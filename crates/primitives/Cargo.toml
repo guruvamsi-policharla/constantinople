@@ -12,15 +12,15 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-bytes.workspace = true
-commonware-codec.workspace = true
-commonware-cryptography.workspace = true
+bytes = { workspace = true, features = ["std"] }
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std", "sha2-asm", "blake3-parallel"] }
 commonware-consensus.workspace = true
-commonware-math.workspace = true
-commonware-utils.workspace = true
-derive_more = { workspace = true, features = ["full"] }
+commonware-math = { workspace = true, features = ["std"] }
+commonware-utils = { workspace = true, features = ["std"] }
+derive_more = { workspace = true, features = ["full", "std"] }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
-rand_core.workspace = true
+rand_core = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 arbitrary = { workspace = true, features = ["derive"] }
@@ -32,18 +32,6 @@ commonware-utils = { workspace = true, features = ["std", "arbitrary"] }
 rand.workspace = true
 
 [features]
-default = [ "std" ]
-std = [
-	"bytes/std",
-	"commonware-codec/std",
-	"commonware-cryptography/std",
-	"commonware-cryptography/sha2-asm",
-	"commonware-cryptography/blake3-parallel",
-	"commonware-math/std",
-	"commonware-utils/std",
-	"derive_more/std",
-	"rand_core/std"
-]
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",
@@ -51,5 +39,4 @@ arbitrary = [
 	"commonware-math/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
-	"std",
 ]

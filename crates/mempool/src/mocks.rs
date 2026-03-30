@@ -1,8 +1,6 @@
 //! Mock transaction sources for tests.
 
 use crate::{Finalized, PendingTransaction, TransactionSource};
-#[cfg(not(any(feature = "std", test)))]
-use alloc::{collections::VecDeque, vec::Vec};
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_primitives::Header;
@@ -10,8 +8,7 @@ use core::{
     future::{Future, ready},
     marker::PhantomData,
 };
-#[cfg(any(feature = "std", test))]
-use std::{collections::VecDeque, vec::Vec};
+use std::collections::VecDeque;
 
 /// A queue-backed transaction source for deterministic tests.
 #[derive(Clone, Debug, Default)]

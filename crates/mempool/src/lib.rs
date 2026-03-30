@@ -1,20 +1,12 @@
 #![doc = include_str!("../README.md")]
-#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-#[cfg(not(any(feature = "std", test)))]
-extern crate alloc;
-
-#[cfg(not(any(feature = "std", test)))]
-use alloc::vec::Vec;
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_primitives::{
     Block, Header, Receipt, Sealed, SignedTransaction, VerifiedTransaction,
 };
 use core::future::Future;
-#[cfg(any(feature = "std", test))]
-use std::vec::Vec;
 
 pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
 pub type PendingTransaction<P, H> = VerifiedTransaction<P, H>;
@@ -45,5 +37,4 @@ where
 #[cfg(feature = "mocks")]
 pub mod mocks;
 
-#[cfg(feature = "server")]
 pub mod server;
