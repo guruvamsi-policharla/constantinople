@@ -1,0 +1,141 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  UDEPS_VERSION: 0.1.50
+  NODE_VERSION: 20
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@nextest
+      - name: cargo test
+        run: just test --locked
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@just
+      - name: build
+        run: just build --locked
+
+  build_no_std:
+    name: Build no_std
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check no_std compatibility
+        run: ./.github/scripts/check_no_std.sh
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: taiki-e/install-action@just
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: fmt + lint
+        run: just lint
+
+  docs:
+    name: Check Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@nextest
+      - name: check docs
+        run: just docs-check
+      - name: test docs
+        run: just docs-test
+
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install just & cargo-udeps
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.43.0,cargo-udeps@${{ env.UDEPS_VERSION }}
+      - name: Check for unused dependencies
+        run: just udeps
+
+  # wasm:
+  #   name: Build WASM
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: wasm32-unknown-unknown
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         save-if: ${{ github.ref == 'refs/heads/main' }}
+  #     - name: Build types
+  #       run: cargo build --target wasm32-unknown-unknown --release --manifest-path types/Cargo.toml && du -h target/wasm32-unknown-unknown/release/alto_types.wasm
+  #     - name: Install wasm-pack
+  #       uses: taiki-e/install-action@wasm-pack
+  #     - name: Pack types
+  #       run: wasm-pack build types --release --target web

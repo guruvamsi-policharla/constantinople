@@ -1,0 +1,660 @@
+//! Callframe state and mutation helpers.
+//!
+//! This module defines [`Frame`], the execution surface exposed to
+//! precompiles. A frame provides:
+//!
+//! - nested callframe creation
+//! - owner-scoped value transfer and storage writes
+//! - read access to declared accounts and storage
+//! - diff merge and discard behavior for child calls
+//!
+//! Frames are intentionally narrow. They expose only the operations a
+//! precompile is allowed to perform and delegate persistence to the
+//! surrounding processor state.
+
+use super::{Precompiles, Processor};
+use crate::processor::state::{AccessListBuilder, AccessSet, FrameDiff, State};
+use bytes::Bytes;
+#[cfg(test)]
+use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+#[cfg(test)]
+use constantinople_primitives::StateValue;
+use constantinople_primitives::{AccessMode, Account, Address, Slot};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use thiserror::Error;
+
+/// An execution halt inside a frame.
+///
+/// `Revert` preserves the return payload from an explicit precompile revert.
+/// The other variants represent hard execution halts that abort the active
+/// frame.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum FrameError {
+    #[error("frame reverted")]
+    Revert(Bytes),
+    #[error("invalid transaction signature")]
+    InvalidSignature,
+    #[error("bad transaction nonce")]
+    BadTransactionNonce,
+    #[error("invalid transaction target")]
+    InvalidTransactionTarget,
+    #[error("access outside of the declared access list")]
+    AccessViolation,
+    #[error("attempted write through read-only access")]
+    WriteProtection,
+    #[error("balance underflow")]
+    BalanceUnderflow,
+    #[error("balance overflow")]
+    BalanceOverflow,
+    #[error("maximum call depth exceeded")]
+    CallDepthExceeded,
+    #[error("precompile panicked")]
+    PrecompilePanic,
+}
+
+/// An in-memory callframe.
+///
+/// A frame owns local writes in `diff` and resolves reads through this order:
+/// local diff, parent diffs, then committed processor state.
+#[derive(Debug)]
+pub struct Frame<'a> {
+    owner: Address,
+    depth: u16,
+    value: u64,
+    input: Bytes,
+    state: &'a State,
+    access: &'a AccessSet,
+    access_list_builder: Option<AccessListBuilder>,
+    parent: Option<&'a Self>,
+    diff: FrameDiff,
+}
+
+impl<'a> Frame<'a> {
+    /// Creates a root frame for `owner`.
+    pub(crate) fn new(
+        owner: Address,
+        state: &'a State,
+        access: &'a AccessSet,
+        access_list_builder: Option<AccessListBuilder>,
+        depth: u16,
+        value: u64,
+        input: Bytes,
+    ) -> Self {
+        Self {
+            owner,
+            depth,
+            value,
+            input,
+            state,
+            access,
+            access_list_builder,
+            parent: None,
+            diff: FrameDiff::default(),
+        }
+    }
+
+    /// Returns the frame owner.
+    pub const fn owner(&self) -> Address {
+        self.owner
+    }
+
+    /// Returns the call value for this frame.
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Returns the current call depth for this frame.
+    pub const fn depth(&self) -> u16 {
+        self.depth
+    }
+
+    /// Returns the input bytes for this frame.
+    pub const fn input(&self) -> &Bytes {
+        &self.input
+    }
+
+    /// Returns the visible account value for the frame owner.
+    pub(super) fn owner_account(&mut self) -> Account {
+        self.account(self.owner)
+    }
+
+    /// Records a new visible account value for the frame owner.
+    pub(super) fn set_owner_account(&mut self, account: Account) {
+        self.set_account(self.owner, account);
+    }
+
+    /// Returns the visible account value for `address`.
+    ///
+    /// Reads walk the local diff first, then parent diffs, then the committed
+    /// processor state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::AccessViolation`] if the transaction did not
+    /// declare account access for `address`.
+    pub fn inspect_account(&mut self, address: Address) -> Result<Account, FrameError> {
+        if !self.access.can_read_account(address) {
+            return Err(FrameError::AccessViolation);
+        }
+
+        Ok(self.account(address))
+    }
+
+    /// Returns the visible storage value for `(address, slot)`.
+    ///
+    /// Reads walk the local diff first, then parent diffs, then the committed
+    /// processor state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::AccessViolation`] if the transaction did not
+    /// declare storage access for `(address, slot)`.
+    pub fn inspect_storage(&mut self, address: Address, slot: Slot) -> Result<Slot, FrameError> {
+        if !self.access.can_read_storage(address, slot) {
+            return Err(FrameError::AccessViolation);
+        }
+
+        Ok(self.storage(address, slot))
+    }
+
+    /// Returns the visible storage value for the frame owner.
+    pub fn read_storage(&mut self, slot: Slot) -> Result<Slot, FrameError> {
+        self.inspect_storage(self.owner, slot)
+    }
+
+    /// Records a new visible storage value for the frame owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::WriteProtection`] if the transaction only
+    /// declared read access for the owner's slot.
+    pub fn write_storage(&mut self, slot: Slot, value: Slot) -> Result<(), FrameError> {
+        if !self.access.can_write_storage(self.owner, slot) {
+            return Err(FrameError::WriteProtection);
+        }
+
+        self.set_storage(self.owner, slot, value);
+        Ok(())
+    }
+
+    /// Transfers value from the frame owner to `to`.
+    ///
+    /// A zero-value transfer is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::AccessViolation`] if the transaction did not
+    /// declare both account accesses, [`FrameError::WriteProtection`] if either
+    /// account is read-only, or a balance error if the transfer cannot be
+    /// applied.
+    pub fn transfer(&mut self, to: Address, value: u64) -> Result<(), FrameError> {
+        self.transfer_between(self.owner, to, value)
+    }
+
+    /// Calls another precompile from this frame.
+    ///
+    /// The nested call executes in a child frame owned by `to`. On success,
+    /// the child diff merges into this frame. On failure, the child diff is
+    /// discarded and the error bubbles back to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::InvalidTransactionTarget`] if `to` is not a
+    /// precompile, [`FrameError::CallDepthExceeded`] when the processor depth
+    /// limit is reached, or any error raised while executing the child call.
+    pub fn call<S, P>(
+        &mut self,
+        processor: &Processor<'_, S, P>,
+        to: Address,
+        value: u64,
+        input: Bytes,
+    ) -> Result<Bytes, FrameError>
+    where
+        S: Strategy,
+        P: Precompiles,
+    {
+        processor.call_precompile(self, to, value, input)
+    }
+
+    /// Merges a successful child diff into this frame.
+    pub(crate) fn merge(
+        &mut self,
+        child: FrameDiff,
+        access_list_builder: Option<AccessListBuilder>,
+    ) {
+        self.diff.merge(child);
+        self.merge_access_list_builder(access_list_builder);
+    }
+
+    /// Merges observed child accesses into this frame.
+    pub(crate) fn merge_access_list_builder(
+        &mut self,
+        access_list_builder: Option<AccessListBuilder>,
+    ) {
+        let Some(child_builder) = access_list_builder else {
+            return;
+        };
+
+        let Some(builder) = &mut self.access_list_builder else {
+            return;
+        };
+
+        builder.merge(child_builder);
+    }
+
+    /// Produces a database changeset for the visible state of this frame.
+    ///
+    /// The exported changeset includes this frame's diff plus all visible
+    /// parent diffs.
+    #[cfg(test)]
+    pub(crate) fn changeset<H: Hasher>(
+        &self,
+        strategy: &impl Strategy,
+    ) -> BTreeMap<Slot, StateValue> {
+        self.visible_diff().changeset::<H>(strategy)
+    }
+
+    /// Consumes the frame and returns its local diff and observed accesses.
+    pub(crate) fn into_parts(self) -> (FrameDiff, Option<AccessListBuilder>) {
+        (self.diff, self.access_list_builder)
+    }
+
+    /// Branches into a child frame owned by `owner` with `value`.
+    ///
+    /// The child sees the parent's visible state but starts with an empty local
+    /// diff.
+    pub(super) fn branch(&self, owner: Address, value: u64, input: Bytes) -> Frame<'_> {
+        self.child_with_depth(owner, self.depth + 1, value, input)
+    }
+
+    /// Creates a child frame with an explicit depth.
+    pub(super) fn child_with_depth(
+        &self,
+        owner: Address,
+        depth: u16,
+        value: u64,
+        input: Bytes,
+    ) -> Frame<'_> {
+        Frame {
+            owner,
+            depth,
+            value,
+            input,
+            state: self.state,
+            access: self.access,
+            access_list_builder: self.access_list_builder.clone(),
+            parent: Some(self),
+            diff: FrameDiff::default(),
+        }
+    }
+
+    /// Transfers value between two accounts inside this frame.
+    pub(super) fn transfer_between(
+        &mut self,
+        from: Address,
+        to: Address,
+        value: u64,
+    ) -> Result<(), FrameError> {
+        if value == 0 {
+            return Ok(());
+        }
+
+        if !self.access.can_read_account(from) || !self.access.can_read_account(to) {
+            return Err(FrameError::AccessViolation);
+        }
+
+        if !self.access.can_write_account(from) || !self.access.can_write_account(to) {
+            return Err(FrameError::WriteProtection);
+        }
+
+        if from == to {
+            return Ok(());
+        }
+
+        let mut from_account = self.account(from);
+        from_account.balance = from_account
+            .balance
+            .checked_sub(value)
+            .ok_or(FrameError::BalanceUnderflow)?;
+
+        let mut to_account = self.account(to);
+        to_account.balance = to_account
+            .balance
+            .checked_add(value)
+            .ok_or(FrameError::BalanceOverflow)?;
+
+        self.set_account(from, from_account);
+        self.set_account(to, to_account);
+        Ok(())
+    }
+
+    /// Reads the visible account value for `address` and records the access.
+    ///
+    /// This bypasses access-list validation. Callers must validate access
+    /// before using it.
+    fn account(&mut self, address: Address) -> Account {
+        self.record_account_access(address, AccessMode::Read);
+
+        if let Some(account) = self.diff.account(address) {
+            return account;
+        }
+
+        let mut parent = self.parent;
+        while let Some(frame) = parent {
+            if let Some(account) = frame.diff.account(address) {
+                return account;
+            }
+
+            parent = frame.parent;
+        }
+
+        self.state.account(address)
+    }
+
+    /// Records a new visible account value for `address`.
+    ///
+    /// This bypasses access-list validation. Callers must validate write
+    /// permission before using it.
+    fn set_account(&mut self, address: Address, account: Account) {
+        self.record_account_access(address, AccessMode::Write);
+        let original = self.account(address);
+        self.diff.set_account(address, original, account);
+    }
+
+    /// Reads the visible storage value for `(address, slot)` and records the
+    /// access.
+    ///
+    /// This bypasses access-list validation. Callers must validate access
+    /// before using it.
+    fn storage(&mut self, address: Address, slot: Slot) -> Slot {
+        self.record_storage_access(address, slot, AccessMode::Read);
+
+        if let Some(value) = self.diff.storage(address, slot) {
+            return value;
+        }
+
+        let mut parent = self.parent;
+        while let Some(frame) = parent {
+            if let Some(value) = frame.diff.storage(address, slot) {
+                return value;
+            }
+
+            parent = frame.parent;
+        }
+
+        self.state.storage(address, slot)
+    }
+
+    /// Records a new visible storage value for `(address, slot)`.
+    ///
+    /// This bypasses access-list validation. Callers must validate write
+    /// permission before using it.
+    fn set_storage(&mut self, address: Address, slot: Slot, value: Slot) {
+        self.record_storage_access(address, slot, AccessMode::Write);
+        let original = self.storage(address, slot);
+        self.diff.set_storage(address, slot, original, value);
+    }
+
+    /// Builds the full visible diff for this frame, including parent diffs.
+    #[cfg(test)]
+    fn visible_diff(&self) -> FrameDiff {
+        let mut diffs = Vec::new();
+        let mut current = Some(self);
+
+        while let Some(frame) = current {
+            diffs.push(frame.diff.clone());
+            current = frame.parent;
+        }
+
+        diffs.reverse();
+
+        let mut visible = FrameDiff::default();
+        for diff in diffs {
+            visible.merge(diff);
+        }
+
+        visible
+    }
+
+    /// Records an observed account access for access-list generation.
+    fn record_account_access(&mut self, address: Address, mode: AccessMode) {
+        let Some(builder) = &mut self.access_list_builder else {
+            return;
+        };
+
+        builder.record_account(address, mode);
+    }
+
+    /// Records an observed storage access for access-list generation.
+    fn record_storage_access(&mut self, address: Address, slot: Slot, mode: AccessMode) {
+        let Some(builder) = &mut self.access_list_builder else {
+            return;
+        };
+
+        builder.record_storage(address, slot, mode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frame, FrameError};
+    use crate::processor::state::{AccessSet, State, account_key, storage_key};
+    use bytes::Bytes;
+    use commonware_codec::{DecodeExt, FixedSize};
+    use commonware_cryptography::blake3;
+    use commonware_parallel::Sequential;
+    use constantinople_primitives::{Access, AccessMode, Account, Address, Slot, StateValue};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn address(byte: u8) -> Address {
+        Address::decode(&[byte; Address::SIZE][..]).expect("address bytes should decode")
+    }
+
+    fn slot(byte: u8) -> Slot {
+        Slot::from([byte; Slot::SIZE])
+    }
+
+    fn access_set(
+        owner: Address,
+        recipient: Address,
+        owner_slot: Slot,
+        child_slot: Slot,
+    ) -> AccessSet {
+        AccessSet::new(
+            owner,
+            recipient,
+            &vec![
+                Access::Account(owner, AccessMode::Write),
+                Access::Account(recipient, AccessMode::Write),
+                Access::Storage(owner, owner_slot, AccessMode::Write),
+                Access::Storage(recipient, child_slot, AccessMode::Write),
+            ],
+        )
+    }
+
+    #[test]
+    fn nested_frames_merge_child_changes() {
+        let root_address = address(0x11);
+        let child_address = address(0x22);
+        let root_slot = slot(0x33);
+        let child_slot = slot(0x44);
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            root_address,
+            Account {
+                balance: 10,
+                nonce: 1,
+            },
+        );
+
+        let state = State::new(accounts, HashMap::new());
+        let access = access_set(root_address, child_address, root_slot, child_slot);
+        let mut root = Frame::new(root_address, &state, &access, None, 0, 7, Bytes::new());
+
+        assert_eq!(root.value(), 7);
+        root.transfer(child_address, 5)
+            .expect("root transfer should succeed");
+        root.write_storage(root_slot, slot(0x55))
+            .expect("root write should succeed");
+
+        let mut child = root.branch(child_address, 9, Bytes::from_static(b"child"));
+        assert_eq!(child.value(), 9);
+        assert_eq!(child.input().as_ref(), b"child");
+        assert_eq!(
+            child
+                .inspect_account(root_address)
+                .expect("root account should be visible")
+                .balance,
+            5
+        );
+
+        child
+            .write_storage(child_slot, slot(0x66))
+            .expect("child write should succeed");
+        child
+            .transfer(root_address, 1)
+            .expect("child transfer should succeed");
+
+        let (diff, access_list_builder) = child.into_parts();
+        root.merge(diff, access_list_builder);
+
+        assert_eq!(
+            root.inspect_account(root_address)
+                .expect("root account should be visible")
+                .balance,
+            6
+        );
+        assert_eq!(
+            root.inspect_account(child_address)
+                .expect("child account should be visible")
+                .balance,
+            4
+        );
+        assert_eq!(
+            root.inspect_storage(child_address, child_slot)
+                .expect("child storage should be visible"),
+            slot(0x66)
+        );
+    }
+
+    #[test]
+    fn nested_frames_drop_unmerged_child_changes() {
+        let root_address = address(0x11);
+        let child_address = address(0x22);
+        let root_slot = slot(0x33);
+        let child_slot = slot(0x44);
+
+        let state = State::new(HashMap::new(), HashMap::new());
+        let access = access_set(root_address, child_address, root_slot, child_slot);
+        let mut root = Frame::new(root_address, &state, &access, None, 0, 3, Bytes::new());
+
+        root.write_storage(root_slot, slot(0x77))
+            .expect("root write should succeed");
+
+        let mut child = root.branch(child_address, 5, Bytes::new());
+        child
+            .write_storage(child_slot, slot(0x66))
+            .expect("child write should succeed");
+        drop(child);
+
+        assert_eq!(
+            root.inspect_storage(root_address, root_slot)
+                .expect("root storage should be visible"),
+            slot(0x77)
+        );
+        assert_eq!(
+            root.inspect_storage(child_address, child_slot)
+                .expect("child storage should be visible"),
+            Slot::default()
+        );
+    }
+
+    #[test]
+    fn frame_changeset_only_includes_persistent_changes() {
+        let root_address = address(0x11);
+        let child_address = address(0x22);
+        let root_slot = slot(0x33);
+        let child_slot = slot(0x44);
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            root_address,
+            Account {
+                balance: 10,
+                nonce: 1,
+            },
+        );
+
+        let mut storage = HashMap::new();
+        storage.insert((root_address, root_slot), slot(0x55));
+
+        let state = State::new(accounts, storage);
+        let access = access_set(root_address, child_address, root_slot, child_slot);
+        let mut root = Frame::new(root_address, &state, &access, None, 0, 1, Bytes::new());
+
+        root.transfer(child_address, 4)
+            .expect("root transfer should succeed");
+        root.write_storage(root_slot, slot(0x77))
+            .expect("root write should succeed");
+        root.write_storage(root_slot, slot(0x55))
+            .expect("root restore should succeed");
+
+        let mut child = root.branch(child_address, 2, Bytes::new());
+        child
+            .write_storage(child_slot, slot(0x88))
+            .expect("child write should succeed");
+
+        let strategy = Sequential;
+        let frame_changeset = child.changeset::<blake3::Blake3>(&strategy);
+
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            account_key(root_address),
+            StateValue::Account(Account {
+                balance: 6,
+                nonce: 1,
+            }),
+        );
+        expected.insert(
+            account_key(child_address),
+            StateValue::Account(Account {
+                balance: 4,
+                nonce: 0,
+            }),
+        );
+        expected.insert(
+            storage_key(&mut blake3::Blake3::default(), child_address, child_slot),
+            StateValue::Storage(slot(0x88)),
+        );
+
+        assert_eq!(frame_changeset, expected);
+    }
+
+    #[test]
+    fn undeclared_access_reverts_reads_and_writes() {
+        let owner = address(0x11);
+        let recipient = address(0x22);
+        let owner_slot = slot(0x33);
+        let other_slot = slot(0x44);
+
+        let access = AccessSet::new(
+            owner,
+            recipient,
+            &vec![Access::Storage(owner, owner_slot, AccessMode::Read)],
+        );
+        let state = State::new(HashMap::new(), HashMap::new());
+        let mut frame = Frame::new(owner, &state, &access, None, 0, 0, Bytes::new());
+
+        assert_eq!(
+            frame.inspect_storage(recipient, other_slot),
+            Err(FrameError::AccessViolation)
+        );
+        assert_eq!(
+            frame.write_storage(owner_slot, slot(0x55)),
+            Err(FrameError::WriteProtection)
+        );
+    }
+}

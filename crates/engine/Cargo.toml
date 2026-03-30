@@ -1,0 +1,53 @@
+[package]
+name = "constantinople-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+test-utils = ["commonware-glue/test-utils", "constantinople-mempool/mocks"]
+
+[dependencies]
+constantinople-application.workspace = true
+constantinople-mempool.workspace = true
+constantinople-primitives.workspace = true
+
+commonware-broadcast.workspace = true
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
+commonware-codec.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
+commonware-glue.workspace = true
+commonware-macros.workspace = true
+commonware-math.workspace = true
+commonware-p2p.workspace = true
+commonware-parallel.workspace = true
+commonware-resolver.workspace = true
+commonware-runtime.workspace = true
+commonware-storage.workspace = true
+commonware-utils.workspace = true
+
+bytes.workspace = true
+futures.workspace = true
+prometheus-client.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+constantinople-mempool = { workspace = true, features = ["mocks"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-glue = { workspace = true, features = ["test-utils"] }
+commonware-runtime.workspace = true
+commonware-parallel = { workspace = true, features = ["std"] }
+commonware-math = { workspace = true, features = ["std"] }
+tracing-subscriber = "0.3"

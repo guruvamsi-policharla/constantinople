@@ -1,0 +1,55 @@
+[package]
+name = "constantinople-primitives"
+description = "Types for constantinople"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+commonware-codec.workspace = true
+commonware-cryptography.workspace = true
+commonware-consensus.workspace = true
+commonware-math.workspace = true
+commonware-utils.workspace = true
+derive_more = { workspace = true, features = ["full"] }
+arbitrary = { workspace = true, features = ["derive"], optional = true }
+rand_core.workspace = true
+
+[dev-dependencies]
+arbitrary = { workspace = true, features = ["derive"] }
+commonware-codec = { workspace = true, features = ["std", "arbitrary"] }
+commonware-consensus = { workspace = true, features = ["arbitrary"] }
+commonware-cryptography = { workspace = true, features = ["std", "arbitrary"] }
+commonware-math = { workspace = true, features = ["std", "arbitrary"] }
+commonware-utils = { workspace = true, features = ["std", "arbitrary"] }
+rand.workspace = true
+
+[features]
+default = [ "std" ]
+std = [
+	"bytes/std",
+	"commonware-codec/std",
+	"commonware-cryptography/std",
+	"commonware-cryptography/sha2-asm",
+	"commonware-cryptography/blake3-parallel",
+	"commonware-math/std",
+	"commonware-utils/std",
+	"derive_more/std",
+	"rand_core/std"
+]
+arbitrary = [
+	"commonware-codec/arbitrary",
+	"commonware-consensus/arbitrary",
+	"commonware-cryptography/arbitrary",
+	"commonware-math/arbitrary",
+	"commonware-utils/arbitrary",
+	"dep:arbitrary",
+	"std",
+]

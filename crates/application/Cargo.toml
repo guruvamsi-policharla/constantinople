@@ -1,0 +1,51 @@
+[package]
+name = "constantinople-application"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[features]
+bench = []
+
+[lints]
+workspace = true
+
+[dependencies]
+constantinople-mempool.workspace = true
+constantinople-primitives.workspace = true
+
+commonware-glue.workspace = true
+commonware-codec.workspace = true
+commonware-utils.workspace = true
+commonware-runtime.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
+commonware-parallel.workspace = true
+
+rand.workspace = true
+bytes.workspace = true
+futures = { workspace = true, features = ["std", "executor"] }
+rand_core.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+commonware-storage.workspace = true
+
+[dev-dependencies]
+constantinople-mempool = { workspace = true, features = ["mocks"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-math = { workspace = true, features = ["std"] }
+commonware-runtime.workspace = true
+commonware-parallel = { workspace = true, features = ["std"] }
+divan.workspace = true
+hashbrown.workspace = true
+rand.workspace = true
+rstest.workspace = true
+
+[[bench]]
+name = "processor"
+harness = false
+required-features = ["bench"]

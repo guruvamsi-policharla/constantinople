@@ -1,0 +1,1 @@
+rustflags = ['--cfg', 'COMMONWARE_STABILITY_ALPHA']
