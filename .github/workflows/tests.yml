@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  UDEPS_VERSION: 0.1.50
+  UDEPS_VERSION: 0.1.60
   NODE_VERSION: 20
 
 jobs:
