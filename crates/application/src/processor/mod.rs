@@ -152,7 +152,7 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        self.prepare_inner(state, transactions)
+        schedule::prepare(state, transactions, transaction_access_set::<H, PK>)
     }
 
     /// Executes transactions from a previously prepared in-memory snapshot.
@@ -166,7 +166,15 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        self.process_prepared_inner(prepared, transactions)
+        schedule::execute(
+            self.strategy,
+            prepared,
+            transactions,
+            self.access_list_builder,
+            |state, transaction, access, access_list_builder| {
+                self.execute_transaction(state, transaction, access, access_list_builder)
+            },
+        )
     }
 
     /// Executes transactions from a previously prepared in-memory snapshot
@@ -216,34 +224,10 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        let prepared = self.prepare_inner(state, transactions);
-        self.process_prepared_inner(&prepared, transactions)
-    }
-
-    fn prepare_inner<H, PK>(
-        &self,
-        state: State,
-        transactions: &[VerifiedTransaction<PK, H>],
-    ) -> schedule::PreparedExecution
-    where
-        H: Hasher,
-        PK: PublicKey,
-    {
-        schedule::prepare(state, transactions, transaction_access_set::<H, PK>)
-    }
-
-    fn process_prepared_inner<H, PK>(
-        &self,
-        prepared: &schedule::PreparedExecution,
-        transactions: &[VerifiedTransaction<PK, H>],
-    ) -> ProcessorOutput<H::Digest>
-    where
-        H: Hasher,
-        PK: PublicKey,
-    {
+        let prepared = schedule::prepare(state, transactions, transaction_access_set::<H, PK>);
         schedule::execute(
             self.strategy,
-            prepared,
+            &prepared,
             transactions,
             self.access_list_builder,
             |state, transaction, access, access_list_builder| {
@@ -274,10 +258,7 @@ where
 
         for transaction in transactions {
             let access = transaction_access_set(transaction);
-            if self
-                .validate_transaction(&state, transaction, &access)
-                .is_err()
-            {
+            if self.validate_transaction(&state, transaction).is_err() {
                 continue;
             }
 
@@ -312,10 +293,7 @@ where
     {
         for transaction in transactions {
             let access = transaction_access_set(transaction);
-            if self
-                .validate_transaction(&state, transaction, &access)
-                .is_err()
-            {
+            if self.validate_transaction(&state, transaction).is_err() {
                 return false;
             }
 
@@ -343,10 +321,7 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        if self
-            .validate_transaction(state, transaction, access)
-            .is_err()
-        {
+        if self.validate_transaction(state, transaction).is_err() {
             return TransactionExecution {
                 receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
                 diff: FrameDiff::default(),
@@ -373,7 +348,7 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        let sender = transaction_sender::<H, PK>(transaction);
+        let sender = transaction.signer();
         let mut prelude = Frame::new(
             sender,
             state,
@@ -383,7 +358,7 @@ where
             0,
             Bytes::new(),
         );
-        if self.bump_sender_nonce(&mut prelude).is_err() {
+        if prelude.bump_sender_nonce().is_err() {
             return TransactionExecution {
                 receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
                 diff: FrameDiff::default(),
@@ -438,17 +413,12 @@ where
         &self,
         state: &State,
         transaction: &VerifiedTransaction<PK, H>,
-        access: &AccessSet,
     ) -> Result<(), FrameError>
     where
         H: Hasher,
         PK: PublicKey,
     {
-        if !state.access_is_valid(access) {
-            return Err(FrameError::AccessViolation);
-        }
-
-        let sender = transaction_sender::<H, PK>(transaction);
+        let sender = transaction.signer();
         let tx = transaction.value();
         let sender_account = state.account(sender);
 
@@ -468,21 +438,6 @@ where
             return Err(FrameError::InvalidTransactionTarget);
         }
 
-        Ok(())
-    }
-
-    /// Applies the sender nonce bump outside the revertible transaction body.
-    ///
-    /// The nonce increment is recorded in a small prelude frame and committed
-    /// immediately into the in-memory state so it survives root-frame reverts.
-    ///
-    fn bump_sender_nonce(&self, prelude: &mut Frame<'_>) -> Result<(), FrameError> {
-        let mut account = prelude.owner_account();
-        account.nonce = account
-            .nonce
-            .checked_add(1)
-            .ok_or(FrameError::BadTransactionNonce)?;
-        prelude.set_owner_account(account);
         Ok(())
     }
 
@@ -533,16 +488,7 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let sender = transaction_sender::<H, PK>(transaction);
+    let sender = transaction.signer();
     let tx = transaction.value();
     AccessSet::new(sender, tx.to, &tx.access_list)
-}
-
-/// Derives the sender address for `transaction`.
-const fn transaction_sender<H, PK>(transaction: &VerifiedTransaction<PK, H>) -> Address
-where
-    H: Hasher,
-    PK: PublicKey,
-{
-    transaction.signer()
 }

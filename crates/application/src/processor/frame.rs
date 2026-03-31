@@ -34,8 +34,6 @@ use thiserror::Error;
 pub enum FrameError {
     #[error("frame reverted")]
     Revert(Bytes),
-    #[error("invalid transaction signature")]
-    InvalidSignature,
     #[error("bad transaction nonce")]
     BadTransactionNonce,
     #[error("invalid transaction target")]
@@ -123,6 +121,20 @@ impl<'a> Frame<'a> {
     /// Records a new visible account value for the frame owner.
     pub(super) fn set_owner_account(&mut self, account: Account) {
         self.set_account(self.owner, account);
+    }
+
+    /// Applies the sender nonce bump outside the revertible transaction body.
+    ///
+    /// The nonce increment is recorded in the prelude frame and committed
+    /// immediately so it survives root-frame reverts.
+    pub(super) fn bump_sender_nonce(&mut self) -> Result<(), FrameError> {
+        let mut account = self.owner_account();
+        account.nonce = account
+            .nonce
+            .checked_add(1)
+            .ok_or(FrameError::BadTransactionNonce)?;
+        self.set_owner_account(account);
+        Ok(())
     }
 
     /// Returns the visible account value for `address`.

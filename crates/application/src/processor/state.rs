@@ -18,7 +18,7 @@ use commonware_parallel::Strategy;
 use constantinople_primitives::{
     Access, AccessList, AccessMode, Account, Address, Slot, StateValue,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 type StorageKey = (Address, Slot);
 
@@ -335,8 +335,6 @@ impl AccessListBuilder {
 pub struct State {
     base_accounts: HashMap<Address, Account>,
     base_storage: HashMap<StorageKey, Slot>,
-    invalid_accounts: BTreeSet<Address>,
-    invalid_storage: BTreeSet<StorageKey>,
     diff: FrameDiff,
 }
 
@@ -350,30 +348,9 @@ impl State {
         base_accounts: HashMap<Address, Account>,
         base_storage: HashMap<(Address, Slot), Slot>,
     ) -> Self {
-        Self::with_invalid(
-            base_accounts,
-            base_storage,
-            BTreeSet::new(),
-            BTreeSet::new(),
-        )
-    }
-
-    /// Creates in-memory processor state with an explicit set of invalid keys.
-    ///
-    /// Invalid keys come from malformed execution witnesses, such as a loaded
-    /// account key that decoded as storage or vice versa. Transactions that
-    /// declare any invalid key are reverted rather than panicking execution.
-    pub(crate) fn with_invalid(
-        base_accounts: HashMap<Address, Account>,
-        base_storage: HashMap<(Address, Slot), Slot>,
-        invalid_accounts: BTreeSet<Address>,
-        invalid_storage: BTreeSet<(Address, Slot)>,
-    ) -> Self {
         Self {
             base_accounts,
             base_storage,
-            invalid_accounts,
-            invalid_storage,
             diff: FrameDiff::default(),
         }
     }
@@ -409,23 +386,6 @@ impl State {
     /// Commits a frame diff into the state.
     pub(crate) fn apply(&mut self, diff: FrameDiff) {
         self.diff.merge(diff);
-    }
-
-    /// Returns whether `access` references only well-formed loaded keys.
-    pub(crate) fn access_is_valid(&self, access: &AccessSet) -> bool {
-        for (address, _) in access.accounts() {
-            if self.invalid_accounts.contains(&address) {
-                return false;
-            }
-        }
-
-        for (address, slot, _) in access.storage() {
-            if self.invalid_storage.contains(&(address, slot)) {
-                return false;
-            }
-        }
-
-        true
     }
 
     /// Produces a database changeset for the committed state diff.

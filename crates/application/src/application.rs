@@ -61,7 +61,7 @@ use core::fmt;
 use futures::StreamExt;
 use rand::Rng;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -122,6 +122,8 @@ pub struct ExecutedTransactions<B, D: Digest> {
 pub enum ProcessorError {
     #[error("state database access failed")]
     Database(#[from] StorageError),
+    #[error("loaded value has wrong type for its key")]
+    MalformedState,
 }
 
 /// Receipts emitted after a block is finalized.
@@ -140,13 +142,13 @@ pub struct BlockReceipts<D: Digest> {
 /// execution.
 ///
 /// Missing accounts and storage values are omitted from the snapshot and later
-/// read as defaults during execution. If a loaded key resolves to the wrong
-/// value kind, the key is marked invalid and any transaction that declares it
-/// will revert during execution rather than panicking the processor.
+/// read as defaults during execution.
 ///
 /// # Errors
 ///
-/// Returns [`ProcessorError::Database`] if any batch read fails.
+/// Returns [`ProcessorError::Database`] if any batch read fails, or
+/// [`ProcessorError::MalformedState`] if a loaded key resolves to the wrong
+/// value kind.
 pub async fn load_state<E, H, T, PK>(
     batch: &StateBatch<E, H, T>,
     transactions: &[VerifiedTransaction<PK, H>],
@@ -159,7 +161,6 @@ where
 {
     let (accounts, storage) = collect_preload_keys(transactions);
     let mut base_accounts = HashMap::with_capacity(accounts.len());
-    let mut invalid_accounts = BTreeSet::new();
     for address in accounts {
         let key = account_key(address);
         let Some(value) = batch.get(&key).await? else {
@@ -167,15 +168,13 @@ where
         };
 
         let StateValue::Account(account) = value else {
-            invalid_accounts.insert(address);
-            continue;
+            return Err(ProcessorError::MalformedState);
         };
 
         base_accounts.insert(address, account);
     }
 
     let mut base_storage = HashMap::with_capacity(storage.len());
-    let mut invalid_storage = BTreeSet::new();
     let mut hasher = H::default();
     for (address, slot) in storage {
         let key = storage_key(&mut hasher, address, slot);
@@ -184,19 +183,13 @@ where
         };
 
         let StateValue::Storage(storage_value) = value else {
-            invalid_storage.insert((address, slot));
-            continue;
+            return Err(ProcessorError::MalformedState);
         };
 
         base_storage.insert((address, slot), storage_value);
     }
 
-    Ok(State::with_invalid(
-        base_accounts,
-        base_storage,
-        invalid_accounts,
-        invalid_storage,
-    ))
+    Ok(State::new(base_accounts, base_storage))
 }
 
 /// Collects the accounts and storage keys that must be loaded for execution.

@@ -706,7 +706,7 @@ fn undeclared_account_read_reverts() {
 }
 
 #[test]
-fn malformed_loaded_account_value_reverts_instead_of_panicking() {
+fn malformed_loaded_account_value_returns_error() {
     run_test(|context| async move {
         let harness = ProcessorHarness::new(context, "malformed-account-value").await;
         let sender = harness.signer([50; 32]);
@@ -719,18 +719,16 @@ fn malformed_loaded_account_value_reverts_instead_of_panicking() {
             )])
             .await;
 
-        let run = harness
+        let result = harness
             .execute_specs(&[TransactionSpec::transfer(sender, recipient, 0, 0)])
-            .await
-            .expect("processing should succeed");
+            .await;
 
-        assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
-        assert_eq!(run.account_change(recipient), None);
+        assert!(result.is_err());
     });
 }
 
 #[test]
-fn malformed_loaded_storage_value_reverts_instead_of_panicking() {
+fn malformed_loaded_storage_value_returns_error() {
     run_test(|context| async move {
         let mut harness = ProcessorHarness::new(context, "malformed-storage-value").await;
         let sender = harness.signer([55; 32]);
@@ -753,7 +751,7 @@ fn malformed_loaded_storage_value_reverts_instead_of_panicking() {
             .await;
         harness.insert_precompile(precompile, vec![PrecompileStep::ReadStorage(slot_key)]);
 
-        let run = harness
+        let result = harness
             .execute_specs(&[TransactionSpec::call(
                 sender,
                 precompile,
@@ -761,11 +759,9 @@ fn malformed_loaded_storage_value_reverts_instead_of_panicking() {
                 0,
                 Bytes::new(),
             )])
-            .await
-            .expect("processing should succeed");
+            .await;
 
-        assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
-        assert_eq!(run.storage_change(precompile, slot_key), None);
+        assert!(result.is_err());
     });
 }
 

@@ -64,8 +64,6 @@ pub struct PreparedExecution {
 /// One scheduled transaction and its effective declared access set.
 #[derive(Debug, Clone)]
 pub(super) struct ScheduledTransaction {
-    /// The transaction's original position in the slice.
-    pub(super) index: usize,
     /// The transaction's effective read/write footprint.
     pub(super) access: AccessSet,
 }
@@ -132,9 +130,7 @@ where
 {
     let scheduled = transactions
         .iter()
-        .enumerate()
-        .map(|(index, transaction)| ScheduledTransaction {
-            index,
+        .map(|transaction| ScheduledTransaction {
             access: access_set(transaction),
         })
         .collect::<Vec<_>>();
@@ -333,8 +329,7 @@ fn execute_transactions_inline<H, PK, F>(
         Option<AccessListBuilder>,
     ) -> TransactionExecution<H::Digest>,
 {
-    for scheduled in execution.scheduled {
-        let transaction_index = scheduled.index;
+    for (transaction_index, scheduled) in execution.scheduled.iter().enumerate() {
         let transaction = &execution.transactions[transaction_index];
         let access_list_builder = execution
             .build_access_lists
@@ -367,7 +362,7 @@ fn schedule_rounds(scheduled: &[ScheduledTransaction]) -> (Vec<Vec<usize>>, Sche
     let mut storage_reads: HashMap<(Address, Slot), usize> = HashMap::new();
     let mut storage_writes: HashMap<(Address, Slot), usize> = HashMap::new();
 
-    for transaction in scheduled {
+    for (index, transaction) in scheduled.iter().enumerate() {
         let mut ready_round = 0;
 
         for (address, mode) in transaction.access.accounts() {
@@ -410,7 +405,7 @@ fn schedule_rounds(scheduled: &[ScheduledTransaction]) -> (Vec<Vec<usize>>, Sche
         while rounds.len() <= ready_round {
             rounds.push(Vec::new());
         }
-        rounds[ready_round].push(transaction.index);
+        rounds[ready_round].push(index);
 
         for (address, mode) in transaction.access.accounts() {
             account_reads.insert(address, ready_round);
