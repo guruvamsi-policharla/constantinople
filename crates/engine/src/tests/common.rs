@@ -1,9 +1,11 @@
-use crate::ThresholdScheme;
+use crate::{
+    ThresholdScheme,
+    types::{EngineBlock, EngineMarshalMailbox},
+};
 use bytes::Bytes;
-use commonware_coding::ReedSolomon;
 use commonware_consensus::{
-    marshal::{self, Identifier, coding::Coding, core::Mailbox as MarshalMailbox},
-    types::{Height, View, coding::Commitment},
+    marshal::{self, Identifier},
+    types::{Height, View},
 };
 use commonware_cryptography::{
     Digestible, Sha256, Signer,
@@ -22,16 +24,14 @@ use constantinople_application::processor::{
     executor::Processor,
     frame::{Frame, FrameError},
 };
-use constantinople_primitives::{Block, Sealed};
 use std::collections::BTreeMap;
 
 pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
 pub(crate) type TestPublicKey = ed25519::PublicKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
-pub(crate) type TestBlock = Sealed<Block<Commitment, TestPublicKey, TestHasher>, TestHasher>;
-pub(crate) type TestVariant = Coding<TestBlock, ReedSolomon<TestHasher>, TestHasher, TestPublicKey>;
-pub(crate) type TestMarshalMailbox = MarshalMailbox<TestScheme, TestVariant>;
+pub(crate) type TestBlock = EngineBlock<TestHasher, TestPublicKey>;
+pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
 const STATE_SYNC_METADATA_SUFFIX: &str = "_state_sync_metadata";
 const SYNC_DONE_KEY: U64 = U64::new(0);

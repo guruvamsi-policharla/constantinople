@@ -16,6 +16,7 @@
 //! simulated networking.
 
 pub mod bootstrapper;
+pub mod types;
 
 mod engine;
 

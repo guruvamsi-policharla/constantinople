@@ -3,7 +3,7 @@
 //! The bootstrapper keeps a fetch request open until it discovers a usable
 //! initial state-sync target.
 
-use super::{BootstrapBlock, BootstrapMarshal};
+use super::{EngineBlock, EngineMarshalMailbox};
 use commonware_cryptography::{Hasher, PublicKey, bls12381::primitives::variant::Variant};
 use commonware_utils::channel::{fallible::AsyncFallibleExt, mpsc, oneshot};
 
@@ -14,10 +14,10 @@ where
     V: Variant,
 {
     Attach {
-        marshal: BootstrapMarshal<H, P, V>,
+        marshal: EngineMarshalMailbox<H, P, V>,
     },
     FetchInitialTarget {
-        response: oneshot::Sender<BootstrapBlock<H, P>>,
+        response: oneshot::Sender<EngineBlock<H, P>>,
     },
 }
 
@@ -55,12 +55,12 @@ where
     }
 
     /// Attach the local marshal mailbox once the engine has been built.
-    pub async fn attach(&self, marshal: BootstrapMarshal<H, P, V>) {
+    pub async fn attach(&self, marshal: EngineMarshalMailbox<H, P, V>) {
         self.sender.send_lossy(Message::Attach { marshal }).await;
     }
 
     /// Wait until the actor discovers an initial state-sync target.
-    pub async fn fetch_initial_target(&self) -> Option<BootstrapBlock<H, P>> {
+    pub async fn fetch_initial_target(&self) -> Option<EngineBlock<H, P>> {
         self.sender
             .request(|response| Message::FetchInitialTarget { response })
             .await

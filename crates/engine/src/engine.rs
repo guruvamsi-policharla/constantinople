@@ -11,14 +11,14 @@
 //! threshold scheme are fixed at startup from the supplied threshold output and
 //! optional local share.
 
-use crate::bootstrapper;
-use commonware_coding::{CodecConfig, ReedSolomon};
+use crate::{bootstrapper, types::*};
+use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporters,
     marshal::{
         self, Update,
-        coding::{Coding, Marshaled, MarshaledConfig, shards, types::StoredCodedBlock},
-        core::{Actor as MarshalActor, Mailbox as MarshalMailbox},
+        coding::{Marshaled, MarshaledConfig, shards},
+        core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
     },
     simplex::{self, elector::Config as Elector, types::Finalization},
@@ -46,21 +46,16 @@ use commonware_storage::{
     archive::immutable,
     journal::contiguous::variable::Config as VariableJournalConfig,
     mmr::journaled::Config as MmrConfig,
-    qmdb::{
-        any::{FixedConfig, unordered::fixed},
-        immutable::Config as ImmutableConfig,
-        sync::resolver::Resolver as SyncResolver,
-    },
+    qmdb::{any::FixedConfig, immutable::Config as ImmutableConfig},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, sync::AsyncRwLock, union};
+use commonware_utils::{NZU16, NZU64, NZUsize, union};
 use constantinople_application::consensus::Application;
-use constantinople_primitives::{Block, BlockCfg, Sealed};
+use constantinople_primitives::BlockCfg;
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
     num::{NonZero, NonZeroU16},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -91,65 +86,6 @@ const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(1024);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
-
-type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
-type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
-type StateDb<E, H> = fixed::Db<
-    E,
-    constantinople_primitives::Slot,
-    constantinople_primitives::StateValue,
-    H,
-    EightCap,
->;
-type TransactionDb<E, H> =
-    commonware_storage::qmdb::immutable::Immutable<E, <H as Hasher>::Digest, (), H, EightCap>;
-type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
-type TransactionSyncDb<E, H> = Arc<AsyncRwLock<TransactionDb<E, H>>>;
-type StateResolverMailbox<E, H> = qmdb_resolver::Mailbox<
-    StateDb<E, H>,
-    <StateSyncDb<E, H> as SyncResolver>::Op,
-    <StateSyncDb<E, H> as SyncResolver>::Digest,
->;
-type TransactionResolverMailbox<E, H> = qmdb_resolver::Mailbox<
-    TransactionDb<E, H>,
-    <TransactionSyncDb<E, H> as SyncResolver>::Op,
-    <TransactionSyncDb<E, H> as SyncResolver>::Digest,
->;
-type App<H, P, V, I, R, T> = Application<H, Commitment, ThresholdScheme<P, V>, P, I, R, T>;
-type AppMailbox<E, H, P, V, I, R, T> = commonware_glue::stateful::Mailbox<E, App<H, P, V, I, R, T>>;
-type MarshalVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
-type MarshalHandle<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, MarshalVariant<H, P>>;
-type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
-type StatefulApp<E, H, P, V, I, R, T> = Stateful<
-    E,
-    App<H, P, V, I, R, T>,
-    MarshalHandle<H, P, V>,
-    (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
->;
-type MarshaledApp<E, H, P, V, I, R, T> = Marshaled<
-    E,
-    AppMailbox<E, H, P, V, I, R, T>,
-    EngineBlock<H, P>,
-    ReedSolomon<H>,
-    H,
-    SchemeProvider<P, V>,
-    T,
-    FixedEpocher,
->;
-type ShardsEngine<E, B, M, H, P, V, T> =
-    shards::Engine<E, SchemeProvider<P, V>, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
-type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
-type SimplexEngine<E, B, H, P, V, L, T, I, R> = simplex::Engine<
-    E,
-    ThresholdScheme<P, V>,
-    L,
-    B,
-    Commitment,
-    MarshaledApp<E, H, P, V, I, R, T>,
-    MarshaledApp<E, H, P, V, I, R, T>,
-    MarshalHandle<H, P, V>,
-    T,
->;
 
 /// Vote channel id.
 pub const VOTE_CHANNEL: u64 = 0;
@@ -259,7 +195,7 @@ where
     #[allow(clippy::type_complexity)]
     marshal: MarshalActor<
         E,
-        MarshalVariant<H, C::PublicKey>,
+        EngineVariant<H, C::PublicKey>,
         SchemeProvider<C::PublicKey, V>,
         immutable::Archive<
             E,
@@ -271,7 +207,7 @@ where
         T,
     >,
     #[cfg(all(test, feature = "test-utils"))]
-    marshal_mailbox: MarshalHandle<H, C::PublicKey, V>,
+    marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
     simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I, R>,
 }
 
@@ -289,7 +225,7 @@ where
     R: constantinople_application::processor::Precompiles + Clone + Send + Sync + 'static,
 {
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn marshal_mailbox(&self) -> MarshalHandle<H, C::PublicKey, V> {
+    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
         self.marshal_mailbox.clone()
     }
 

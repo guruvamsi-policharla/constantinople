@@ -19,22 +19,10 @@
 //! invalid certificates, and block/finalization mismatches before they can
 //! influence the vote count.
 
-use crate::ThresholdScheme;
-use commonware_coding::ReedSolomon;
-use commonware_consensus::{
-    marshal::{coding::Coding, core::Mailbox as MarshalMailbox},
-    simplex::types::Finalization,
-    types::coding::Commitment,
-};
-use constantinople_primitives::{Block, Sealed};
+use crate::types::{EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant};
 
 mod actor;
 pub use actor::{Actor, Config};
 
 mod mailbox;
 pub use mailbox::Mailbox;
-
-type BootstrapBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
-type BootstrapVariant<H, P> = Coding<BootstrapBlock<H, P>, ReedSolomon<H>, H, P>;
-type BootstrapMarshal<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, BootstrapVariant<H, P>>;
-type BootstrapFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;

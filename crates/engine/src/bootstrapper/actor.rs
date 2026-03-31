@@ -19,8 +19,7 @@
 //! without a safe tip stay silent for that round.
 
 use super::{
-    BootstrapBlock, BootstrapFinalization, BootstrapMarshal, BootstrapVariant, Mailbox,
-    mailbox::Message,
+    EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant, Mailbox, mailbox::Message,
 };
 use crate::ThresholdScheme;
 use commonware_codec::{Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
@@ -82,8 +81,8 @@ where
     P: PublicKey,
     V: Variant,
 {
-    block: BootstrapBlock<H, P>,
-    finalization: BootstrapFinalization<P, V>,
+    block: EngineBlock<H, P>,
+    finalization: EngineFinalization<P, V>,
 }
 
 impl<H, P, V> Write for LatestTip<H, P, V>
@@ -119,7 +118,7 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
-            block: BootstrapBlock::<H, P>::read_cfg(buf, &cfg.block)?,
+            block: EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?,
             finalization: Finalization::<ThresholdScheme<P, V>, Commitment>::read_cfg(
                 buf,
                 &cfg.certificate,
@@ -244,11 +243,11 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    fn majority_block(&self, required: usize) -> Option<BootstrapBlock<H, P>> {
+    fn majority_block(&self, required: usize) -> Option<EngineBlock<H, P>> {
         let mut counts: Vec<(
-            <BootstrapBlock<H, P> as Digestible>::Digest,
+            <EngineBlock<H, P> as Digestible>::Digest,
             usize,
-            BootstrapBlock<H, P>,
+            EngineBlock<H, P>,
         )> = Vec::new();
 
         for (_, response) in &self.responses {
@@ -286,8 +285,8 @@ where
     peer_provider: M,
     blocker: B,
     scheme: ThresholdScheme<P, V>,
-    marshal: Option<BootstrapMarshal<H, P, V>>,
-    pending: Option<oneshot::Sender<BootstrapBlock<H, P>>>,
+    marshal: Option<EngineMarshalMailbox<H, P, V>>,
+    pending: Option<oneshot::Sender<EngineBlock<H, P>>>,
     fetch: Option<Fetch<H, P, V>>,
     retry_deadline: Option<SystemTime>,
     next_request_id: u64,
@@ -492,7 +491,7 @@ where
             return None;
         }
 
-        if <BootstrapVariant<H, P> as MarshalVariant>::commitment_to_inner(
+        if <EngineVariant<H, P> as MarshalVariant>::commitment_to_inner(
             finalization.proposal.payload,
         ) != block.digest()
         {
@@ -567,9 +566,9 @@ where
         let block = marshal.get_block(Identifier::Latest).await?;
         let height = block.height();
         let finalization = marshal.get_finalization(height).await?;
-        let block = <BootstrapVariant<H, P> as MarshalVariant>::into_inner(block);
+        let block = <EngineVariant<H, P> as MarshalVariant>::into_inner(block);
         debug_assert_eq!(
-            <BootstrapVariant<H, P> as MarshalVariant>::commitment_to_inner(
+            <EngineVariant<H, P> as MarshalVariant>::commitment_to_inner(
                 finalization.proposal.payload,
             ),
             block.digest(),
@@ -622,7 +621,7 @@ where
     }
 
     /// Deliver the selected block to the pending caller.
-    fn resolve_pending(&mut self, block: BootstrapBlock<H, P>) {
+    fn resolve_pending(&mut self, block: EngineBlock<H, P>) {
         self.fetch = None;
         self.retry_deadline = None;
         if let Some(sender) = self.pending.take() {
