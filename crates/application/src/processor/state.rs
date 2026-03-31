@@ -5,19 +5,19 @@
 //!
 //! - the loaded base account and storage snapshot
 //! - per-frame diffs that can be merged or discarded
-//! - access-list permissions and access-list construction
 //! - deterministic export of the final database changeset
 //!
 //! The state layer is deliberately persistence-agnostic. It only knows how to
 //! represent visible values and produce the slot/value writes that should be
 //! applied back to the database.
+//!
+//! Access-list declarations and observed-access tracking live in the sibling
+//! `access` module.
 
-use commonware_codec::FixedSize;
+use super::keys::{account_key, storage_key};
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use constantinople_primitives::{
-    Access, AccessList, AccessMode, Account, Address, Slot, StateValue,
-};
+use constantinople_primitives::{Account, Address, Slot, StateValue};
 use std::collections::{BTreeMap, HashMap};
 
 type StorageKey = (Address, Slot);
@@ -181,190 +181,6 @@ impl FrameDiff {
     }
 }
 
-/// Declared account and storage access for one transaction.
-///
-/// The processor builds this once from the transaction's explicit access list
-/// plus implicit top-level account accesses. Frames use it to reject reads and
-/// writes that were not declared up front.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AccessSet {
-    accounts: HashMap<Address, AccessMode>,
-    storage: HashMap<StorageKey, AccessMode>,
-}
-
-impl AccessSet {
-    /// Creates an access set from a transaction access list.
-    ///
-    /// The sender is always declared Write (nonce bump). The recipient mode
-    /// is caller-determined: Write when a value transfer occurs, Read for
-    /// zero-value calls.
-    pub(crate) fn new(
-        sender: Address,
-        recipient: Address,
-        recipient_mode: AccessMode,
-        access_list: &AccessList,
-    ) -> Self {
-        let mut access = Self::default();
-        access.allow_account(sender, AccessMode::Write);
-        access.allow_account(recipient, recipient_mode);
-
-        for entry in access_list {
-            match entry {
-                Access::Account(address, mode) => access.allow_account(*address, *mode),
-                Access::Storage(address, slot, mode) => {
-                    access.allow_storage(*address, *slot, *mode)
-                }
-            }
-        }
-
-        access
-    }
-
-    /// Returns whether `address` may be read.
-    pub(crate) fn can_read_account(&self, address: Address) -> bool {
-        self.accounts.contains_key(&address)
-    }
-
-    /// Returns whether `address` may be written.
-    pub(crate) fn can_write_account(&self, address: Address) -> bool {
-        self.accounts.get(&address) == Some(&AccessMode::Write)
-    }
-
-    /// Returns whether `(address, slot)` may be read.
-    pub(crate) fn can_read_storage(&self, address: Address, slot: Slot) -> bool {
-        self.storage.contains_key(&(address, slot))
-    }
-
-    /// Returns whether `(address, slot)` may be written.
-    pub(crate) fn can_write_storage(&self, address: Address, slot: Slot) -> bool {
-        self.storage.get(&(address, slot)) == Some(&AccessMode::Write)
-    }
-
-    /// Iterates the declared account accesses.
-    pub(crate) fn accounts(&self) -> impl Iterator<Item = (Address, AccessMode)> + '_ {
-        self.accounts
-            .iter()
-            .map(|(address, mode)| (*address, *mode))
-    }
-
-    /// Iterates the declared storage accesses.
-    pub(crate) fn storage(&self) -> impl Iterator<Item = (Address, Slot, AccessMode)> + '_ {
-        self.storage
-            .iter()
-            .map(|((address, slot), mode)| (*address, *slot, *mode))
-    }
-
-    /// Returns whether the observed accesses exactly match the declared set.
-    ///
-    /// Every declared entry must appear in the observed set with the same mode,
-    /// and the observed set must not contain entries absent from the declared
-    /// set. The second condition is already enforced at runtime by the frame
-    /// access checks, so this method only verifies the first direction.
-    pub(crate) fn is_exact_match(&self, observed: &AccessListBuilder) -> bool {
-        if self.accounts.len() != observed.accounts.len()
-            || self.storage.len() != observed.storage.len()
-        {
-            return false;
-        }
-
-        for (address, declared_mode) in &self.accounts {
-            match observed.accounts.get(address) {
-                Some(observed_mode) if observed_mode == declared_mode => {}
-                _ => return false,
-            }
-        }
-
-        for ((address, slot), declared_mode) in &self.storage {
-            match observed.storage.get(&(*address, *slot)) {
-                Some(observed_mode) if observed_mode == declared_mode => {}
-                _ => return false,
-            }
-        }
-
-        true
-    }
-
-    fn allow_account(&mut self, address: Address, mode: AccessMode) {
-        match self.accounts.get_mut(&address) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
-            None => {
-                self.accounts.insert(address, mode);
-            }
-        }
-    }
-
-    fn allow_storage(&mut self, address: Address, slot: Slot, mode: AccessMode) {
-        match self.storage.get_mut(&(address, slot)) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
-            None => {
-                self.storage.insert((address, slot), mode);
-            }
-        }
-    }
-}
-
-/// Observed account and storage accesses during one transaction.
-///
-/// This collects the strongest mode seen for each accessed item so the
-/// resulting access list can be reused for future execution.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AccessListBuilder {
-    accounts: BTreeMap<Address, AccessMode>,
-    storage: BTreeMap<StorageKey, AccessMode>,
-}
-
-impl AccessListBuilder {
-    /// Records account access for `address`.
-    pub(crate) fn record_account(&mut self, address: Address, mode: AccessMode) {
-        match self.accounts.get_mut(&address) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
-            None => {
-                self.accounts.insert(address, mode);
-            }
-        }
-    }
-
-    /// Records storage access for `(address, slot)`.
-    pub(crate) fn record_storage(&mut self, address: Address, slot: Slot, mode: AccessMode) {
-        match self.storage.get_mut(&(address, slot)) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
-            None => {
-                self.storage.insert((address, slot), mode);
-            }
-        }
-    }
-
-    /// Merges another builder into this one.
-    pub(crate) fn merge(&mut self, other: Self) {
-        for (address, mode) in other.accounts {
-            self.record_account(address, mode);
-        }
-
-        for ((address, slot), mode) in other.storage {
-            self.record_storage(address, slot, mode);
-        }
-    }
-
-    /// Converts the collected accesses into a deterministic access list.
-    pub(crate) fn into_access_list(self) -> AccessList {
-        let mut access_list = Vec::with_capacity(self.accounts.len() + self.storage.len());
-
-        for (address, mode) in self.accounts {
-            access_list.push(Access::Account(address, mode));
-        }
-
-        for ((address, slot), mode) in self.storage {
-            access_list.push(Access::Storage(address, slot, mode));
-        }
-
-        access_list
-    }
-}
-
 /// In-memory processor state.
 ///
 /// `State` combines the loaded base state with the committed in-memory diff
@@ -434,34 +250,4 @@ impl State {
     ) -> BTreeMap<Slot, StateValue> {
         self.diff.changeset::<H>(strategy)
     }
-}
-
-/// Builds the database key for an account.
-///
-/// The address occupies the first `Address::SIZE` bytes. The remaining bytes
-/// are zero.
-pub(crate) fn account_key(address: Address) -> Slot {
-    address.as_ref().into()
-}
-
-/// Builds the database key for a storage slot.
-///
-/// The key is `H(address || storage_slot)`.
-///
-/// # Panics
-///
-/// Panics if `H` does not produce a 32-byte digest.
-pub(crate) fn storage_key<H: Hasher>(hasher: &mut H, address: Address, storage_slot: Slot) -> Slot {
-    hasher.reset();
-    hasher.update(address.as_ref());
-    hasher.update(storage_slot.as_ref());
-
-    let digest = hasher.finalize();
-    assert_eq!(
-        digest.as_ref().len(),
-        Slot::SIZE,
-        "storage key hash must be 32 bytes",
-    );
-
-    Slot::from(digest.as_ref())
 }

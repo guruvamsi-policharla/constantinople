@@ -9,8 +9,13 @@
 //! - execute signed transaction slices
 //! - assert receipts and persistent changesets
 
-use super::{Frame, FrameError, Precompiles, Processor, ProcessorOutput, state::AccessListBuilder};
-use crate::application::{ProcessorError, StateDatabase, load_state};
+use super::{
+    Precompiles,
+    access::AccessListBuilder,
+    executor::{Processor, ProcessorOutput, ValidationResult},
+    frame::{Frame, FrameError},
+};
+use crate::consensus::{ProcessorError, StateDatabase, load_state};
 use bytes::Bytes;
 use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
@@ -353,7 +358,7 @@ impl ProcessorRun {
         match self
             .output
             .changeset
-            .get(&super::state::account_key(address))
+            .get(&super::keys::account_key(address))
         {
             Some(StateValue::Account(account)) => Some(*account),
             Some(StateValue::Storage(_)) => panic!("account key stored a storage value"),
@@ -363,7 +368,7 @@ impl ProcessorRun {
 
     fn storage_change(&self, address: Address, slot: Slot) -> Option<Slot> {
         let mut hasher = TestHasher::default();
-        let key = super::state::storage_key(&mut hasher, address, slot);
+        let key = super::keys::storage_key(&mut hasher, address, slot);
         match self.output.changeset.get(&key) {
             Some(StateValue::Storage(value)) => Some(*value),
             Some(StateValue::Account(_)) => panic!("storage key stored an account value"),
@@ -396,7 +401,7 @@ impl ProcessorHarness {
 
     async fn set_account(&self, address: Address, account: Account) {
         self.write_state([(
-            super::state::account_key(address),
+            super::keys::account_key(address),
             StateValue::Account(account),
         )])
         .await;
@@ -404,7 +409,7 @@ impl ProcessorHarness {
 
     async fn set_storage(&self, address: Address, slot: Slot, value: Slot) {
         let mut hasher = TestHasher::default();
-        let key = super::state::storage_key(&mut hasher, address, slot);
+        let key = super::keys::storage_key(&mut hasher, address, slot);
         self.write_state([(key, StateValue::Storage(value))]).await;
     }
 
@@ -501,27 +506,15 @@ impl ProcessorHarness {
         Ok(processor.process(state, transactions))
     }
 
-    async fn filter_invalid(
+    async fn validate(
         &self,
         transactions: &[TestSigned],
-    ) -> Result<Vec<TestSigned>, ProcessorError> {
+    ) -> Result<ValidationResult<TestPublicKey, TestHasher>, ProcessorError> {
         let batch = ManagedDb::new_batch(&self.db).await;
         let state = load_state(&batch, transactions).await?;
         let precompiles = self.precompiles.clone();
         let processor = Processor::new(&Sequential, &precompiles);
-        let (filtered, _output) = processor.filter_and_execute(state, transactions);
-        Ok(filtered)
-    }
-
-    async fn all_statically_valid(
-        &self,
-        transactions: &[TestSigned],
-    ) -> Result<bool, ProcessorError> {
-        let batch = ManagedDb::new_batch(&self.db).await;
-        let state = load_state(&batch, transactions).await?;
-        let precompiles = self.precompiles.clone();
-        let processor = Processor::new(&Sequential, &precompiles);
-        Ok(processor.all_statically_valid(state, transactions))
+        Ok(processor.validate(&state, transactions.to_vec()))
     }
 
     async fn write_state(&self, writes: impl IntoIterator<Item = (Slot, StateValue)>) {
@@ -718,7 +711,7 @@ fn malformed_loaded_account_value_returns_error() {
 
         harness
             .write_state([(
-                super::state::account_key(sender.address),
+                super::keys::account_key(sender.address),
                 StateValue::Storage(slot(0x01)),
             )])
             .await;
@@ -739,7 +732,7 @@ fn malformed_loaded_storage_value_returns_error() {
         let precompile = address(0x95);
         let slot_key = slot(0x96);
         let mut hasher = TestHasher::default();
-        let storage_key = super::state::storage_key(&mut hasher, precompile, slot_key);
+        let storage_key = super::keys::storage_key(&mut hasher, precompile, slot_key);
 
         harness
             .set_account(
@@ -2066,11 +2059,10 @@ fn reverted_tx_still_consumes_nonce_for_next_tx() {
 }
 
 #[test]
-fn bad_nonce_returns_revert_receipt_and_continues() {
+fn validate_filters_duplicate_nonce_from_batch() {
     run_test(|context| async move {
-        let mut harness = ProcessorHarness::new(context, "bad-nonce-continues").await;
+        let harness = ProcessorHarness::new(context, "bad-nonce-filtered").await;
         let sender = harness.signer([25; 32]);
-        let panic_precompile = address(0x48);
 
         harness
             .set_account(
@@ -2081,27 +2073,35 @@ fn bad_nonce_returns_revert_receipt_and_continues() {
                 },
             )
             .await;
-        harness.insert_precompile(panic_precompile, vec![PrecompileStep::Return(Bytes::new())]);
 
-        let run = harness
-            .execute_specs(&[
+        let transactions = harness
+            .transactions(&[
                 TransactionSpec::transfer(sender.clone(), address(0x58), 1, 0),
                 TransactionSpec::transfer(sender.clone(), address(0x59), 1, 0),
-                TransactionSpec::call(sender, panic_precompile, 0, 1, Bytes::new()),
+                TransactionSpec::transfer(sender.clone(), address(0x5A), 1, 1),
             ])
             .await
-            .expect("processing should succeed");
+            .expect("transaction building should succeed");
 
-        assert_receipt(&run, 0, ReceiptStatus::Success, Bytes::new());
-        assert_receipt(&run, 1, ReceiptStatus::Revert, Bytes::new());
-        assert_receipt(&run, 2, ReceiptStatus::Success, Bytes::new());
+        let result = harness
+            .validate(&transactions)
+            .await
+            .expect("validation should succeed");
+
+        // Nonces [0, 0, 1]: first nonce-0 passes, second nonce-0 is rejected
+        // (pending nonce is now 1), third nonce-1 passes.
+        assert_eq!(result.valid.len(), 2);
+        assert_eq!(result.valid[0].value().nonce, 0);
+        assert_eq!(result.valid[1].value().nonce, 1);
+        assert_eq!(result.invalid.len(), 1);
+        assert_eq!(result.invalid[0].value().nonce, 0);
     });
 }
 
 #[test]
-fn filter_invalid_drops_static_invalid_transactions() {
+fn validate_drops_static_invalid_transactions() {
     run_test(|context| async move {
-        let harness = ProcessorHarness::new(context, "filter-invalid-transactions").await;
+        let harness = ProcessorHarness::new(context, "validate-drops-invalid").await;
         let sender = harness.signer([53; 32]);
         let recipient = address(0x93);
 
@@ -2123,20 +2123,22 @@ fn filter_invalid_drops_static_invalid_transactions() {
             .await
             .expect("transaction building should succeed");
 
-        let filtered = harness
-            .filter_invalid(&transactions)
+        let result = harness
+            .validate(&transactions)
             .await
-            .expect("filtering should succeed");
+            .expect("validation should succeed");
 
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].value().nonce, 0);
+        assert_eq!(result.valid.len(), 1);
+        assert_eq!(result.valid[0].value().nonce, 0);
+        assert_eq!(result.invalid.len(), 1);
+        assert_eq!(result.invalid[0].value().nonce, 1);
     });
 }
 
 #[test]
-fn all_statically_valid_rejects_invalid_block_transaction() {
+fn validate_rejects_duplicate_nonce() {
     run_test(|context| async move {
-        let harness = ProcessorHarness::new(context, "all-statically-valid").await;
+        let harness = ProcessorHarness::new(context, "validate-duplicate-nonce").await;
         let sender = harness.signer([54; 32]);
         let recipient = address(0x94);
 
@@ -2158,12 +2160,15 @@ fn all_statically_valid_rejects_invalid_block_transaction() {
             .await
             .expect("transaction building should succeed");
 
-        let is_valid = harness
-            .all_statically_valid(&transactions)
+        let result = harness
+            .validate(&transactions)
             .await
             .expect("validation should succeed");
 
-        assert!(!is_valid);
+        // First nonce-0 passes, second is rejected because the pending
+        // nonce has already advanced to 1.
+        assert_eq!(result.valid.len(), 1);
+        assert_eq!(result.invalid.len(), 1);
     });
 }
 

@@ -1,28 +1,35 @@
-//! Callframe state and mutation helpers.
+//! Callframe execution surface for precompiles.
 //!
-//! This module defines [`Frame`], the execution surface exposed to
-//! precompiles. A frame provides:
+//! A [`Frame`] is the interface precompiles use to interact with on-chain
+//! state during execution. Each frame is scoped to an owner address and
+//! provides a narrow set of operations:
 //!
-//! - nested callframe creation
-//! - owner-scoped value transfer and storage writes
-//! - read access to declared accounts and storage
-//! - diff merge and discard behavior for child calls
+//! - **Read** any declared account or storage slot ([`inspect_account`],
+//!   [`inspect_storage`], [`read_storage`]).
+//! - **Write** the owner's storage slots ([`write_storage`]).
+//! - **Transfer** value from the owner to another account ([`transfer`]).
+//! - **Call** another precompile ([`call`]).
 //!
-//! Frames are intentionally narrow. They expose only the operations a
-//! precompile is allowed to perform and delegate persistence to the
-//! surrounding processor state.
+//! All operations are validated against the transaction's declared access
+//! list. Undeclared accesses return [`FrameError::AccessViolation`] and
+//! writes through read-only declarations return
+//! [`FrameError::WriteProtection`].
+//!
+//! [`inspect_account`]: Frame::inspect_account
+//! [`inspect_storage`]: Frame::inspect_storage
+//! [`read_storage`]: Frame::read_storage
+//! [`write_storage`]: Frame::write_storage
+//! [`transfer`]: Frame::transfer
+//! [`call`]: Frame::call
 
-use super::{Precompiles, Processor};
-use crate::processor::state::{AccessListBuilder, AccessSet, FrameDiff, State};
+use super::{Precompiles, executor::Processor};
+use crate::processor::{
+    access::{AccessListBuilder, AccessSet},
+    state::{FrameDiff, State},
+};
 use bytes::Bytes;
-#[cfg(test)]
-use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-#[cfg(test)]
-use constantinople_primitives::StateValue;
 use constantinople_primitives::{AccessMode, Account, Address, Slot};
-#[cfg(test)]
-use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// An execution halt inside a frame.
@@ -52,10 +59,13 @@ pub enum FrameError {
     PrecompilePanic,
 }
 
-/// An in-memory callframe.
+/// An in-memory callframe scoped to an owner address.
 ///
-/// A frame owns local writes in `diff` and resolves reads through this order:
-/// local diff, parent diffs, then committed processor state.
+/// Precompiles receive a `&mut Frame` and use it to read state, write
+/// owner-scoped storage, transfer value, and call other precompiles. All
+/// access is validated against the transaction's declared access list.
+///
+/// Reads resolve through: local diff → parent diffs → committed state.
 #[derive(Debug)]
 pub struct Frame<'a> {
     owner: Address,
@@ -193,14 +203,16 @@ impl<'a> Frame<'a> {
 
     /// Transfers value from the frame owner to `to`.
     ///
-    /// A zero-value transfer is a no-op.
+    /// Both accounts are always validated against the access list. A
+    /// zero-value transfer records Read access for both accounts; a non-zero
+    /// transfer records Write and moves the balance.
     ///
     /// # Errors
     ///
-    /// Returns [`FrameError::AccessViolation`] if the transaction did not
-    /// declare both account accesses, [`FrameError::WriteProtection`] if either
-    /// account is read-only, or a balance error if the transfer cannot be
-    /// applied.
+    /// Returns [`FrameError::AccessViolation`] if either account is not
+    /// declared, [`FrameError::WriteProtection`] if a non-zero transfer
+    /// targets a read-only account, or a balance error if the transfer
+    /// cannot be applied.
     pub fn transfer(&mut self, to: Address, value: u64) -> Result<(), FrameError> {
         self.transfer_between(self.owner, to, value)
     }
@@ -239,18 +251,6 @@ impl<'a> Frame<'a> {
     /// Merges only the observed accesses from a failed child into this frame.
     pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessListBuilder) {
         self.access_list_builder.merge(child_builder);
-    }
-
-    /// Produces a database changeset for the visible state of this frame.
-    ///
-    /// The exported changeset includes this frame's diff plus all visible
-    /// parent diffs.
-    #[cfg(test)]
-    pub(crate) fn changeset<H: Hasher>(
-        &self,
-        strategy: &impl Strategy,
-    ) -> BTreeMap<Slot, StateValue> {
-        self.visible_diff().changeset::<H>(strategy)
     }
 
     /// Consumes the frame and returns its local diff and observed accesses.
@@ -408,27 +408,6 @@ impl<'a> Frame<'a> {
         self.diff.set_storage(address, slot, original, value);
     }
 
-    /// Builds the full visible diff for this frame, including parent diffs.
-    #[cfg(test)]
-    fn visible_diff(&self) -> FrameDiff {
-        let mut diffs = Vec::new();
-        let mut current = Some(self);
-
-        while let Some(frame) = current {
-            diffs.push(frame.diff.clone());
-            current = frame.parent;
-        }
-
-        diffs.reverse();
-
-        let mut visible = FrameDiff::default();
-        for diff in diffs {
-            visible.merge(diff);
-        }
-
-        visible
-    }
-
     /// Records an observed account access.
     fn record_account_access(&mut self, address: Address, mode: AccessMode) {
         self.access_list_builder.record_account(address, mode);
@@ -443,7 +422,11 @@ impl<'a> Frame<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Frame, FrameError};
-    use crate::processor::state::{AccessListBuilder, AccessSet, State, account_key, storage_key};
+    use crate::processor::{
+        access::{AccessListBuilder, AccessSet},
+        keys::{account_key, storage_key},
+        state::State,
+    };
     use bytes::Bytes;
     use commonware_codec::{DecodeExt, FixedSize};
     use commonware_cryptography::blake3;
@@ -635,8 +618,12 @@ mod tests {
             .write_storage(child_slot, slot(0x88))
             .expect("child write should succeed");
 
+        // Merge child into parent and export the changeset.
+        let (child_diff, child_builder) = child.into_parts();
+        root.merge(child_diff, child_builder);
+        let (root_diff, _) = root.into_parts();
         let strategy = Sequential;
-        let frame_changeset = child.changeset::<blake3::Blake3>(&strategy);
+        let frame_changeset = root_diff.changeset::<blake3::Blake3>(&strategy);
 
         let mut expected = BTreeMap::new();
         expected.insert(

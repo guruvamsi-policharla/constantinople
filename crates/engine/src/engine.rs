@@ -53,7 +53,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, sync::AsyncRwLock, union};
-use constantinople_application::application::Application;
+use constantinople_application::consensus::Application;
 use constantinople_primitives::{Block, BlockCfg, Sealed};
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
@@ -224,10 +224,9 @@ where
         constantinople_primitives::Address,
         constantinople_primitives::Account,
     )>,
-    pub receipt_callback:
-        Option<constantinople_application::application::ReceiptCallback<H::Digest>>,
+    pub receipt_callback: Option<constantinople_application::consensus::ReceiptCallback<H::Digest>>,
     pub rejection_callback:
-        Option<constantinople_application::application::RejectionCallback<H::Digest>>,
+        Option<constantinople_application::consensus::RejectionCallback<H::Digest>>,
 }
 
 /// Fully assembled validator engine.

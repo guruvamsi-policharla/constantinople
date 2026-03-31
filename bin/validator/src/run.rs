@@ -37,13 +37,13 @@ impl Precompiles for NoopPrecompiles {
     fn execute<S>(
         &self,
         _address: Address,
-        _frame: &mut constantinople_application::processor::Frame<'_>,
-        _processor: &constantinople_application::processor::Processor<'_, S, Self>,
-    ) -> Result<bytes::Bytes, constantinople_application::processor::FrameError>
+        _frame: &mut constantinople_application::processor::frame::Frame<'_>,
+        _processor: &constantinople_application::processor::executor::Processor<'_, S, Self>,
+    ) -> Result<bytes::Bytes, constantinople_application::processor::frame::FrameError>
     where
         S: commonware_parallel::Strategy,
     {
-        Err(constantinople_application::processor::FrameError::InvalidTransactionTarget)
+        Err(constantinople_application::processor::frame::FrameError::InvalidTransactionTarget)
     }
 }
 
@@ -167,7 +167,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         );
 
         let mempool_inner = mempool.inner();
-        let receipt_callback: constantinople_application::application::ReceiptCallback<
+        let receipt_callback: constantinople_application::consensus::ReceiptCallback<
             <Sha256 as commonware_cryptography::Hasher>::Digest,
         > = std::sync::Arc::new(move |height, receipts| {
             let inner = mempool_inner.clone();
@@ -188,7 +188,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         });
 
         let rejection_inner = mempool.inner();
-        let rejection_callback: constantinople_application::application::RejectionCallback<
+        let rejection_callback: constantinople_application::consensus::RejectionCallback<
             <Sha256 as commonware_cryptography::Hasher>::Digest,
         > = std::sync::Arc::new(move |rejected_hashes| {
             let inner = rejection_inner.clone();

@@ -13,8 +13,13 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, sync::AsyncRwLock};
 use constantinople_application::{
-    application::load_state,
-    processor::{Frame, FrameError, Precompiles, PreparedExecution, Processor},
+    consensus::load_state,
+    processor::{
+        Precompiles,
+        executor::Processor,
+        frame::{Frame, FrameError},
+        state::State,
+    },
 };
 use constantinople_primitives::{
     Access, AccessList, AccessMode, Account, Address, Slot, StateValue, Transaction,
@@ -58,31 +63,31 @@ fn main() {
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn sequential_execution_low_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = low_contention_fixture(transaction_count);
-    bencher.bench_local(|| black_box(fixture.execute_only(&Sequential)));
+    bencher.bench_local(|| black_box(fixture.run(&Sequential)));
 }
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn parallel_execution_low_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = low_contention_fixture(transaction_count);
     let strategy = parallel_strategy();
-    bencher.bench_local(|| black_box(fixture.execute_only(&strategy)));
+    bencher.bench_local(|| black_box(fixture.run(&strategy)));
 }
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn sequential_execution_high_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = high_contention_fixture(transaction_count);
-    bencher.bench_local(|| black_box(fixture.execute_only(&Sequential)));
+    bencher.bench_local(|| black_box(fixture.run(&Sequential)));
 }
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn parallel_execution_high_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = high_contention_fixture(transaction_count);
     let strategy = parallel_strategy();
-    bencher.bench_local(|| black_box(fixture.execute_only(&strategy)));
+    bencher.bench_local(|| black_box(fixture.run(&strategy)));
 }
 
 struct BenchFixture {
-    prepared: PreparedExecution,
+    state: State,
     precompiles: BenchPrecompiles,
     transactions: Vec<TestSigned>,
 }
@@ -122,7 +127,7 @@ impl BenchFixture {
             ));
         }
 
-        Self::prepare(state_writes, precompiles, transactions)
+        Self::load(state_writes, precompiles, transactions)
     }
 
     fn high_contention(transaction_count: usize) -> Self {
@@ -159,21 +164,24 @@ impl BenchFixture {
             ));
         }
 
-        Self::prepare(state_writes, precompiles, transactions)
+        Self::load(state_writes, precompiles, transactions)
     }
 
-    fn execute_only<S>(&self, strategy: &S) -> usize
+    /// Benchmarks validate + process as the measured path.
+    fn run<S>(&self, strategy: &S) -> usize
     where
         S: Strategy,
     {
         let processor = Processor::<S, BenchPrecompiles>::new(strategy, &self.precompiles);
+        let result = processor.validate(&self.state, self.transactions.clone());
         processor
-            .execute_prepared(&self.prepared, &self.transactions)
+            .process(self.state.clone(), &result.valid)
             .receipts
             .len()
     }
 
-    fn prepare(
+    /// Loads state from the database outside of the measured path.
+    fn load(
         state_writes: Vec<(Address, Account)>,
         precompiles: BenchPrecompiles,
         transactions: Vec<TestSigned>,
@@ -196,11 +204,9 @@ impl BenchFixture {
             let state = load_state(&batch, &transactions)
                 .await
                 .expect("processor should preload state");
-            let processor = Processor::new(&Sequential, &precompiles);
-            let prepared = processor.prepare(state, &transactions);
 
             Self {
-                prepared,
+                state,
                 precompiles,
                 transactions,
             }

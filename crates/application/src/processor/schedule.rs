@@ -19,16 +19,11 @@
 //!
 //! That keeps the hot path cheap and avoids paying thread-pool overhead for
 //! schedules that are effectively serial anyway.
-//!
-//! Sources:
-//!
-//! - M. V. Hermenegildo and F. Bueno, "A methodology for granularity-based
-//!   control of parallelism in logic programs", 1996.
-//!   <https://doi.org/10.1006/jsco.1996.0038>
 
 use super::{
-    ProcessorOutput,
-    state::{AccessSet, FrameDiff, State},
+    access::AccessSet,
+    executor::ProcessorOutput,
+    state::{FrameDiff, State},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -39,7 +34,7 @@ use std::collections::HashMap;
 
 /// The result of executing a prepared transaction slice before changeset export.
 #[derive(Debug)]
-pub struct ExecutedPrepared<D: Digest> {
+pub(super) struct ExecutedPrepared<D: Digest> {
     /// The final in-memory state after all transaction diffs have been merged.
     pub state: State,
     /// Receipts in transaction order.
@@ -50,7 +45,7 @@ pub struct ExecutedPrepared<D: Digest> {
 
 /// Prepared processor inputs for repeated in-memory execution.
 #[derive(Debug, Clone)]
-pub struct PreparedExecution {
+pub(super) struct PreparedExecution {
     /// The loaded in-memory state snapshot to clone for each execution.
     pub(super) state: State,
     /// Per-transaction metadata shared across executions.

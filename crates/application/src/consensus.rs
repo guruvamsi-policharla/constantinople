@@ -15,8 +15,10 @@
 //! the processor owns the in-memory state transition logic.
 
 use crate::processor::{
-    Precompiles, Processor, ProcessorOutput, State,
-    state::{account_key, storage_key},
+    Precompiles,
+    executor::Processor,
+    keys::{account_key, storage_key},
+    state::State,
 };
 use commonware_codec::Encode;
 use commonware_consensus::{
@@ -108,15 +110,6 @@ pub type TransactionBatch<E, H> = ImmutableUnmerkleized<E, <H as Hasher>::Digest
 /// Unmerkleized batch tuple passed to application execution.
 pub type ApplicationBatches<E, H, T> = (StateBatch<E, H, T>, TransactionBatch<E, H>);
 
-/// The result of executing a block's transactions against application batches.
-#[derive(Debug)]
-pub struct ExecutedTransactions<B, D: Digest> {
-    /// Updated application batches after applying the processor output.
-    pub batches: B,
-    /// Receipts and state writes emitted by the processor.
-    pub output: ProcessorOutput<D>,
-}
-
 /// Errors raised while preparing processor state from the backing database.
 #[derive(Debug, Error)]
 pub enum ProcessorError {
@@ -124,14 +117,6 @@ pub enum ProcessorError {
     Database(#[from] StorageError),
     #[error("loaded value has wrong type for its key")]
     MalformedState,
-}
-
-/// Receipts emitted after a block is finalized.
-#[derive(Debug, Clone)]
-pub struct BlockReceipts<D: Digest> {
-    pub height: u64,
-    pub tx_hashes: Vec<D>,
-    pub receipts: Vec<Receipt<D>>,
 }
 
 /// Loads the declared processor state for `transactions` from `batch`.
@@ -160,33 +145,51 @@ where
     PK: PublicKey,
 {
     let (accounts, storage) = collect_preload_keys(transactions);
-    let mut base_accounts = HashMap::with_capacity(accounts.len());
-    for address in accounts {
-        let key = account_key(address);
-        let Some(value) = batch.get(&key).await? else {
-            continue;
-        };
 
+    // Build all database keys up front so loads can run concurrently.
+    let account_keys: Vec<_> = accounts
+        .iter()
+        .map(|address| (account_key(*address), *address))
+        .collect();
+    let mut hasher = H::default();
+    let storage_keys: Vec<_> = storage
+        .iter()
+        .map(|(address, slot)| (storage_key(&mut hasher, *address, *slot), *address, *slot))
+        .collect();
+
+    // Load all accounts and storage slots in parallel.
+    let (account_results, storage_results) = futures::future::try_join(
+        futures::future::try_join_all(
+            account_keys
+                .iter()
+                .map(|(key, _)| async move { batch.get(key).await }),
+        ),
+        futures::future::try_join_all(
+            storage_keys
+                .iter()
+                .map(|(key, _, _)| async move { batch.get(key).await }),
+        ),
+    )
+    .await?;
+
+    // Assemble the account map.
+    let mut base_accounts = HashMap::with_capacity(accounts.len());
+    for ((_, address), result) in account_keys.iter().zip(account_results) {
+        let Some(value) = result else { continue };
         let StateValue::Account(account) = value else {
             return Err(ProcessorError::MalformedState);
         };
-
-        base_accounts.insert(address, account);
+        base_accounts.insert(*address, account);
     }
 
+    // Assemble the storage map.
     let mut base_storage = HashMap::with_capacity(storage.len());
-    let mut hasher = H::default();
-    for (address, slot) in storage {
-        let key = storage_key(&mut hasher, address, slot);
-        let Some(value) = batch.get(&key).await? else {
-            continue;
-        };
-
+    for ((_, address, slot), result) in storage_keys.iter().zip(storage_results) {
+        let Some(value) = result else { continue };
         let StateValue::Storage(storage_value) = value else {
             return Err(ProcessorError::MalformedState);
         };
-
-        base_storage.insert((address, slot), storage_value);
+        base_storage.insert((*address, *slot), storage_value);
     }
 
     Ok(State::new(base_accounts, base_storage))
@@ -349,52 +352,6 @@ where
             .fold(batch, |batch, (address, account)| {
                 batch.write(account_key(*address), Some(StateValue::Account(*account)))
             })
-    }
-
-    /// Executes `transactions` against `state` and applies writes to `batches`.
-    fn execute_loaded_transactions<E>(
-        &self,
-        batches: ApplicationBatches<E, H, EightCap>,
-        state: State,
-        transactions: &[VerifiedTransaction<P, H>],
-    ) -> ExecutedTransactions<ApplicationBatches<E, H, EightCap>, H::Digest>
-    where
-        E: Storage + Clock + Metrics,
-    {
-        let (state_batch, transaction_batch) = batches;
-        let processor = Processor::new(self.strategy(), self.precompiles());
-        let output = processor.process(state, transactions);
-
-        let state_batch = output
-            .changeset
-            .iter()
-            .fold(state_batch, |batch, (key, value)| {
-                batch.write(*key, Some(value.clone()))
-            });
-        let transaction_batch = transactions
-            .iter()
-            .fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
-
-        ExecutedTransactions {
-            batches: (state_batch, transaction_batch),
-            output,
-        }
-    }
-
-    /// Loads state, executes transactions, and applies writes to `batches`.
-    pub async fn execute_transactions<E>(
-        &self,
-        batches: ApplicationBatches<E, H, EightCap>,
-        transactions: &[VerifiedTransaction<P, H>],
-    ) -> Result<ExecutedTransactions<ApplicationBatches<E, H, EightCap>, H::Digest>, ProcessorError>
-    where
-        E: Storage + Clock + Metrics,
-    {
-        let (state_batch, transaction_batch) = batches;
-        let state = load_state(&state_batch, transactions).await?;
-        Ok(self.execute_loaded_transactions((state_batch, transaction_batch), state, transactions))
     }
 
     /// Verifies signed wire transactions and returns verified execution transactions.
@@ -566,34 +523,32 @@ where
             .await
             .expect("proposed state loading must succeed");
         let processor = Processor::new(self.strategy(), self.precompiles());
-        let (transactions, output) = processor.filter_and_execute(state, &all_proposed);
+        let result = processor.validate(&state, all_proposed);
 
         // Notify rejected transaction waiters.
-        if let Some(ref callback) = self.rejection_callback {
-            let included: HashSet<_> = transactions
+        if let Some(ref callback) = self.rejection_callback
+            && !result.invalid.is_empty()
+        {
+            let rejected: Vec<_> = result
+                .invalid
                 .iter()
-                .map(|tx| tx.message_digest().as_ref().to_vec())
-                .collect();
-            let rejected: Vec<_> = all_proposed
-                .iter()
-                .filter(|tx| !included.contains(tx.message_digest().as_ref()))
                 .map(|tx| *tx.message_digest())
                 .collect();
-            if !rejected.is_empty() {
-                callback(rejected);
-            }
+            callback(rejected);
         }
 
+        let transaction_batch = result
+            .valid
+            .iter()
+            .fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
+        let output = processor.process(state, &result.valid);
         let state_batch = output
             .changeset
             .iter()
             .fold(state_batch, |batch, (key, value)| {
                 batch.write(*key, Some(value.clone()))
-            });
-        let transaction_batch = transactions
-            .iter()
-            .fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
             });
         if let Some(ref callback) = self.receipt_callback {
             callback(parent.header.height + 1, output.receipts.clone());
@@ -603,7 +558,7 @@ where
             .await
             .expect("database merkleization must succeed");
         let transactions_end =
-            parent.header.transactions_range.end() + transactions.len() as u64 + 1;
+            parent.header.transactions_range.end() + result.valid.len() as u64 + 1;
 
         let header = Header {
             context,
@@ -624,7 +579,8 @@ where
         };
         let block = Block::new(
             header,
-            transactions
+            result
+                .valid
                 .into_iter()
                 .map(VerifiedTransaction::into_inner)
                 .collect(),
@@ -641,9 +597,8 @@ where
     ///
     /// Verification rejects invalid transaction signatures and invalid
     /// timestamps, then waits until the block timestamp has passed to
-    /// account for clock skew. After the wait, it rejects any block that
-    /// contains a static-invalid transaction, re-executes the block, and
-    /// compares all derived roots and ranges.
+    /// account for clock skew. After the wait, it re-executes the block
+    /// and compares all derived roots and ranges.
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         (runtime, _context): (E, Self::Context),
@@ -685,24 +640,21 @@ where
             .await
             .expect("block state loading during verification must succeed");
         let processor = Processor::new(self.strategy(), self.precompiles());
-        if !processor.all_statically_valid(state.clone(), &verified_block.body) {
-            warn!(
-                height = block.header.height,
-                "verify rejected: static validation failed"
-            );
-            return None;
-        }
-        let executed = self.execute_loaded_transactions(
-            (state_batch, transaction_batch),
-            state,
-            &verified_block.body,
-        );
-        let ExecutedTransactions {
-            batches: (sb, tb),
-            output,
-        } = executed;
+        let transaction_batch = verified_block
+            .body
+            .iter()
+            .fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
+        let output = processor.process(state, &verified_block.body);
+        let state_batch = output
+            .changeset
+            .iter()
+            .fold(state_batch, |batch, (key, value)| {
+                batch.write(*key, Some(value.clone()))
+            });
         let (state_merkleized, transaction_merkleized, receipts_root) = self
-            .finalize_execution(sb, tb, &output.receipts)
+            .finalize_execution(state_batch, transaction_batch, &output.receipts)
             .await
             .expect("database merkleization during verification must succeed");
         let transactions_end =
@@ -782,20 +734,25 @@ where
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("certified block state loading must succeed");
-        let executed = self.execute_loaded_transactions(
-            (state_batch, transaction_batch),
-            state,
-            &verified_block.body,
-        );
-        let ExecutedTransactions {
-            batches: (sb, tb),
-            output,
-        } = executed;
+        let processor = Processor::new(self.strategy(), self.precompiles());
+        let transaction_batch = verified_block
+            .body
+            .iter()
+            .fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
+        let output = processor.process(state, &verified_block.body);
+        let state_batch = output
+            .changeset
+            .iter()
+            .fold(state_batch, |batch, (key, value)| {
+                batch.write(*key, Some(value.clone()))
+            });
         if let Some(ref callback) = self.receipt_callback {
             callback(block.header.height, output.receipts.clone());
         }
         let (state_merkleized, transaction_merkleized, _) = self
-            .finalize_execution(sb, tb, &output.receipts)
+            .finalize_execution(state_batch, transaction_batch, &output.receipts)
             .await
             .expect("database merkleization must succeed");
         (state_merkleized, transaction_merkleized)
@@ -838,7 +795,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Application, WireBlock};
-    use crate::processor::{Frame, FrameError, Precompiles, Processor};
+    use crate::processor::{
+        Precompiles,
+        executor::Processor,
+        frame::{Frame, FrameError},
+    };
     use bytes::Bytes;
     use commonware_codec::{Decode, Encode};
     use commonware_consensus::{

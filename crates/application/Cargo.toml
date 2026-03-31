@@ -8,9 +8,6 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
-[features]
-bench = []
-
 [lints]
 workspace = true
 
@@ -51,4 +48,3 @@ development = ["divan"]
 [[bench]]
 name = "processor"
 harness = false
-required-features = ["bench"]

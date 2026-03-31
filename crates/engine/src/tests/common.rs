@@ -17,7 +17,11 @@ use commonware_glue::simulate::{processed::ProcessedHeight, tracker::Finalizatio
 use commonware_runtime::{Clock, Metrics, Quota, Storage};
 use commonware_storage::metadata::{Config as MetadataConfig, Metadata};
 use commonware_utils::{N3f1, TryCollect, channel::mpsc, sequence::U64, sync::Mutex, test_rng};
-use constantinople_application::processor::{Frame, FrameError, Precompiles, Processor};
+use constantinople_application::processor::{
+    Precompiles,
+    executor::Processor,
+    frame::{Frame, FrameError},
+};
 use constantinople_primitives::{Block, Sealed};
 use std::{
     collections::{BTreeMap, HashMap},
