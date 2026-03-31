@@ -18,17 +18,16 @@ use constantinople_application::{
         Precompiles,
         executor::Processor,
         frame::{Frame, FrameError},
-        state::State,
+        state::{DiscoveryState, State},
     },
 };
 use constantinople_primitives::{
-    Access, AccessList, AccessMode, Account, Address, Slot, StateValue, Transaction,
-    VerifiedTransaction,
+    Account, Address, BlockAccessList, Slot, StateValue, Transaction, VerifiedTransaction,
 };
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     hint::black_box,
     marker::PhantomData,
     num::NonZeroUsize,
@@ -88,6 +87,7 @@ fn parallel_execution_high_contention(bencher: Bencher<'_, '_>, transaction_coun
 
 struct BenchFixture {
     state: State,
+    access_list: BlockAccessList,
     precompiles: BenchPrecompiles,
     transactions: Vec<TestSigned>,
 }
@@ -123,7 +123,6 @@ impl BenchFixture {
                 0,
                 0,
                 Bytes::copy_from_slice(value.as_ref()),
-                vec![Access::Storage(precompile, storage_slot, AccessMode::Write)],
             ));
         }
 
@@ -160,14 +159,13 @@ impl BenchFixture {
                 0,
                 0,
                 Bytes::copy_from_slice(value.as_ref()),
-                vec![Access::Storage(precompile, storage_slot, AccessMode::Write)],
             ));
         }
 
         Self::load(state_writes, precompiles, transactions)
     }
 
-    /// Benchmarks validate + process as the measured path.
+    /// Benchmarks validate + verify as the measured path.
     fn run<S>(&self, strategy: &S) -> usize
     where
         S: Strategy,
@@ -175,7 +173,8 @@ impl BenchFixture {
         let processor = Processor::<S, BenchPrecompiles>::new(strategy, &self.precompiles);
         let result = processor.validate(&self.state, self.transactions.clone());
         processor
-            .process(self.state.clone(), &result.valid)
+            .verify(self.state.clone(), &result.valid, &self.access_list)
+            .expect("bench BAL should verify")
             .receipts
             .len()
     }
@@ -200,13 +199,23 @@ impl BenchFixture {
             let db = Arc::new(AsyncRwLock::new(open_state_db(context, &suffix).await));
             write_accounts(&db, &state_writes).await;
 
+            let base_accounts = state_writes.iter().copied().collect::<HashMap<_, _>>();
+            let base_state = State::new(base_accounts, HashMap::new());
+            let processor = Processor::new(&Sequential, &precompiles);
+            let mut discovery_state = DiscoveryState::new(base_state);
+            let validation = processor.validate(&discovery_state, transactions.clone());
+            let access_list = processor
+                .propose(&mut discovery_state, &validation.valid)
+                .access_list;
+
             let batch = ManagedDb::new_batch(&db).await;
-            let state = load_state(&batch, &transactions)
+            let state = load_state(&batch, &access_list)
                 .await
                 .expect("processor should preload state");
 
             Self {
                 state,
+                access_list,
                 precompiles,
                 transactions,
             }
@@ -228,14 +237,7 @@ impl TestSigner {
         Self { seed, address }
     }
 
-    fn sign(
-        &self,
-        to: Address,
-        value: u64,
-        nonce: u64,
-        input: Bytes,
-        access_list: AccessList,
-    ) -> TestSigned {
+    fn sign(&self, to: Address, value: u64, nonce: u64, input: Bytes) -> TestSigned {
         let key = private_key(self.seed);
         Transaction {
             sender: key.public_key(),
@@ -243,7 +245,6 @@ impl TestSigner {
             input,
             value,
             nonce,
-            access_list,
             _digest: PhantomData,
         }
         .seal_and_sign_verified(&key, NAMESPACE, &mut TestHasher::default())
@@ -272,14 +273,15 @@ impl Precompiles for BenchPrecompiles {
         self.programs.contains_key(&address)
     }
 
-    fn execute<S>(
+    fn execute<S, R>(
         &self,
         address: Address,
-        frame: &mut Frame<'_>,
+        frame: &mut Frame<'_, R>,
         _processor: &Processor<'_, S, Self>,
     ) -> Result<Bytes, FrameError>
     where
         S: Strategy,
+        R: constantinople_application::processor::state::StateReader,
         Self: Sized,
     {
         let Some(program) = self.programs.get(&address) else {

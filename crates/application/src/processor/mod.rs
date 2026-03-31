@@ -47,13 +47,14 @@ pub trait Precompiles: Sync {
     /// The frame provides the precompile with access to account and storage
     /// state scoped to the declared access list. On success, return the
     /// output bytes. On failure, return a [`FrameError`](frame::FrameError).
-    fn execute<S>(
+    fn execute<S, R>(
         &self,
         address: Address,
-        frame: &mut frame::Frame<'_>,
+        frame: &mut frame::Frame<'_, R>,
         processor: &executor::Processor<'_, S, Self>,
     ) -> Result<Bytes, frame::FrameError>
     where
         S: Strategy,
+        R: state::StateReader,
         Self: Sized;
 }

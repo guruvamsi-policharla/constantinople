@@ -28,27 +28,6 @@ pub struct InclusionReceipt {
     pub status: String,
 }
 
-/// Result of simulating a transaction.
-#[derive(Debug, serde::Serialize)]
-pub struct SimulationResult {
-    pub success: bool,
-    pub status: String,
-    pub return_data: String,
-    pub access_list: Vec<String>,
-}
-
-/// Trait for reading state and simulating transactions. Implemented by the
-/// binary once the databases are available.
-pub trait StateReader: Send + Sync + 'static {
-    /// Simulate a transaction and return the access list and receipt.
-    fn simulate(
-        &self,
-        tx_bytes: &[u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<SimulationResult, String>> + Send + '_>,
-    >;
-}
-
 /// Mempool size limits.
 #[derive(Debug, Clone, Copy)]
 pub struct MempoolConfig {
@@ -230,30 +209,6 @@ where
     }
 }
 
-async fn simulate_tx<C, P, H>(
-    State(state): State<Arc<RouterState<C, P, H>>>,
-    body: String,
-) -> Result<Json<SimulationResult>, (StatusCode, String)>
-where
-    C: Digest + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-{
-    let reader = state.state_reader.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "databases not ready".to_string(),
-    ))?;
-
-    let bytes = decode_body_hex(&body)?;
-
-    let result = reader
-        .simulate(&bytes)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-
-    Ok(Json(result))
-}
-
 struct RouterState<C, P, H>
 where
     H: Hasher,
@@ -262,15 +217,11 @@ where
     inner: Arc<Mutex<MempoolInner<H, P>>>,
     namespace: &'static [u8],
     max_pool_bytes: usize,
-    state_reader: Option<Arc<dyn StateReader>>,
     _marker: std::marker::PhantomData<C>,
 }
 
 /// Creates the axum router for the mempool HTTP API.
-pub fn router<C, P, H>(
-    mempool: &Mempool<C, P, H>,
-    state_reader: Option<Arc<dyn StateReader>>,
-) -> Router
+pub fn router<C, P, H>(mempool: &Mempool<C, P, H>) -> Router
 where
     C: Digest + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
@@ -280,12 +231,10 @@ where
         inner: mempool.inner(),
         namespace: mempool.transaction_namespace(),
         max_pool_bytes: mempool.config().max_pool_bytes,
-        state_reader,
         _marker: std::marker::PhantomData::<C>,
     });
 
     Router::new()
         .route("/tx", post(submit_tx::<C, P, H>))
-        .route("/simulate", post(simulate_tx::<C, P, H>))
         .with_state(state)
 }

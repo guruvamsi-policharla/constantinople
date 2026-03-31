@@ -17,13 +17,28 @@
 use super::keys::{account_key, storage_key};
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Account, Address, Slot, StateValue};
+use constantinople_primitives::{Account, AccountWrite, Address, Slot, StateValue, StorageWrite};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
 
 type StorageKey = (Address, Slot);
+
+/// Reads visible state values for execution.
+///
+/// This trait is implemented by both the fully preloaded verifier state and
+/// the proposer-side lazy discovery state. Callers always observe the current
+/// visible value for a key, with missing data represented as the default
+/// account or slot value.
+pub trait StateReader {
+    /// Returns the visible account value for `address`.
+    fn account(&self, address: Address) -> Account;
+
+    /// Returns the visible storage value for `(address, slot)`.
+    fn storage(&self, address: Address, slot: Slot) -> Slot;
+}
 
 /// Tracks one value that changed during execution.
 ///
@@ -182,6 +197,35 @@ impl FrameDiff {
 
         changeset
     }
+
+    /// Returns the final changed account values in deterministic order.
+    pub(crate) fn account_writes(&self) -> Vec<AccountWrite> {
+        let mut writes = self
+            .accounts
+            .iter()
+            .map(|(address, tracked)| AccountWrite {
+                address: *address,
+                account: tracked.current(),
+            })
+            .collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|write| write.address);
+        writes
+    }
+
+    /// Returns the final changed storage values in deterministic order.
+    pub(crate) fn storage_writes(&self) -> Vec<StorageWrite> {
+        let mut writes = self
+            .storage
+            .iter()
+            .map(|((address, slot), tracked)| StorageWrite {
+                address: *address,
+                slot: *slot,
+                value: tracked.current(),
+            })
+            .collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|write| (write.address, write.slot));
+        writes
+    }
 }
 
 /// In-memory processor state.
@@ -256,5 +300,104 @@ impl State {
         strategy: &impl Strategy,
     ) -> BTreeMap<Slot, StateValue> {
         self.diff.changeset::<H>(strategy)
+    }
+
+    /// Returns the final changed values in deterministic order.
+    pub(crate) fn writes(&self) -> (Vec<AccountWrite>, Vec<StorageWrite>) {
+        (self.diff.account_writes(), self.diff.storage_writes())
+    }
+}
+
+impl StateReader for State {
+    fn account(&self, address: Address) -> Account {
+        Self::account(self, address)
+    }
+
+    fn storage(&self, address: Address, slot: Slot) -> Slot {
+        Self::storage(self, address, slot)
+    }
+}
+
+/// Proposal-time state with lazy base reads.
+///
+/// `DiscoveryState` wraps another [`StateReader`] and caches every base read
+/// on demand. The proposer executes sequentially over this state to discover
+/// the canonical BAL and final writes without preloading the entire block's
+/// footprint up front.
+#[derive(Debug)]
+pub struct DiscoveryState<R: StateReader> {
+    reader: R,
+    base_accounts: RefCell<HashMap<Address, Account>>,
+    base_storage: RefCell<HashMap<StorageKey, Slot>>,
+    diff: FrameDiff,
+}
+
+impl<R: StateReader> DiscoveryState<R> {
+    /// Creates an empty lazy state backed by `reader`.
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            base_accounts: RefCell::new(HashMap::new()),
+            base_storage: RefCell::new(HashMap::new()),
+            diff: FrameDiff::default(),
+        }
+    }
+
+    /// Commits a frame diff into the state.
+    pub(crate) fn apply(&mut self, diff: FrameDiff) {
+        self.diff.merge(diff);
+    }
+
+    /// Produces a database changeset for the committed state diff.
+    pub(crate) fn changeset<H: Hasher>(
+        &self,
+        strategy: &impl Strategy,
+    ) -> BTreeMap<Slot, StateValue> {
+        self.diff.changeset::<H>(strategy)
+    }
+
+    /// Returns the final changed values in deterministic order.
+    pub(crate) fn writes(&self) -> (Vec<AccountWrite>, Vec<StorageWrite>) {
+        (self.diff.account_writes(), self.diff.storage_writes())
+    }
+
+    fn load_account(&self, address: Address) -> Account {
+        if let Some(account) = self.diff.account(address) {
+            return account;
+        }
+
+        if let Some(account) = self.base_accounts.borrow().get(&address).copied() {
+            return account;
+        }
+
+        let loaded = self.reader.account(address);
+        self.base_accounts.borrow_mut().insert(address, loaded);
+        loaded
+    }
+
+    fn load_storage(&self, address: Address, slot: Slot) -> Slot {
+        if let Some(value) = self.diff.storage(address, slot) {
+            return value;
+        }
+
+        if let Some(value) = self.base_storage.borrow().get(&(address, slot)).copied() {
+            return value;
+        }
+
+        let loaded = self.reader.storage(address, slot);
+        self.base_storage
+            .borrow_mut()
+            .insert((address, slot), loaded);
+        loaded
+    }
+}
+
+impl<R: StateReader> StateReader for DiscoveryState<R> {
+    fn account(&self, address: Address) -> Account {
+        self.load_account(address)
+    }
+
+    fn storage(&self, address: Address, slot: Slot) -> Slot {
+        self.load_storage(address, slot)
     }
 }

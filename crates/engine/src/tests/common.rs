@@ -148,14 +148,15 @@ impl Precompiles for NoopPrecompiles {
         false
     }
 
-    fn execute<S>(
+    fn execute<S, R>(
         &self,
         _address: constantinople_primitives::Address,
-        _frame: &mut Frame<'_>,
+        _frame: &mut Frame<'_, R>,
         _processor: &Processor<'_, S, Self>,
     ) -> Result<Bytes, FrameError>
     where
         S: commonware_parallel::Strategy,
+        R: constantinople_application::processor::state::StateReader,
     {
         Err(FrameError::InvalidTransactionTarget)
     }

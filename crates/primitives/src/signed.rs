@@ -394,7 +394,6 @@ mod test {
             input: bytes::Bytes::new(),
             value: 0,
             nonce: 0,
-            access_list: Vec::new(),
             _digest: core::marker::PhantomData::<blake3::Digest>,
         }
         .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
@@ -417,7 +416,6 @@ mod test {
             input: bytes::Bytes::new(),
             value: 0,
             nonce: 0,
-            access_list: Vec::new(),
             _digest: core::marker::PhantomData::<blake3::Digest>,
         }
         .seal_and_sign_verified(&private_key, NAMESPACE, hasher);

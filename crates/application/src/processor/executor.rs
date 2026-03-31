@@ -1,51 +1,51 @@
 //! Transaction execution engine.
 //!
-//! The [`Processor`] struct orchestrates transaction execution: it validates
-//! transactions, manages the prelude nonce bump, dispatches to precompiles or
-//! plain transfers, and enforces exact access-list matching after each
-//! successful execution.
+//! The [`Processor`] struct orchestrates transaction execution in two modes:
 //!
-//! The public API has two stages:
-//!
-//! 1. [`Processor::validate`] — splits a batch into statically valid and
-//!    invalid transactions, tracking nonce state across the batch.
-//! 2. [`Processor::process`] — executes the validated transactions with
-//!    greedy dependency scheduling.
+//! 1. [`Processor::propose`] executes sequentially over a lazy state reader
+//!    and builds the block access list (BAL) for proposal.
+//! 2. [`Processor::verify`] executes against a preloaded in-memory [`State`]
+//!    and validates the declared BAL during verification.
 
 use super::{
     Precompiles,
-    access::{AccessObserver, AccessSet},
+    access::{AccessListBuilder, AccessSet},
     frame::{Frame, FrameError},
     schedule::{self, TransactionExecution},
-    state::{FrameDiff, State},
+    state::{DiscoveryState, State, StateReader},
 };
 use bytes::Bytes;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    AccessList, AccessMode, Address, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
+    BlockAccessList, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
 };
 use std::{
     collections::{BTreeMap, HashMap},
     panic::{AssertUnwindSafe, catch_unwind},
 };
+use thiserror::Error;
 
 const MAX_CALL_DEPTH: u16 = 64;
 
-/// The final result of processing a set of transactions.
+/// The final result of verifier-side execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessorOutput<D: Digest> {
+pub struct ExecutionOutput<D: Digest> {
     /// Receipts in transaction order.
     pub receipts: Vec<Receipt<D>>,
-    /// Persistent database writes produced by the processed transactions.
+    /// Persistent database writes produced by execution.
     pub changeset: BTreeMap<Slot, StateValue>,
-    /// Optionally built access lists for the processed transactions.
-    ///
-    /// This field is `None` unless access-list building is enabled on the
-    /// processor via [`Processor::with_access_list_builder`]. When enabled,
-    /// successful transactions produce `Some(access_list)` and reverted
-    /// transactions produce `None`.
-    pub access_lists: Option<Vec<Option<AccessList>>>,
+}
+
+/// The result of proposer-side execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalOutput<D: Digest> {
+    /// Receipts in transaction order.
+    pub receipts: Vec<Receipt<D>>,
+    /// Persistent database writes produced by execution.
+    pub changeset: BTreeMap<Slot, StateValue>,
+    /// The discovered block access list.
+    pub access_list: BlockAccessList,
 }
 
 /// The result of [`Processor::validate`].
@@ -57,12 +57,18 @@ pub struct ValidationResult<PK: PublicKey, H: Hasher> {
     pub invalid: Vec<VerifiedTransaction<PK, H>>,
 }
 
-/// Executes transactions against the in-memory processor state.
-///
-/// The processor uses the declared transaction access lists to build greedy
-/// dependency rounds. Each round executes against the same committed state
-/// snapshot, and the resulting receipts and diffs are merged back into the
-/// processor state in the original transaction order.
+/// Errors raised while verifying a declared block access list.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VerificationError {
+    #[error("block access list has an invalid transaction layout")]
+    MalformedBlockAccessList,
+    #[error("transaction {transaction_index} declared accesses do not exactly match execution")]
+    AccessListMismatch { transaction_index: usize },
+    #[error("block access list final writes do not match execution")]
+    FinalStateMismatch,
+}
+
+/// Executes transactions for BAL proposal and verification.
 pub struct Processor<'a, S, P>
 where
     S: Strategy,
@@ -70,7 +76,6 @@ where
 {
     strategy: &'a S,
     precompiles: &'a P,
-    access_list_builder: bool,
 }
 
 impl<S, P> core::fmt::Debug for Processor<'_, S, P>
@@ -94,29 +99,13 @@ where
         Self {
             strategy,
             precompiles,
-            access_list_builder: false,
         }
     }
 
-    /// Enables access-list collection during execution.
-    ///
-    /// Successful transactions will return the observed access list in
-    /// [`ProcessorOutput::access_lists`].
-    pub const fn with_access_list_builder(mut self) -> Self {
-        self.access_list_builder = true;
-        self
-    }
-
     /// Splits `transactions` into statically valid and invalid sets.
-    ///
-    /// Each transaction is checked against the visible state for correct
-    /// nonce, sufficient balance, and valid precompile target. A pending
-    /// nonce map tracks nonce increments across the batch so sequential
-    /// transactions from the same sender validate correctly without
-    /// mutating the underlying state.
     pub fn validate<H, PK>(
         &self,
-        state: &State,
+        state: &impl StateReader,
         transactions: Vec<VerifiedTransaction<PK, H>>,
     ) -> ValidationResult<PK, H>
     where
@@ -150,63 +139,174 @@ where
         ValidationResult { valid, invalid }
     }
 
-    /// Processes pre-validated transactions against `state` and returns
-    /// receipts plus the final state diff.
+    /// Sequentially executes `transactions` and builds the BAL for proposal.
     ///
-    /// Callers should pass only transactions that have been through
-    /// [`Processor::validate`]. The processor greedily partitions them into
-    /// dependency rounds and executes through the configured [`Strategy`].
-    pub fn process<H, PK>(
+    /// The discovered BAL uses the processor's canonical access ordering and
+    /// deterministic final-write ordering so verifiers can later check it
+    /// exactly.
+    pub fn propose<H, PK, R>(
+        &self,
+        state: &mut DiscoveryState<R>,
+        transactions: &[VerifiedTransaction<PK, H>],
+    ) -> ProposalOutput<H::Digest>
+    where
+        H: Hasher,
+        PK: PublicKey,
+        R: StateReader,
+    {
+        let mut receipts = Vec::with_capacity(transactions.len());
+        let mut transaction_accesses = Vec::with_capacity(transactions.len());
+        let permissive_access = AccessSet::permissive();
+
+        for transaction in transactions {
+            let result = self.execute_for_proposal(state, transaction, &permissive_access);
+            state.apply(result.diff);
+            receipts.push(result.receipt);
+            transaction_accesses.push(result.observed_accesses);
+        }
+
+        let (account_writes, storage_writes) = state.writes();
+        let access_list = BlockAccessList::from_transactions(
+            transaction_accesses,
+            account_writes,
+            storage_writes,
+        );
+
+        ProposalOutput {
+            receipts,
+            changeset: state.changeset::<H>(self.strategy),
+            access_list,
+        }
+    }
+
+    /// Verifies pre-validated transactions against `state`.
+    ///
+    /// This is the verifier path. Each transaction must access exactly the
+    /// declared BAL slice, no more and no less, and the declared final writes
+    /// must exactly match the final committed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerificationError::MalformedBlockAccessList`] if the BAL layout is
+    /// structurally invalid, [`VerificationError::AccessListMismatch`] if any
+    /// transaction's declared access slice does not match execution exactly,
+    /// or [`VerificationError::FinalStateMismatch`] if the declared final writes do
+    /// not equal the final state after execution.
+    pub fn verify<H, PK>(
         &self,
         state: State,
         transactions: &[VerifiedTransaction<PK, H>],
-    ) -> ProcessorOutput<H::Digest>
+        access_list: &BlockAccessList,
+    ) -> Result<ExecutionOutput<H::Digest>, VerificationError>
     where
         H: Hasher,
         PK: PublicKey,
     {
-        let prepared = schedule::prepare(
+        if !access_list.is_well_formed(transactions.len()) {
+            return Err(VerificationError::MalformedBlockAccessList);
+        }
+
+        let declared_accesses = access_list
+            .transaction_accesses()
+            .map(AccessSet::new)
+            .collect();
+        let executed = schedule::execute(
             self.strategy,
             state,
+            declared_accesses,
             transactions,
-            transaction_access_set::<H, PK>,
-        );
-        schedule::execute(
-            self.strategy,
-            &prepared,
-            transactions,
-            self.access_list_builder,
-            |state, transaction, access, return_access_list| {
-                self.execute_validated_transaction(state, transaction, access, return_access_list)
-            },
+            |state, transaction, access| self.execute_for_verification(state, transaction, access),
         )
+        .map_err(|transaction_index| VerificationError::AccessListMismatch { transaction_index })?;
+
+        for (transaction_index, (declared, observed_accesses)) in access_list
+            .transaction_accesses()
+            .zip(executed.observed_accesses.iter())
+            .enumerate()
+        {
+            // Verification is intentionally strict: the declared BAL slice must
+            // exactly match the canonical observed access list, including
+            // duplicate-free normalization and deterministic ordering.
+            if declared != observed_accesses.as_slice() {
+                return Err(VerificationError::AccessListMismatch { transaction_index });
+            }
+        }
+
+        let (account_writes, storage_writes) = executed.state.writes();
+        if account_writes != access_list.account_writes
+            || storage_writes != access_list.storage_writes
+        {
+            return Err(VerificationError::FinalStateMismatch);
+        }
+
+        Ok(ExecutionOutput {
+            receipts: executed.receipts,
+            changeset: executed.state.changeset::<H>(self.strategy),
+        })
     }
 
-    /// Executes a single transaction against `state`.
-    fn execute_validated_transaction<H, PK>(
+    /// Executes one transaction during proposal.
+    fn execute_for_proposal<H, PK, V>(
         &self,
-        state: &State,
+        state: &V,
         transaction: &VerifiedTransaction<PK, H>,
         access: &AccessSet,
-        return_access_list: bool,
     ) -> TransactionExecution<H::Digest>
     where
         H: Hasher,
         PK: PublicKey,
+        V: StateReader,
+    {
+        self.execute_transaction(state, transaction, access, false)
+            .expect("permissive proposal execution must not fail access enforcement")
+    }
+
+    /// Executes one transaction during verification.
+    fn execute_for_verification<H, PK, V>(
+        &self,
+        state: &V,
+        transaction: &VerifiedTransaction<PK, H>,
+        access: &AccessSet,
+    ) -> Result<TransactionExecution<H::Digest>, ()>
+    where
+        H: Hasher,
+        PK: PublicKey,
+        V: StateReader,
+    {
+        self.execute_transaction(state, transaction, access, true)
+    }
+
+    /// Executes a single transaction against `state`.
+    fn execute_transaction<H, PK, V>(
+        &self,
+        state: &V,
+        transaction: &VerifiedTransaction<PK, H>,
+        access: &AccessSet,
+        fail_on_access_violation: bool,
+    ) -> Result<TransactionExecution<H::Digest>, ()>
+    where
+        H: Hasher,
+        PK: PublicKey,
+        V: StateReader,
     {
         let sender = transaction.signer();
-        let observer = if return_access_list {
-            AccessObserver::builder()
-        } else {
-            AccessObserver::counter(access)
-        };
-        let mut prelude = Frame::new(sender, state, access, observer, 0, 0, Bytes::new());
+        let mut prelude = Frame::new(
+            sender,
+            state,
+            access,
+            AccessListBuilder::default(),
+            0,
+            0,
+            Bytes::new(),
+        );
+
         if prelude.bump_sender_nonce().is_err() {
-            return TransactionExecution {
+            let (diff, observed_accesses) = prelude.into_parts();
+            return Ok(TransactionExecution {
                 receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
-                diff: FrameDiff::default(),
-                access_list: None,
-            };
+                diff,
+                observed_accesses: observed_accesses.into_access_list(),
+            });
         }
 
         let tx = transaction.value();
@@ -219,52 +319,52 @@ where
 
         match result {
             Ok(return_data) => {
-                let (diff, child_observer) = root.into_parts();
-                prelude.merge(diff, child_observer);
-                let (diff, observer) = prelude.into_parts();
+                let (diff, child_accesses) = root.into_parts();
+                prelude.merge(diff, child_accesses);
+                let (diff, observed_accesses) = prelude.into_parts();
 
-                if !access.is_exact_match(&observer) {
-                    return TransactionExecution {
-                        receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
-                        diff,
-                        access_list: None,
-                    };
-                }
-
-                TransactionExecution {
+                Ok(TransactionExecution {
                     receipt: Receipt::new(
                         *transaction.message_digest(),
                         ReceiptStatus::Success,
                         return_data,
                     ),
                     diff,
-                    access_list: observer.into_access_list(),
-                }
+                    observed_accesses: observed_accesses.into_access_list(),
+                })
             }
             Err(err) => {
+                if fail_on_access_violation
+                    && matches!(
+                        err,
+                        FrameError::AccessViolation | FrameError::WriteProtection
+                    )
+                {
+                    return Err(());
+                }
+
                 let payload = match err {
-                    FrameError::Revert(p) => p,
+                    FrameError::Revert(payload) => payload,
                     _ => Bytes::new(),
                 };
-                let (diff, _) = prelude.into_parts();
-                TransactionExecution {
+                let (_, child_accesses) = root.into_parts();
+                prelude.merge_access_list_builder(child_accesses);
+                let (diff, observed_accesses) = prelude.into_parts();
+
+                Ok(TransactionExecution {
                     receipt: Receipt::revert(*transaction.message_digest(), payload),
                     diff,
-                    access_list: None,
-                }
+                    observed_accesses: observed_accesses.into_access_list(),
+                })
             }
         }
     }
 
     /// Executes a nested precompile call from `frame`.
-    ///
-    /// Successful child calls merge their diffs into the parent frame.
-    /// Reverted or halted child calls discard their state diff but still
-    /// propagate any observed accesses.
-    pub(super) fn call_precompile(
+    pub(super) fn call_precompile<R: StateReader>(
         &self,
-        frame: &mut Frame<'_>,
-        to: Address,
+        frame: &mut Frame<'_, R>,
+        to: constantinople_primitives::Address,
         value: u64,
         input: Bytes,
     ) -> Result<Bytes, FrameError> {
@@ -292,20 +392,4 @@ where
 
         result
     }
-}
-
-/// Builds the effective declared access set for `transaction`.
-pub(super) fn transaction_access_set<H, PK>(transaction: &VerifiedTransaction<PK, H>) -> AccessSet
-where
-    H: Hasher,
-    PK: PublicKey,
-{
-    let sender = transaction.signer();
-    let tx = transaction.value();
-    let recipient_mode = if tx.value > 0 {
-        AccessMode::Write
-    } else {
-        AccessMode::Read
-    };
-    AccessSet::new(sender, tx.to, recipient_mode, &tx.access_list)
 }

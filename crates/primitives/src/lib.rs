@@ -10,6 +10,9 @@ pub use signed::{Signable, Signed, Verified};
 mod account;
 pub use account::{Account, Address, Slot, StateValue};
 
+mod bal;
+pub use bal::{AccountWrite, BlockAccessList, BlockAccessListCfg, StorageWrite};
+
 mod block;
 pub use block::{
     Block, BlockCfg, Header, SignedBlock, SignedTransaction, VerifiedBlock, VerifiedTransaction,

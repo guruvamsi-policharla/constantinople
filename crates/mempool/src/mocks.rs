@@ -94,7 +94,6 @@ mod tests {
             input: Bytes::new(),
             value: 1,
             nonce,
-            access_list: vec![],
             _digest: core::marker::PhantomData,
         }
         .seal_and_sign_verified(key, NAMESPACE, hasher)
@@ -136,6 +135,7 @@ mod tests {
             transactions_root: blake3::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
             receipts_root: blake3::Digest::EMPTY,
+            block_access_list_hash: blake3::Digest::EMPTY,
         };
 
         let first = futures::executor::block_on(source.propose(&parent, &test_context()));

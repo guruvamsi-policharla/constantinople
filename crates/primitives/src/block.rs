@@ -6,7 +6,7 @@
 //! - [`Block`] - Execution payload and required consensus metadata.
 
 use crate::{
-    Sealable, Sealed, Signed, Verified,
+    BlockAccessList, BlockAccessListCfg, Sealable, Sealed, Signed, Verified,
     transaction::{Transaction, TransactionCfg},
 };
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
@@ -42,6 +42,8 @@ where
     pub transactions_range: NonEmptyRange<u64>,
     /// A root of all transaction receipts in this block.
     pub receipts_root: D,
+    /// The digest of the encoded block access list.
+    pub block_access_list_hash: D,
 }
 
 impl<C, D, P> Header<C, D, P>
@@ -74,6 +76,7 @@ where
             + self.transactions_root.encode_size()
             + self.transactions_range.encode_size()
             + self.receipts_root.encode_size()
+            + self.block_access_list_hash.encode_size()
     }
 }
 
@@ -93,6 +96,7 @@ where
         self.transactions_root.write(buf);
         self.transactions_range.write(buf);
         self.receipts_root.write(buf);
+        self.block_access_list_hash.write(buf);
     }
 }
 
@@ -116,6 +120,7 @@ where
             transactions_root: D::read(buf)?,
             transactions_range: NonEmptyRange::read(buf)?,
             receipts_root: D::read(buf)?,
+            block_access_list_hash: D::read(buf)?,
         })
     }
 }
@@ -138,6 +143,7 @@ where
             transactions_root: u.arbitrary()?,
             transactions_range: u.arbitrary()?,
             receipts_root: u.arbitrary()?,
+            block_access_list_hash: u.arbitrary()?,
         })
     }
 }
@@ -147,6 +153,14 @@ where
 pub struct BlockCfg {
     /// Maximum number of transactions in the block body.
     pub max_transactions: RangeCfg<usize>,
+    /// Maximum number of declared per-transaction offsets in the BAL.
+    pub max_tx_offsets: RangeCfg<usize>,
+    /// Maximum number of declared accesses in the BAL.
+    pub max_tx_accesses: RangeCfg<usize>,
+    /// Maximum number of final account writes in the BAL.
+    pub max_account_writes: RangeCfg<usize>,
+    /// Maximum number of final storage writes in the BAL.
+    pub max_storage_writes: RangeCfg<usize>,
     /// Codec configuration for individual transactions.
     pub transaction: TransactionCfg,
 }
@@ -155,6 +169,10 @@ impl Default for BlockCfg {
     fn default() -> Self {
         Self {
             max_transactions: RangeCfg::new(0..=usize::MAX),
+            max_tx_offsets: RangeCfg::new(0..=usize::MAX),
+            max_tx_accesses: RangeCfg::new(0..=usize::MAX),
+            max_account_writes: RangeCfg::new(0..=usize::MAX),
+            max_storage_writes: RangeCfg::new(0..=usize::MAX),
             transaction: TransactionCfg::default(),
         }
     }
@@ -184,6 +202,8 @@ where
 {
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
+    /// The block access list committed by `header`.
+    pub access_list: BlockAccessList,
     /// Ordered transactions included in this execution payload.
     pub body: Vec<Tx>,
 }
@@ -200,6 +220,7 @@ where
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
             header: u.arbitrary()?,
+            access_list: u.arbitrary()?,
             body: u.arbitrary()?,
         })
     }
@@ -213,7 +234,9 @@ where
     Tx: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.header == other.header && self.body == other.body
+        self.header == other.header
+            && self.access_list == other.access_list
+            && self.body == other.body
     }
 }
 
@@ -234,8 +257,16 @@ where
     H: Hasher,
 {
     /// Creates a new block.
-    pub const fn new(header: Header<C, H::Digest, P>, body: Vec<Tx>) -> Self {
-        Self { header, body }
+    pub const fn new(
+        header: Header<C, H::Digest, P>,
+        access_list: BlockAccessList,
+        body: Vec<Tx>,
+    ) -> Self {
+        Self {
+            header,
+            access_list,
+            body,
+        }
     }
 }
 
@@ -247,7 +278,7 @@ where
     Tx: EncodeSize,
 {
     fn encode_size(&self) -> usize {
-        self.header.encode_size() + self.body.encode_size()
+        self.header.encode_size() + self.access_list.encode_size() + self.body.encode_size()
     }
 }
 
@@ -260,6 +291,7 @@ where
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
+        self.access_list.write(buf);
         self.body.write(buf);
     }
 }
@@ -274,8 +306,15 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let tx_vec_cfg = (cfg.max_transactions, cfg.transaction.clone());
+        let bal_cfg = BlockAccessListCfg {
+            max_tx_offsets: cfg.max_tx_offsets,
+            max_tx_accesses: cfg.max_tx_accesses,
+            max_account_writes: cfg.max_account_writes,
+            max_storage_writes: cfg.max_storage_writes,
+        };
         Ok(Self {
             header: Header::read_cfg(buf, &())?,
+            access_list: BlockAccessList::read_cfg(buf, &bal_cfg)?,
             body: Vec::read_cfg(buf, &tx_vec_cfg)?,
         })
     }
@@ -369,6 +408,7 @@ mod tests {
             transactions_root: blake3::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
             receipts_root: blake3::Digest::EMPTY,
+            block_access_list_hash: blake3::Digest::EMPTY,
         }
     }
 
@@ -399,8 +439,11 @@ mod tests {
 
     #[test]
     fn block_codec_roundtrip_empty_body() {
-        let block =
-            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
+        let block = Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
+            test_header(),
+            BlockAccessList::default(),
+            vec![],
+        );
 
         let mut buf = Vec::with_capacity(block.encode_size());
         block.write(&mut buf);
@@ -415,8 +458,11 @@ mod tests {
 
     #[test]
     fn block_encode_size_matches_written() {
-        let block =
-            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
+        let block = Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
+            test_header(),
+            BlockAccessList::default(),
+            vec![],
+        );
         let expected = block.encode_size();
 
         let mut buf = Vec::new();

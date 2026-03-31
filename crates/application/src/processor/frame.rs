@@ -24,8 +24,8 @@
 
 use super::{Precompiles, executor::Processor};
 use crate::processor::{
-    access::{AccessObserver, AccessSet},
-    state::{FrameDiff, State},
+    access::{AccessListBuilder, AccessSet},
+    state::{FrameDiff, StateReader},
 };
 use bytes::Bytes;
 use commonware_parallel::Strategy;
@@ -66,26 +66,37 @@ pub enum FrameError {
 /// access is validated against the transaction's declared access list.
 ///
 /// Reads resolve through: local diff → parent diffs → committed state.
-#[derive(Debug)]
-pub struct Frame<'a> {
+pub struct Frame<'a, R: StateReader> {
     owner: Address,
     depth: u16,
     value: u64,
     input: Bytes,
-    state: &'a State,
+    state: &'a R,
     access: &'a AccessSet,
-    access_list_builder: AccessObserver,
+    access_list_builder: AccessListBuilder,
     parent: Option<&'a Self>,
     diff: FrameDiff,
 }
 
-impl<'a> Frame<'a> {
+impl<R: StateReader> core::fmt::Debug for Frame<'_, R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame")
+            .field("owner", &self.owner)
+            .field("depth", &self.depth)
+            .field("value", &self.value)
+            .field("input_len", &self.input.len())
+            .field("diff", &self.diff)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, R: StateReader> Frame<'a, R> {
     /// Creates a root frame for `owner`.
     pub(crate) fn new(
         owner: Address,
-        state: &'a State,
+        state: &'a R,
         access: &'a AccessSet,
-        access_list_builder: AccessObserver,
+        access_list_builder: AccessListBuilder,
         depth: u16,
         value: u64,
         input: Bytes,
@@ -243,18 +254,18 @@ impl<'a> Frame<'a> {
     }
 
     /// Merges a successful child diff and observed accesses into this frame.
-    pub(crate) fn merge(&mut self, child: FrameDiff, child_builder: AccessObserver) {
+    pub(crate) fn merge(&mut self, child: FrameDiff, child_builder: AccessListBuilder) {
         self.diff.merge(child);
         self.access_list_builder.merge(child_builder);
     }
 
     /// Merges only the observed accesses from a failed child into this frame.
-    pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessObserver) {
+    pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessListBuilder) {
         self.access_list_builder.merge(child_builder);
     }
 
     /// Consumes the frame and returns its local diff and observed accesses.
-    pub(crate) fn into_parts(self) -> (FrameDiff, AccessObserver) {
+    pub(crate) fn into_parts(self) -> (FrameDiff, AccessListBuilder) {
         (self.diff, self.access_list_builder)
     }
 
@@ -262,7 +273,7 @@ impl<'a> Frame<'a> {
     ///
     /// The child sees the parent's visible state but starts with an empty local
     /// diff.
-    pub(super) fn branch(&self, owner: Address, value: u64, input: Bytes) -> Frame<'_> {
+    pub(super) fn branch(&self, owner: Address, value: u64, input: Bytes) -> Frame<'_, R> {
         self.child_with_depth(owner, self.depth + 1, value, input)
     }
 
@@ -276,7 +287,7 @@ impl<'a> Frame<'a> {
         depth: u16,
         value: u64,
         input: Bytes,
-    ) -> Frame<'_> {
+    ) -> Frame<'_, R> {
         Frame {
             owner,
             depth,
@@ -284,10 +295,7 @@ impl<'a> Frame<'a> {
             input,
             state: self.state,
             access: self.access,
-            access_list_builder: match &self.access_list_builder {
-                AccessObserver::Counter(_) => AccessObserver::counter(self.access),
-                AccessObserver::Builder(_) => AccessObserver::builder(),
-            },
+            access_list_builder: AccessListBuilder::default(),
             parent: Some(self),
             diff: FrameDiff::default(),
         }
@@ -413,14 +421,12 @@ impl<'a> Frame<'a> {
 
     /// Records an observed account access.
     fn record_account_access(&mut self, address: Address, mode: AccessMode) {
-        self.access_list_builder
-            .record_account(address, mode, self.access);
+        self.access_list_builder.record_account(address, mode);
     }
 
     /// Records an observed storage access.
     fn record_storage_access(&mut self, address: Address, slot: Slot, mode: AccessMode) {
-        self.access_list_builder
-            .record_storage(address, slot, mode, self.access);
+        self.access_list_builder.record_storage(address, slot, mode);
     }
 }
 
@@ -428,7 +434,7 @@ impl<'a> Frame<'a> {
 mod tests {
     use super::{Frame, FrameError};
     use crate::processor::{
-        access::{AccessObserver, AccessSet},
+        access::{AccessListBuilder, AccessSet},
         keys::{account_key, storage_key},
         state::State,
     };
@@ -453,17 +459,12 @@ mod tests {
         owner_slot: Slot,
         child_slot: Slot,
     ) -> AccessSet {
-        AccessSet::new(
-            owner,
-            recipient,
-            AccessMode::Write,
-            &vec![
-                Access::Account(owner, AccessMode::Write),
-                Access::Account(recipient, AccessMode::Write),
-                Access::Storage(owner, owner_slot, AccessMode::Write),
-                Access::Storage(recipient, child_slot, AccessMode::Write),
-            ],
-        )
+        AccessSet::new(&[
+            Access::Account(owner, AccessMode::Write),
+            Access::Account(recipient, AccessMode::Write),
+            Access::Storage(owner, owner_slot, AccessMode::Write),
+            Access::Storage(recipient, child_slot, AccessMode::Write),
+        ])
     }
 
     #[test]
@@ -488,7 +489,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessObserver::builder(),
+            AccessListBuilder::default(),
             0,
             7,
             Bytes::new(),
@@ -553,7 +554,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessObserver::builder(),
+            AccessListBuilder::default(),
             0,
             3,
             Bytes::new(),
@@ -605,7 +606,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessObserver::builder(),
+            AccessListBuilder::default(),
             0,
             1,
             Bytes::new(),
@@ -660,18 +661,13 @@ mod tests {
         let owner_slot = slot(0x33);
         let other_slot = slot(0x44);
 
-        let access = AccessSet::new(
-            owner,
-            recipient,
-            AccessMode::Write,
-            &vec![Access::Storage(owner, owner_slot, AccessMode::Read)],
-        );
+        let access = AccessSet::new(&[Access::Storage(owner, owner_slot, AccessMode::Read)]);
         let state = State::new(HashMap::new(), HashMap::new());
         let mut frame = Frame::new(
             owner,
             &state,
             &access,
-            AccessObserver::builder(),
+            AccessListBuilder::default(),
             0,
             0,
             Bytes::new(),

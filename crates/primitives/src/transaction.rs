@@ -109,15 +109,12 @@ pub type AccessList = Vec<Access>;
 pub struct TransactionCfg {
     /// Maximum size of the transaction input bytes.
     pub max_input_size: RangeCfg<usize>,
-    /// Maximum number of entries in the access list.
-    pub max_access_list_len: RangeCfg<usize>,
 }
 
 impl Default for TransactionCfg {
     fn default() -> Self {
         Self {
             max_input_size: RangeCfg::new(0..=usize::MAX),
-            max_access_list_len: RangeCfg::new(0..=usize::MAX),
         }
     }
 }
@@ -135,8 +132,6 @@ pub struct Transaction<D: Digest, P: PublicKey> {
     pub value: u64,
     /// The sender nonce.
     pub nonce: u64,
-    /// The accesses declared by this transaction.
-    pub access_list: AccessList,
     /// The digest type.
     pub _digest: core::marker::PhantomData<D>,
 }
@@ -170,7 +165,6 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
         self.input.write(buf);
         self.value.write(buf);
         self.nonce.write(buf);
-        self.access_list.write(buf);
     }
 }
 
@@ -181,7 +175,6 @@ impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
             + self.input.encode_size()
             + self.value.encode_size()
             + self.nonce.encode_size()
-            + self.access_list.encode_size()
     }
 }
 
@@ -189,14 +182,12 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
     type Cfg = TransactionCfg;
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
-        let access_list_cfg = (cfg.max_access_list_len, ());
         Ok(Self {
             sender: P::read(buf)?,
             to: Address::read(buf)?,
             input: Bytes::read_cfg(buf, &cfg.max_input_size)?,
             value: u64::read(buf)?,
             nonce: u64::read(buf)?,
-            access_list: AccessList::read_cfg(buf, &access_list_cfg)?,
             _digest: core::marker::PhantomData,
         })
     }
@@ -225,7 +216,6 @@ where
             input: Bytes::from(<Vec<u8> as arbitrary::Arbitrary>::arbitrary(u)?),
             value: u.arbitrary()?,
             nonce: u.arbitrary()?,
-            access_list: u.arbitrary()?,
             _digest: core::marker::PhantomData,
         })
     }
@@ -297,7 +287,6 @@ mod test {
             input: Bytes::from_static(b"hello world"),
             value: 12345,
             nonce: 1,
-            access_list: Vec::new(),
             _digest: core::marker::PhantomData,
         };
 
@@ -320,7 +309,6 @@ mod test {
             input: Bytes::from_static(b"some payload"),
             value: u64::MAX,
             nonce: u64::MAX,
-            access_list: Vec::new(),
             _digest: core::marker::PhantomData,
         };
 

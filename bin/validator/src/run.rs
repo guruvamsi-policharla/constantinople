@@ -15,7 +15,7 @@ use commonware_runtime::{
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex};
-use constantinople_application::processor::Precompiles;
+use constantinople_application::processor::{Precompiles, state::StateReader};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
     MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
@@ -34,14 +34,15 @@ impl Precompiles for NoopPrecompiles {
         false
     }
 
-    fn execute<S>(
+    fn execute<S, R>(
         &self,
         _address: Address,
-        _frame: &mut constantinople_application::processor::frame::Frame<'_>,
+        _frame: &mut constantinople_application::processor::frame::Frame<'_, R>,
         _processor: &constantinople_application::processor::executor::Processor<'_, S, Self>,
     ) -> Result<bytes::Bytes, constantinople_application::processor::frame::FrameError>
     where
         S: commonware_parallel::Strategy,
+        R: StateReader,
     {
         Err(constantinople_application::processor::frame::FrameError::InvalidTransactionTarget)
     }
@@ -209,7 +210,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         });
 
         // Start HTTP server (state_reader filled after DB subscription).
-        let router = constantinople_mempool::server::router(&mempool, None);
+        let router = constantinople_mempool::server::router(&mempool);
         let http_addr: std::net::SocketAddr = format!("0.0.0.0:{http_port}").parse().unwrap();
         let http_listener = tokio::net::TcpListener::bind(http_addr)
             .await
