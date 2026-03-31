@@ -252,22 +252,25 @@ where
         )
     }
 
-    /// Returns a copy of `transactions` with static-invalid transactions removed.
+    /// Filters static-invalid transactions and executes the survivors.
     ///
     /// This path is intended for proposal. Transactions that fail static
     /// validation are dropped before block construction, while transactions
-    /// that revert at runtime are retained.
-    pub fn filter_invalid<H, PK>(
+    /// that revert at runtime are retained. The execution results are returned
+    /// alongside the filtered transactions so callers can skip a redundant
+    /// re-execution pass.
+    pub fn filter_and_execute<H, PK>(
         &self,
         mut state: State,
         transactions: &[VerifiedTransaction<PK, H>],
-    ) -> Vec<VerifiedTransaction<PK, H>>
+    ) -> (Vec<VerifiedTransaction<PK, H>>, ProcessorOutput<H::Digest>)
     where
         H: Hasher,
         PK: PublicKey,
         VerifiedTransaction<PK, H>: Clone,
     {
         let mut filtered = Vec::with_capacity(transactions.len());
+        let mut receipts = Vec::with_capacity(transactions.len());
 
         for transaction in transactions {
             let access = transaction_access_set(transaction);
@@ -279,11 +282,18 @@ where
             }
 
             let result = self.execute_validated_transaction(&state, transaction, &access, None);
+            receipts.push(result.receipt);
             state.apply(result.diff);
             filtered.push(transaction.clone());
         }
 
-        filtered
+        let changeset = state.changeset::<H>(self.strategy);
+        let output = ProcessorOutput {
+            receipts,
+            changeset,
+            access_lists: None,
+        };
+        (filtered, output)
     }
 
     /// Returns whether every transaction passes static validation.

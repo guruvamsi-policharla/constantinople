@@ -571,7 +571,7 @@ where
             .await
             .expect("proposed state loading must succeed");
         let processor = Processor::new(self.strategy(), self.precompiles());
-        let transactions = processor.filter_invalid(state.clone(), &all_proposed);
+        let (transactions, output) = processor.filter_and_execute(state, &all_proposed);
 
         // Notify rejected transaction waiters.
         if let Some(ref callback) = self.rejection_callback {
@@ -588,20 +588,23 @@ where
                 callback(rejected);
             }
         }
-        let executed = self.execute_loaded_transactions(
-            (state_batch, transaction_batch),
-            state,
-            &transactions,
-        );
-        let ExecutedTransactions {
-            batches: (sb, tb),
-            output,
-        } = executed;
+
+        let state_batch = output
+            .changeset
+            .iter()
+            .fold(state_batch, |batch, (key, value)| {
+                batch.write(*key, Some(value.clone()))
+            });
+        let transaction_batch = transactions
+            .iter()
+            .fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
         if let Some(ref callback) = self.receipt_callback {
             callback(parent.header.height + 1, output.receipts.clone());
         }
         let (state_merkleized, transaction_merkleized, receipts_root) = self
-            .finalize_execution(sb, tb, &output.receipts)
+            .finalize_execution(state_batch, transaction_batch, &output.receipts)
             .await
             .expect("database merkleization must succeed");
         let transactions_end =

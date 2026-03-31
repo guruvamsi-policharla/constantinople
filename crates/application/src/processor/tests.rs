@@ -505,7 +505,8 @@ impl ProcessorHarness {
         let state = load_state(&batch, transactions).await?;
         let precompiles = self.precompiles.clone();
         let processor = Processor::new(&Sequential, &precompiles);
-        Ok(processor.filter_invalid(state, transactions))
+        let (filtered, _output) = processor.filter_and_execute(state, transactions);
+        Ok(filtered)
     }
 
     async fn all_statically_valid(
