@@ -104,3 +104,36 @@ impl<D: Digest> Read for Receipt<D> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_codec::{Decode, Encode, RangeCfg};
+    use commonware_cryptography::{Digest, blake3};
+
+    #[test]
+    fn receipt_codec_roundtrip_success() {
+        let receipt = Receipt {
+            transaction_hash: blake3::Digest::EMPTY,
+            status: ReceiptStatus::Success,
+            return_data: Bytes::from_static(b"ok"),
+        };
+
+        let encoded = receipt.encode();
+        let decoded =
+            Receipt::<blake3::Digest>::decode_cfg(encoded.as_ref(), &RangeCfg::new(0..=usize::MAX))
+                .expect("decoding should succeed");
+        assert_eq!(decoded, receipt);
+    }
+
+    #[test]
+    fn receipt_codec_roundtrip_revert() {
+        let receipt = Receipt::revert(blake3::Digest::EMPTY, Bytes::from_static(b"reverted"));
+
+        let encoded = receipt.encode();
+        let decoded =
+            Receipt::<blake3::Digest>::decode_cfg(encoded.as_ref(), &RangeCfg::new(0..=usize::MAX))
+                .expect("decoding should succeed");
+        assert_eq!(decoded, receipt);
+    }
+}
