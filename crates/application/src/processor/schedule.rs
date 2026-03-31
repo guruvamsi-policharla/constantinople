@@ -28,7 +28,7 @@
 
 use super::{
     ProcessorOutput,
-    state::{AccessListBuilder, AccessSet, FrameDiff, State},
+    state::{AccessSet, FrameDiff, State},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -160,12 +160,7 @@ where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(
-            &State,
-            &VerifiedTransaction<PK, H>,
-            &AccessSet,
-            Option<AccessListBuilder>,
-        ) -> TransactionExecution<H::Digest>
+    F: Fn(&State, &VerifiedTransaction<PK, H>, &AccessSet, bool) -> TransactionExecution<H::Digest>
         + Sync,
 {
     let mut state = prepared.state.clone();
@@ -217,12 +212,7 @@ where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(
-            &State,
-            &VerifiedTransaction<PK, H>,
-            &AccessSet,
-            Option<AccessListBuilder>,
-        ) -> TransactionExecution<H::Digest>
+    F: Fn(&State, &VerifiedTransaction<PK, H>, &AccessSet, bool) -> TransactionExecution<H::Digest>
         + Sync,
 {
     let executed = execute_prepared(
@@ -251,12 +241,7 @@ where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(
-            &State,
-            &VerifiedTransaction<PK, H>,
-            &AccessSet,
-            Option<AccessListBuilder>,
-        ) -> TransactionExecution<H::Digest>
+    F: Fn(&State, &VerifiedTransaction<PK, H>, &AccessSet, bool) -> TransactionExecution<H::Digest>
         + Sync,
 {
     if should_execute_round_inline(strategy, round) {
@@ -284,26 +269,18 @@ fn execute_round_inline<H, PK, F>(
 where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(
-        &State,
-        &VerifiedTransaction<PK, H>,
-        &AccessSet,
-        Option<AccessListBuilder>,
-    ) -> TransactionExecution<H::Digest>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>, &AccessSet, bool) -> TransactionExecution<H::Digest>,
 {
     let mut results = Vec::with_capacity(round.len());
 
     for transaction_index in round {
         let transaction = &execution.transactions[*transaction_index];
         let scheduled = &execution.scheduled[*transaction_index];
-        let access_list_builder = execution
-            .build_access_lists
-            .then(AccessListBuilder::default);
         results.push((execution.execute_transaction)(
             state,
             transaction,
             &scheduled.access,
-            access_list_builder,
+            execution.build_access_lists,
         ));
     }
 
@@ -322,23 +299,15 @@ fn execute_transactions_inline<H, PK, F>(
 ) where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(
-        &State,
-        &VerifiedTransaction<PK, H>,
-        &AccessSet,
-        Option<AccessListBuilder>,
-    ) -> TransactionExecution<H::Digest>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>, &AccessSet, bool) -> TransactionExecution<H::Digest>,
 {
     for (transaction_index, scheduled) in execution.scheduled.iter().enumerate() {
         let transaction = &execution.transactions[transaction_index];
-        let access_list_builder = execution
-            .build_access_lists
-            .then(AccessListBuilder::default);
         let result = (execution.execute_transaction)(
             state,
             transaction,
             &scheduled.access,
-            access_list_builder,
+            execution.build_access_lists,
         );
 
         state.apply(result.diff);

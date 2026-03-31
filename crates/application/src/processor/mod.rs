@@ -31,7 +31,7 @@ use bytes::Bytes;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    AccessList, Address, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
+    AccessList, AccessMode, Address, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
 };
 pub use frame::{Frame, FrameError};
 use schedule::TransactionExecution;
@@ -262,7 +262,7 @@ where
                 continue;
             }
 
-            let result = self.execute_validated_transaction(&state, transaction, &access, None);
+            let result = self.execute_validated_transaction(&state, transaction, &access, false);
             receipts.push(result.receipt);
             state.apply(result.diff);
             filtered.push(transaction.clone());
@@ -297,7 +297,7 @@ where
                 return false;
             }
 
-            let result = self.execute_validated_transaction(&state, transaction, &access, None);
+            let result = self.execute_validated_transaction(&state, transaction, &access, false);
             state.apply(result.diff);
         }
 
@@ -315,7 +315,7 @@ where
         state: &State,
         transaction: &VerifiedTransaction<PK, H>,
         access: &AccessSet,
-        access_list_builder: Option<AccessListBuilder>,
+        return_access_list: bool,
     ) -> TransactionExecution<H::Digest>
     where
         H: Hasher,
@@ -329,7 +329,7 @@ where
             };
         }
 
-        self.execute_validated_transaction(state, transaction, access, access_list_builder)
+        self.execute_validated_transaction(state, transaction, access, return_access_list)
     }
 
     /// Executes one transaction after static validation has already succeeded.
@@ -342,22 +342,15 @@ where
         state: &State,
         transaction: &VerifiedTransaction<PK, H>,
         access: &AccessSet,
-        access_list_builder: Option<AccessListBuilder>,
+        return_access_list: bool,
     ) -> TransactionExecution<H::Digest>
     where
         H: Hasher,
         PK: PublicKey,
     {
         let sender = transaction.signer();
-        let mut prelude = Frame::new(
-            sender,
-            state,
-            access,
-            access_list_builder,
-            0,
-            0,
-            Bytes::new(),
-        );
+        let builder = AccessListBuilder::default();
+        let mut prelude = Frame::new(sender, state, access, builder, 0, 0, Bytes::new());
         if prelude.bump_sender_nonce().is_err() {
             return TransactionExecution {
                 receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
@@ -376,9 +369,18 @@ where
 
         match result {
             Ok(return_data) => {
-                let (diff, access_list_builder) = root.into_parts();
-                prelude.merge(diff, access_list_builder);
-                let (diff, access_list_builder) = prelude.into_parts();
+                let (diff, builder) = root.into_parts();
+                prelude.merge(diff, builder);
+                let (diff, builder) = prelude.into_parts();
+
+                if !access.is_exact_match(&builder) {
+                    return TransactionExecution {
+                        receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
+                        diff,
+                        access_list: None,
+                    };
+                }
+
                 TransactionExecution {
                     receipt: Receipt::new(
                         *transaction.message_digest(),
@@ -386,7 +388,7 @@ where
                         return_data,
                     ),
                     diff,
-                    access_list: access_list_builder.map(AccessListBuilder::into_access_list),
+                    access_list: return_access_list.then(|| builder.into_access_list()),
                 }
             }
             Err(err) => {
@@ -462,6 +464,9 @@ where
         }
 
         let mut child = frame.branch(to, value, input);
+        // The transfer always validates and records account access for both
+        // sides, ensuring the callee is declared in the access list even for
+        // zero-value calls.
         child.transfer_between(frame.owner(), to, value)?;
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.precompiles.execute(to, &mut child, self)
@@ -482,7 +487,9 @@ where
 /// Builds the effective declared access set for `transaction`.
 ///
 /// The effective access set combines the explicit access list with the
-/// processor's implicit sender and top-level recipient account writes.
+/// processor's implicit accesses: the sender is always Write (nonce bump)
+/// and the recipient is Write when a value transfer occurs or Read
+/// otherwise.
 fn transaction_access_set<H, PK>(transaction: &VerifiedTransaction<PK, H>) -> AccessSet
 where
     H: Hasher,
@@ -490,5 +497,10 @@ where
 {
     let sender = transaction.signer();
     let tx = transaction.value();
-    AccessSet::new(sender, tx.to, &tx.access_list)
+    let recipient_mode = if tx.value > 0 {
+        AccessMode::Write
+    } else {
+        AccessMode::Read
+    };
+    AccessSet::new(sender, tx.to, recipient_mode, &tx.access_list)
 }

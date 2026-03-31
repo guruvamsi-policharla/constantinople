@@ -194,10 +194,19 @@ pub(crate) struct AccessSet {
 
 impl AccessSet {
     /// Creates an access set from a transaction access list.
-    pub(crate) fn new(sender: Address, recipient: Address, access_list: &AccessList) -> Self {
+    ///
+    /// The sender is always declared Write (nonce bump). The recipient mode
+    /// is caller-determined: Write when a value transfer occurs, Read for
+    /// zero-value calls.
+    pub(crate) fn new(
+        sender: Address,
+        recipient: Address,
+        recipient_mode: AccessMode,
+        access_list: &AccessList,
+    ) -> Self {
         let mut access = Self::default();
         access.allow_account(sender, AccessMode::Write);
-        access.allow_account(recipient, AccessMode::Write);
+        access.allow_account(recipient, recipient_mode);
 
         for entry in access_list {
             match entry {
@@ -243,6 +252,36 @@ impl AccessSet {
         self.storage
             .iter()
             .map(|((address, slot), mode)| (*address, *slot, *mode))
+    }
+
+    /// Returns whether the observed accesses exactly match the declared set.
+    ///
+    /// Every declared entry must appear in the observed set with the same mode,
+    /// and the observed set must not contain entries absent from the declared
+    /// set. The second condition is already enforced at runtime by the frame
+    /// access checks, so this method only verifies the first direction.
+    pub(crate) fn is_exact_match(&self, observed: &AccessListBuilder) -> bool {
+        if self.accounts.len() != observed.accounts.len()
+            || self.storage.len() != observed.storage.len()
+        {
+            return false;
+        }
+
+        for (address, declared_mode) in &self.accounts {
+            match observed.accounts.get(address) {
+                Some(observed_mode) if observed_mode == declared_mode => {}
+                _ => return false,
+            }
+        }
+
+        for ((address, slot), declared_mode) in &self.storage {
+            match observed.storage.get(&(*address, *slot)) {
+                Some(observed_mode) if observed_mode == declared_mode => {}
+                _ => return false,
+            }
+        }
+
+        true
     }
 
     fn allow_account(&mut self, address: Address, mode: AccessMode) {

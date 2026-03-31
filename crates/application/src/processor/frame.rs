@@ -64,7 +64,7 @@ pub struct Frame<'a> {
     input: Bytes,
     state: &'a State,
     access: &'a AccessSet,
-    access_list_builder: Option<AccessListBuilder>,
+    access_list_builder: AccessListBuilder,
     parent: Option<&'a Self>,
     diff: FrameDiff,
 }
@@ -75,7 +75,7 @@ impl<'a> Frame<'a> {
         owner: Address,
         state: &'a State,
         access: &'a AccessSet,
-        access_list_builder: Option<AccessListBuilder>,
+        access_list_builder: AccessListBuilder,
         depth: u16,
         value: u64,
         input: Bytes,
@@ -230,30 +230,15 @@ impl<'a> Frame<'a> {
         processor.call_precompile(self, to, value, input)
     }
 
-    /// Merges a successful child diff into this frame.
-    pub(crate) fn merge(
-        &mut self,
-        child: FrameDiff,
-        access_list_builder: Option<AccessListBuilder>,
-    ) {
+    /// Merges a successful child diff and observed accesses into this frame.
+    pub(crate) fn merge(&mut self, child: FrameDiff, child_builder: AccessListBuilder) {
         self.diff.merge(child);
-        self.merge_access_list_builder(access_list_builder);
+        self.access_list_builder.merge(child_builder);
     }
 
-    /// Merges observed child accesses into this frame.
-    pub(crate) fn merge_access_list_builder(
-        &mut self,
-        access_list_builder: Option<AccessListBuilder>,
-    ) {
-        let Some(child_builder) = access_list_builder else {
-            return;
-        };
-
-        let Some(builder) = &mut self.access_list_builder else {
-            return;
-        };
-
-        builder.merge(child_builder);
+    /// Merges only the observed accesses from a failed child into this frame.
+    pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessListBuilder) {
+        self.access_list_builder.merge(child_builder);
     }
 
     /// Produces a database changeset for the visible state of this frame.
@@ -269,7 +254,7 @@ impl<'a> Frame<'a> {
     }
 
     /// Consumes the frame and returns its local diff and observed accesses.
-    pub(crate) fn into_parts(self) -> (FrameDiff, Option<AccessListBuilder>) {
+    pub(crate) fn into_parts(self) -> (FrameDiff, AccessListBuilder) {
         (self.diff, self.access_list_builder)
     }
 
@@ -282,6 +267,9 @@ impl<'a> Frame<'a> {
     }
 
     /// Creates a child frame with an explicit depth.
+    ///
+    /// The child starts with an empty access list builder and empty diff. After
+    /// execution the caller merges the child's builder back into the parent.
     pub(super) fn child_with_depth(
         &self,
         owner: Address,
@@ -296,25 +284,33 @@ impl<'a> Frame<'a> {
             input,
             state: self.state,
             access: self.access,
-            access_list_builder: self.access_list_builder.clone(),
+            access_list_builder: AccessListBuilder::default(),
             parent: Some(self),
             diff: FrameDiff::default(),
         }
     }
 
     /// Transfers value between two accounts inside this frame.
+    ///
+    /// Both accounts are always validated against the access list so the
+    /// scheduler sees the dependency. A zero-value transfer records Read
+    /// access; a non-zero transfer records Write.
     pub(super) fn transfer_between(
         &mut self,
         from: Address,
         to: Address,
         value: u64,
     ) -> Result<(), FrameError> {
-        if value == 0 {
-            return Ok(());
-        }
-
         if !self.access.can_read_account(from) || !self.access.can_read_account(to) {
             return Err(FrameError::AccessViolation);
+        }
+
+        if value == 0 {
+            // Record Read access for both accounts so the access list and
+            // scheduler see the dependency even when no balance moves.
+            let _ = self.account(from);
+            let _ = self.account(to);
+            return Ok(());
         }
 
         if !self.access.can_write_account(from) || !self.access.can_write_account(to) {
@@ -322,6 +318,9 @@ impl<'a> Frame<'a> {
         }
 
         if from == to {
+            // Read + write records Write access without modifying state.
+            let account = self.account(from);
+            self.set_account(from, account);
             return Ok(());
         }
 
@@ -430,29 +429,21 @@ impl<'a> Frame<'a> {
         visible
     }
 
-    /// Records an observed account access for access-list generation.
+    /// Records an observed account access.
     fn record_account_access(&mut self, address: Address, mode: AccessMode) {
-        let Some(builder) = &mut self.access_list_builder else {
-            return;
-        };
-
-        builder.record_account(address, mode);
+        self.access_list_builder.record_account(address, mode);
     }
 
-    /// Records an observed storage access for access-list generation.
+    /// Records an observed storage access.
     fn record_storage_access(&mut self, address: Address, slot: Slot, mode: AccessMode) {
-        let Some(builder) = &mut self.access_list_builder else {
-            return;
-        };
-
-        builder.record_storage(address, slot, mode);
+        self.access_list_builder.record_storage(address, slot, mode);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Frame, FrameError};
-    use crate::processor::state::{AccessSet, State, account_key, storage_key};
+    use crate::processor::state::{AccessListBuilder, AccessSet, State, account_key, storage_key};
     use bytes::Bytes;
     use commonware_codec::{DecodeExt, FixedSize};
     use commonware_cryptography::blake3;
@@ -477,6 +468,7 @@ mod tests {
         AccessSet::new(
             owner,
             recipient,
+            AccessMode::Write,
             &vec![
                 Access::Account(owner, AccessMode::Write),
                 Access::Account(recipient, AccessMode::Write),
@@ -504,7 +496,15 @@ mod tests {
 
         let state = State::new(accounts, HashMap::new());
         let access = access_set(root_address, child_address, root_slot, child_slot);
-        let mut root = Frame::new(root_address, &state, &access, None, 0, 7, Bytes::new());
+        let mut root = Frame::new(
+            root_address,
+            &state,
+            &access,
+            AccessListBuilder::default(),
+            0,
+            7,
+            Bytes::new(),
+        );
 
         assert_eq!(root.value(), 7);
         root.transfer(child_address, 5)
@@ -561,7 +561,15 @@ mod tests {
 
         let state = State::new(HashMap::new(), HashMap::new());
         let access = access_set(root_address, child_address, root_slot, child_slot);
-        let mut root = Frame::new(root_address, &state, &access, None, 0, 3, Bytes::new());
+        let mut root = Frame::new(
+            root_address,
+            &state,
+            &access,
+            AccessListBuilder::default(),
+            0,
+            3,
+            Bytes::new(),
+        );
 
         root.write_storage(root_slot, slot(0x77))
             .expect("root write should succeed");
@@ -605,7 +613,15 @@ mod tests {
 
         let state = State::new(accounts, storage);
         let access = access_set(root_address, child_address, root_slot, child_slot);
-        let mut root = Frame::new(root_address, &state, &access, None, 0, 1, Bytes::new());
+        let mut root = Frame::new(
+            root_address,
+            &state,
+            &access,
+            AccessListBuilder::default(),
+            0,
+            1,
+            Bytes::new(),
+        );
 
         root.transfer(child_address, 4)
             .expect("root transfer should succeed");
@@ -655,10 +671,19 @@ mod tests {
         let access = AccessSet::new(
             owner,
             recipient,
+            AccessMode::Write,
             &vec![Access::Storage(owner, owner_slot, AccessMode::Read)],
         );
         let state = State::new(HashMap::new(), HashMap::new());
-        let mut frame = Frame::new(owner, &state, &access, None, 0, 0, Bytes::new());
+        let mut frame = Frame::new(
+            owner,
+            &state,
+            &access,
+            AccessListBuilder::default(),
+            0,
+            0,
+            Bytes::new(),
+        );
 
         assert_eq!(
             frame.inspect_storage(recipient, other_slot),

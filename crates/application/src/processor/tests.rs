@@ -230,8 +230,9 @@ impl TestPrecompiles {
                 PrecompileStep::WriteStorage(slot, _) => {
                     builder.record_storage(address, *slot, AccessMode::Write);
                 }
-                PrecompileStep::Transfer(address, _) => {
-                    builder.record_account(*address, AccessMode::Write);
+                PrecompileStep::Transfer(recipient, _) => {
+                    builder.record_account(address, AccessMode::Write);
+                    builder.record_account(*recipient, AccessMode::Write);
                 }
                 PrecompileStep::Call(callee, value, _)
                 | PrecompileStep::AssertCallReturns(callee, value, _, _)
@@ -239,6 +240,9 @@ impl TestPrecompiles {
                     if *value > 0 {
                         builder.record_account(address, AccessMode::Write);
                         builder.record_account(*callee, AccessMode::Write);
+                    } else {
+                        builder.record_account(address, AccessMode::Read);
+                        builder.record_account(*callee, AccessMode::Read);
                     }
 
                     self.record_simulation_accesses(*callee, builder, visited);
@@ -1047,7 +1051,7 @@ fn precompile_cannot_write_other_account_storage() {
                 TransactionSpec::call(sender, precompile, 0, 0, Bytes::new()).with_access_list(
                     vec![
                         Access::Storage(precompile, shared_slot, AccessMode::Write),
-                        Access::Storage(other, shared_slot, AccessMode::Write),
+                        Access::Storage(other, shared_slot, AccessMode::Read),
                     ],
                 ),
             ])
@@ -2221,8 +2225,9 @@ fn successful_tx_returns_built_access_list() {
             .built_access_list(0)
             .expect("successful transaction should return an access list");
         assert_eq!(run.transaction_access_list(0), access_list);
-        assert_eq!(access_list.len(), 4);
+        assert_eq!(access_list.len(), 5);
         assert!(access_list.contains(&Access::Account(sender.address, AccessMode::Write)));
+        assert!(access_list.contains(&Access::Account(precompile, AccessMode::Read)));
         assert!(access_list.contains(&Access::Account(other, AccessMode::Read)));
         assert!(access_list.contains(&Access::Storage(other, other_slot, AccessMode::Read)));
         assert!(access_list.contains(&Access::Storage(precompile, owner_slot, AccessMode::Write)));
@@ -2322,9 +2327,10 @@ fn builder_access_patterns(
                 ],
                 vec![
                     Access::Account(sender.address, AccessMode::Write),
+                    Access::Account(precompile, AccessMode::Read),
                     Access::Storage(precompile, owner_slot, AccessMode::Write),
                 ],
-                2,
+                3,
             ),
             BuilderCase::DeduplicatesRepeatedAccesses => (
                 vec![
@@ -2340,11 +2346,12 @@ fn builder_access_patterns(
                 ],
                 vec![
                     Access::Account(sender.address, AccessMode::Write),
+                    Access::Account(precompile, AccessMode::Read),
                     Access::Account(other, AccessMode::Read),
                     Access::Storage(other, other_slot, AccessMode::Read),
                     Access::Storage(precompile, owner_slot, AccessMode::Write),
                 ],
-                4,
+                5,
             ),
             BuilderCase::RecordsCrossAccountReads => (
                 vec![
@@ -2354,10 +2361,11 @@ fn builder_access_patterns(
                 ],
                 vec![
                     Access::Account(sender.address, AccessMode::Write),
+                    Access::Account(precompile, AccessMode::Read),
                     Access::Account(other, AccessMode::Read),
                     Access::Storage(other, other_slot, AccessMode::Read),
                 ],
-                3,
+                4,
             ),
         };
 
@@ -2557,5 +2565,49 @@ fn parallel_execution_reports_receipts_in_transaction_order() {
             run.output.receipts[2].return_data,
             Bytes::from_static(b"second"),
         );
+    });
+}
+
+#[test]
+fn nested_call_to_undeclared_account_reverts() {
+    run_test(|context| async move {
+        let mut harness = ProcessorHarness::new(context, "undeclared-nested-account").await;
+        let sender = harness.signer([80; 32]);
+        let parent = address(0xA0);
+        let child = address(0xA1);
+        let child_slot = slot(0xB0);
+
+        harness
+            .set_account(
+                sender.address,
+                Account {
+                    balance: 10,
+                    nonce: 0,
+                },
+            )
+            .await;
+        harness.insert_precompile(
+            child,
+            vec![
+                PrecompileStep::WriteStorage(child_slot, slot(0x01)),
+                PrecompileStep::Return(Bytes::new()),
+            ],
+        );
+        harness.insert_precompile(parent, vec![PrecompileStep::Call(child, 0, Bytes::new())]);
+
+        // Deliberately omit child's account from the access list. Only declare
+        // the child's storage so the call body would succeed *if* the account
+        // check were missing.
+        let run = harness
+            .execute_specs(&[
+                TransactionSpec::call(sender.clone(), parent, 0, 0, Bytes::new())
+                    .with_access_list(vec![Access::Storage(child, child_slot, AccessMode::Write)]),
+            ])
+            .await
+            .expect("processing should succeed");
+
+        // The nested call targets an undeclared account, so the transaction
+        // must revert.
+        assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
     });
 }
