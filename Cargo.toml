@@ -17,7 +17,6 @@ members = [
 ]
 
 [workspace.lints.rust]
-missing-debug-implementations = "warn"
 unused-must-use = "deny"
 rust-2018-idioms = "deny"
 

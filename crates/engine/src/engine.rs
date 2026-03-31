@@ -11,6 +11,7 @@
 //! threshold scheme are fixed at startup from the supplied threshold output and
 //! optional local share.
 
+use crate::bootstrapper;
 use commonware_coding::{CodecConfig, ReedSolomon};
 use commonware_consensus::{
     Reporters,
@@ -164,8 +165,10 @@ pub const MARSHAL_RESOLVER_CHANNEL: u64 = 4;
 pub const STATE_RESOLVER_CHANNEL: u64 = 5;
 /// Transaction database sync resolver channel id.
 pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
+/// Bootstrapper channel id.
+pub const BOOTSTRAPPER_CHANNEL: u64 = 7;
 
-/// All required channel ids in registration order.
+/// Channel ids expected by [`Channels`] in registration order.
 pub const CHANNELS: [u64; 7] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
@@ -194,7 +197,6 @@ where
 }
 
 /// Engine initialization parameters.
-#[allow(missing_debug_implementations)]
 pub struct Config<C, M, B, V, T, I, R, H>
 where
     C: Signer,
@@ -227,10 +229,10 @@ where
     pub receipt_callback: Option<constantinople_application::consensus::ReceiptCallback<H::Digest>>,
     pub rejection_callback:
         Option<constantinople_application::consensus::RejectionCallback<H::Digest>>,
+    pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
 
 /// Fully assembled validator engine.
-#[allow(missing_debug_implementations)]
 pub struct Engine<E, C, M, B, H, V, L, T, I, R>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
@@ -378,6 +380,7 @@ where
             },
         )
         .await;
+        config.bootstrapper.attach(marshal_mailbox.clone()).await;
 
         let (shards, shard_mailbox) = shards::Engine::new(
             context.with_label("shards"),

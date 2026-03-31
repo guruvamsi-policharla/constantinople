@@ -38,7 +38,6 @@ pub struct MempoolConfig {
 }
 
 /// Shared mempool state between HTTP handlers and the TransactionSource.
-#[allow(missing_debug_implementations)]
 pub struct MempoolInner<H: Hasher, P: PublicKey> {
     pub pending: VecDeque<PendingTransaction<P, H>>,
     pub pending_bytes: usize,
@@ -46,7 +45,6 @@ pub struct MempoolInner<H: Hasher, P: PublicKey> {
 }
 
 /// HTTP mempool that implements `TransactionSource`.
-#[allow(missing_debug_implementations)]
 pub struct Mempool<C, P, H>
 where
     H: Hasher,

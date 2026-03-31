@@ -5,7 +5,7 @@ use crate::{
     config::{ValidatorConfig, decode_public_key},
 };
 use commonware_codec::Encode;
-use commonware_consensus::simplex::elector::RoundRobin;
+use commonware_consensus::{Heightable, simplex::elector::RoundRobin};
 use commonware_cryptography::{Sha256, bls12381::primitives::variant::MinSig, ed25519};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
@@ -14,16 +14,16 @@ use commonware_runtime::{
     Metrics as _, Quota, Runner as _,
     tokio::telemetry::{self, Logging},
 };
-use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex};
+use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex, union};
 use constantinople_application::processor::{Precompiles, state::StateReader};
 use constantinople_engine::{
-    CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
+    MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::server::Mempool;
 use constantinople_primitives::Address;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tracing::info;
 
 #[derive(Clone, Debug, Default)]
@@ -113,7 +113,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 decoded.listen,
                 Ingress::Socket(decoded.listen),
                 decoded.bootstrappers,
-                4 * 1024 * 1024,
+                12 * 1024 * 1024,
             ),
         );
 
@@ -141,6 +141,28 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
+        let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
+
+        let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
+            context.with_label("bootstrapper"),
+            bootstrapper::Config {
+                public_key: decoded.public_key.clone(),
+                peer_provider: oracle.clone(),
+                blocker: oracle.clone(),
+                scheme:
+                    constantinople_engine::ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
+                        &union(b"constantinople", b"_CONSENSUS"),
+                        decoded.dkg_output.players().clone(),
+                        decoded.dkg_output.public().clone(),
+                    ),
+                mailbox_size: 32,
+                round_timeout: Duration::from_secs(1),
+                retry_interval: Duration::from_secs(1),
+                block_codec: Default::default(),
+            },
+        );
+        let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
+        let network_handle = network.start();
 
         // Determine startup mode.
         let startup = match mode {
@@ -149,8 +171,14 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 StartupMode::MarshalSync
             }
             StartupArg::StateSync => {
-                info!("state-sync requested -- falling back to marshal-sync");
-                StartupMode::MarshalSync
+                info!("starting in state-sync mode");
+                let block = bootstrapper_mailbox
+                    .fetch_initial_target()
+                    .await
+                    .expect("bootstrapper actor exited before selecting a state-sync target");
+                let height = block.height().get();
+                info!(height, "selected state-sync target");
+                StartupMode::StateSync { block }
             }
         };
 
@@ -252,15 +280,16 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 genesis_allocations: decoded.genesis_allocations,
                 receipt_callback: Some(receipt_callback),
                 rejection_callback: Some(rejection_callback),
+                bootstrapper: bootstrapper_mailbox.clone(),
             },
         )
         .await;
 
         info!("starting engine");
         let engine_handle = engine.start(channels, None::<NoopReporter>);
-        let network_handle = network.start();
 
         tokio::select! {
+            _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
             _ = engine_handle => tracing::warn!("engine exited"),
             _ = network_handle => tracing::warn!("network exited"),
             _ = http_handle => tracing::warn!("http server exited"),
