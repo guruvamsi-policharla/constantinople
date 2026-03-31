@@ -24,7 +24,7 @@
 
 use super::{Precompiles, executor::Processor};
 use crate::processor::{
-    access::{AccessListBuilder, AccessSet},
+    access::{AccessObserver, AccessSet},
     state::{FrameDiff, State},
 };
 use bytes::Bytes;
@@ -74,7 +74,7 @@ pub struct Frame<'a> {
     input: Bytes,
     state: &'a State,
     access: &'a AccessSet,
-    access_list_builder: AccessListBuilder,
+    access_list_builder: AccessObserver,
     parent: Option<&'a Self>,
     diff: FrameDiff,
 }
@@ -85,7 +85,7 @@ impl<'a> Frame<'a> {
         owner: Address,
         state: &'a State,
         access: &'a AccessSet,
-        access_list_builder: AccessListBuilder,
+        access_list_builder: AccessObserver,
         depth: u16,
         value: u64,
         input: Bytes,
@@ -243,18 +243,18 @@ impl<'a> Frame<'a> {
     }
 
     /// Merges a successful child diff and observed accesses into this frame.
-    pub(crate) fn merge(&mut self, child: FrameDiff, child_builder: AccessListBuilder) {
+    pub(crate) fn merge(&mut self, child: FrameDiff, child_builder: AccessObserver) {
         self.diff.merge(child);
         self.access_list_builder.merge(child_builder);
     }
 
     /// Merges only the observed accesses from a failed child into this frame.
-    pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessListBuilder) {
+    pub(crate) fn merge_access_list_builder(&mut self, child_builder: AccessObserver) {
         self.access_list_builder.merge(child_builder);
     }
 
     /// Consumes the frame and returns its local diff and observed accesses.
-    pub(crate) fn into_parts(self) -> (FrameDiff, AccessListBuilder) {
+    pub(crate) fn into_parts(self) -> (FrameDiff, AccessObserver) {
         (self.diff, self.access_list_builder)
     }
 
@@ -284,7 +284,10 @@ impl<'a> Frame<'a> {
             input,
             state: self.state,
             access: self.access,
-            access_list_builder: AccessListBuilder::default(),
+            access_list_builder: match &self.access_list_builder {
+                AccessObserver::Counter(_) => AccessObserver::counter(self.access),
+                AccessObserver::Builder(_) => AccessObserver::builder(),
+            },
             parent: Some(self),
             diff: FrameDiff::default(),
         }
@@ -410,12 +413,14 @@ impl<'a> Frame<'a> {
 
     /// Records an observed account access.
     fn record_account_access(&mut self, address: Address, mode: AccessMode) {
-        self.access_list_builder.record_account(address, mode);
+        self.access_list_builder
+            .record_account(address, mode, self.access);
     }
 
     /// Records an observed storage access.
     fn record_storage_access(&mut self, address: Address, slot: Slot, mode: AccessMode) {
-        self.access_list_builder.record_storage(address, slot, mode);
+        self.access_list_builder
+            .record_storage(address, slot, mode, self.access);
     }
 }
 
@@ -423,7 +428,7 @@ impl<'a> Frame<'a> {
 mod tests {
     use super::{Frame, FrameError};
     use crate::processor::{
-        access::{AccessListBuilder, AccessSet},
+        access::{AccessObserver, AccessSet},
         keys::{account_key, storage_key},
         state::State,
     };
@@ -483,7 +488,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessListBuilder::default(),
+            AccessObserver::builder(),
             0,
             7,
             Bytes::new(),
@@ -548,7 +553,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessListBuilder::default(),
+            AccessObserver::builder(),
             0,
             3,
             Bytes::new(),
@@ -600,7 +605,7 @@ mod tests {
             root_address,
             &state,
             &access,
-            AccessListBuilder::default(),
+            AccessObserver::builder(),
             0,
             1,
             Bytes::new(),
@@ -666,7 +671,7 @@ mod tests {
             owner,
             &state,
             &access,
-            AccessListBuilder::default(),
+            AccessObserver::builder(),
             0,
             0,
             Bytes::new(),

@@ -70,3 +70,7 @@ futures = { version = "0.3.31", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 divan = "0.1"
+
+[profile.samply]
+inherits = "release"
+debug = true

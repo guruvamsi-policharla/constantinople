@@ -14,7 +14,7 @@
 
 use super::{
     Precompiles,
-    access::{AccessListBuilder, AccessSet},
+    access::{AccessObserver, AccessSet},
     frame::{Frame, FrameError},
     schedule::{self, TransactionExecution},
     state::{FrameDiff, State},
@@ -165,7 +165,12 @@ where
         H: Hasher,
         PK: PublicKey,
     {
-        let prepared = schedule::prepare(state, transactions, transaction_access_set::<H, PK>);
+        let prepared = schedule::prepare(
+            self.strategy,
+            state,
+            transactions,
+            transaction_access_set::<H, PK>,
+        );
         schedule::execute(
             self.strategy,
             &prepared,
@@ -190,8 +195,12 @@ where
         PK: PublicKey,
     {
         let sender = transaction.signer();
-        let builder = AccessListBuilder::default();
-        let mut prelude = Frame::new(sender, state, access, builder, 0, 0, Bytes::new());
+        let observer = if return_access_list {
+            AccessObserver::builder()
+        } else {
+            AccessObserver::counter(access)
+        };
+        let mut prelude = Frame::new(sender, state, access, observer, 0, 0, Bytes::new());
         if prelude.bump_sender_nonce().is_err() {
             return TransactionExecution {
                 receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
@@ -210,11 +219,11 @@ where
 
         match result {
             Ok(return_data) => {
-                let (diff, builder) = root.into_parts();
-                prelude.merge(diff, builder);
-                let (diff, builder) = prelude.into_parts();
+                let (diff, child_observer) = root.into_parts();
+                prelude.merge(diff, child_observer);
+                let (diff, observer) = prelude.into_parts();
 
-                if !access.is_exact_match(&builder) {
+                if !access.is_exact_match(&observer) {
                     return TransactionExecution {
                         receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
                         diff,
@@ -229,7 +238,7 @@ where
                         return_data,
                     ),
                     diff,
-                    access_list: return_access_list.then(|| builder.into_access_list()),
+                    access_list: observer.into_access_list(),
                 }
             }
             Err(err) => {

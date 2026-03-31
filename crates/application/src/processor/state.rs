@@ -18,7 +18,10 @@ use super::keys::{account_key, storage_key};
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{Account, Address, Slot, StateValue};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 type StorageKey = (Address, Slot);
 
@@ -186,10 +189,14 @@ impl FrameDiff {
 /// `State` combines the loaded base state with the committed in-memory diff
 /// accumulated during execution. Reads first consult the committed diff and
 /// then fall back to the loaded base state.
+///
+/// The base maps are `Arc`-wrapped so that `State::clone()` is a cheap
+/// reference-count bump rather than a deep copy. The base maps are read-only
+/// during execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
-    base_accounts: HashMap<Address, Account>,
-    base_storage: HashMap<StorageKey, Slot>,
+    base_accounts: Arc<HashMap<Address, Account>>,
+    base_storage: Arc<HashMap<StorageKey, Slot>>,
     diff: FrameDiff,
 }
 
@@ -204,8 +211,8 @@ impl State {
         base_storage: HashMap<(Address, Slot), Slot>,
     ) -> Self {
         Self {
-            base_accounts,
-            base_storage,
+            base_accounts: Arc::new(base_accounts),
+            base_storage: Arc::new(base_storage),
             diff: FrameDiff::default(),
         }
     }

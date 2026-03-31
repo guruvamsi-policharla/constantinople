@@ -25,8 +25,10 @@ type StorageKey = (Address, Slot);
 /// writes that were not declared up front.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AccessSet {
-    accounts: HashMap<Address, AccessMode>,
-    storage: HashMap<StorageKey, AccessMode>,
+    accounts: HashMap<Address, (AccessMode, usize)>,
+    storage: HashMap<StorageKey, (AccessMode, usize)>,
+    /// Total number of entries (accounts + storage).
+    total: usize,
 }
 
 impl AccessSet {
@@ -41,7 +43,11 @@ impl AccessSet {
         recipient_mode: AccessMode,
         access_list: &AccessList,
     ) -> Self {
-        let mut access = Self::default();
+        let mut access = Self {
+            accounts: HashMap::with_capacity(access_list.len() + 2),
+            storage: HashMap::with_capacity(access_list.len()),
+            total: 0,
+        };
         access.allow_account(sender, AccessMode::Write);
         access.allow_account(recipient, recipient_mode);
 
@@ -64,7 +70,9 @@ impl AccessSet {
 
     /// Returns whether `address` may be written.
     pub(crate) fn can_write_account(&self, address: Address) -> bool {
-        self.accounts.get(&address) == Some(&AccessMode::Write)
+        self.accounts
+            .get(&address)
+            .is_some_and(|(mode, _)| *mode == AccessMode::Write)
     }
 
     /// Returns whether `(address, slot)` may be read.
@@ -74,70 +82,205 @@ impl AccessSet {
 
     /// Returns whether `(address, slot)` may be written.
     pub(crate) fn can_write_storage(&self, address: Address, slot: Slot) -> bool {
-        self.storage.get(&(address, slot)) == Some(&AccessMode::Write)
+        self.storage
+            .get(&(address, slot))
+            .is_some_and(|(mode, _)| *mode == AccessMode::Write)
+    }
+
+    /// Returns the bitset index for `address`, if declared.
+    pub(crate) fn account_index(&self, address: Address) -> Option<usize> {
+        self.accounts.get(&address).map(|(_, idx)| *idx)
+    }
+
+    /// Returns the bitset index for `(address, slot)`, if declared.
+    pub(crate) fn storage_index(&self, address: Address, slot: Slot) -> Option<usize> {
+        self.storage.get(&(address, slot)).map(|(_, idx)| *idx)
     }
 
     /// Iterates the declared account accesses.
     pub(crate) fn accounts(&self) -> impl Iterator<Item = (Address, AccessMode)> + '_ {
         self.accounts
             .iter()
-            .map(|(address, mode)| (*address, *mode))
+            .map(|(address, (mode, _))| (*address, *mode))
     }
 
     /// Iterates the declared storage accesses.
     pub(crate) fn storage(&self) -> impl Iterator<Item = (Address, Slot, AccessMode)> + '_ {
         self.storage
             .iter()
-            .map(|((address, slot), mode)| (*address, *slot, *mode))
+            .map(|((address, slot), (mode, _))| (*address, *slot, *mode))
     }
 
-    /// Returns whether the observed accesses exactly match the declared set.
+    /// Returns the total number of declared entries (accounts + storage).
+    pub(crate) const fn len(&self) -> usize {
+        self.total
+    }
+
+    /// Returns whether every declared entry was accessed.
     ///
-    /// Every declared entry must appear in the observed set with the same mode,
-    /// and the observed set must not contain entries absent from the declared
-    /// set. The second condition is already enforced at runtime by the frame
-    /// access checks, so this method only verifies the first direction.
-    pub(crate) fn is_exact_match(&self, observed: &AccessListBuilder) -> bool {
-        if self.accounts.len() != observed.accounts.len()
-            || self.storage.len() != observed.storage.len()
-        {
-            return false;
-        }
+    /// For the `Counter` observer, checks that all bits in the bitset are set.
+    /// For the `Builder` observer, compares every entry by key and mode.
+    pub(crate) fn is_exact_match(&self, observer: &AccessObserver) -> bool {
+        match observer {
+            AccessObserver::Counter(bits) => {
+                let total = self.len();
+                if total == 0 {
+                    return true;
+                }
+                // Check all full words are all-ones.
+                let full_words = total / 64;
+                for word in &bits[..full_words] {
+                    if *word != u64::MAX {
+                        return false;
+                    }
+                }
+                // Check the partial last word has the right bits set.
+                let remainder = total % 64;
+                if remainder > 0 {
+                    let mask = (1u64 << remainder) - 1;
+                    if bits[full_words] & mask != mask {
+                        return false;
+                    }
+                }
+                true
+            }
+            AccessObserver::Builder(builder) => {
+                if self.accounts.len() != builder.accounts.len()
+                    || self.storage.len() != builder.storage.len()
+                {
+                    return false;
+                }
 
-        for (address, declared_mode) in &self.accounts {
-            match observed.accounts.get(address) {
-                Some(observed_mode) if observed_mode == declared_mode => {}
-                _ => return false,
+                for (address, (declared_mode, _)) in &self.accounts {
+                    match builder.accounts.get(address) {
+                        Some(observed_mode) if observed_mode == declared_mode => {}
+                        _ => return false,
+                    }
+                }
+
+                for ((address, slot), (declared_mode, _)) in &self.storage {
+                    match builder.storage.get(&(*address, *slot)) {
+                        Some(observed_mode) if observed_mode == declared_mode => {}
+                        _ => return false,
+                    }
+                }
+
+                true
             }
         }
-
-        for ((address, slot), declared_mode) in &self.storage {
-            match observed.storage.get(&(*address, *slot)) {
-                Some(observed_mode) if observed_mode == declared_mode => {}
-                _ => return false,
-            }
-        }
-
-        true
     }
 
     fn allow_account(&mut self, address: Address, mode: AccessMode) {
         match self.accounts.get_mut(&address) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
+            Some((existing, _)) if *existing == AccessMode::Write => {}
+            Some((existing, _)) => *existing = mode,
             None => {
-                self.accounts.insert(address, mode);
+                let index = self.total;
+                self.total += 1;
+                self.accounts.insert(address, (mode, index));
             }
         }
     }
 
     fn allow_storage(&mut self, address: Address, slot: Slot, mode: AccessMode) {
         match self.storage.get_mut(&(address, slot)) {
-            Some(existing) if *existing == AccessMode::Write => {}
-            Some(existing) => *existing = mode,
+            Some((existing, _)) if *existing == AccessMode::Write => {}
+            Some((existing, _)) => *existing = mode,
             None => {
-                self.storage.insert((address, slot), mode);
+                let index = self.total;
+                self.total += 1;
+                self.storage.insert((address, slot), (mode, index));
             }
+        }
+    }
+}
+
+/// Tracks observed accesses during execution.
+///
+/// The `Counter` variant is the fast path: it uses a bitset indexed by the
+/// sequential position of each entry in the [`AccessSet`]. After execution,
+/// the processor checks that all bits are set.
+///
+/// The `Builder` variant records full access details for simulation, allowing
+/// the observed access list to be returned to the caller.
+#[derive(Debug, Clone)]
+pub(crate) enum AccessObserver {
+    /// Bitset tracking which declared entries have been accessed.
+    Counter(Vec<u64>),
+    /// Records full access details for access-list construction.
+    Builder(AccessListBuilder),
+}
+
+impl AccessObserver {
+    /// Creates a counter-based observer pre-sized for the given access set.
+    pub(crate) fn counter(access: &AccessSet) -> Self {
+        let bits_needed = access.len();
+        let words = bits_needed.div_ceil(64);
+        Self::Counter(vec![0u64; words])
+    }
+
+    /// Creates a builder-based observer for access-list construction.
+    pub(crate) fn builder() -> Self {
+        Self::Builder(AccessListBuilder::default())
+    }
+
+    /// Records an account access by its index in the access set.
+    pub(crate) fn record_account(
+        &mut self,
+        address: Address,
+        mode: AccessMode,
+        access: &AccessSet,
+    ) {
+        match self {
+            Self::Counter(bits) => {
+                if let Some(index) = access.account_index(address) {
+                    let word = index / 64;
+                    let bit = index % 64;
+                    bits[word] |= 1u64 << bit;
+                }
+            }
+            Self::Builder(builder) => builder.record_account(address, mode),
+        }
+    }
+
+    /// Records a storage access by its index in the access set.
+    pub(crate) fn record_storage(
+        &mut self,
+        address: Address,
+        slot: Slot,
+        mode: AccessMode,
+        access: &AccessSet,
+    ) {
+        match self {
+            Self::Counter(bits) => {
+                if let Some(index) = access.storage_index(address, slot) {
+                    let word = index / 64;
+                    let bit = index % 64;
+                    bits[word] |= 1u64 << bit;
+                }
+            }
+            Self::Builder(builder) => builder.record_storage(address, slot, mode),
+        }
+    }
+
+    /// Merges a child observer into this one.
+    pub(crate) fn merge(&mut self, child: Self) {
+        match (self, child) {
+            (Self::Counter(parent), Self::Counter(child)) => {
+                for (p, c) in parent.iter_mut().zip(child.iter()) {
+                    *p |= c;
+                }
+            }
+            (Self::Builder(parent), Self::Builder(child)) => parent.merge(child),
+            _ => unreachable!("counter and builder observers cannot be mixed"),
+        }
+    }
+
+    /// Converts to an access list, if this is a builder.
+    pub(crate) fn into_access_list(self) -> Option<AccessList> {
+        match self {
+            Self::Counter(_) => None,
+            Self::Builder(builder) => Some(builder.into_access_list()),
         }
     }
 }
