@@ -217,7 +217,6 @@ pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
-    genesis_allocations: Vec<(Address, Account)>,
     transaction_callback: Option<TransactionCallback<H::Digest>>,
     _marker: PhantomData<(C, S, I)>,
 }
@@ -231,7 +230,6 @@ where
             strategy: self.strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
-            genesis_allocations: self.genesis_allocations.clone(),
             transaction_callback: self.transaction_callback.clone(),
             _marker: PhantomData,
         }
@@ -254,13 +252,11 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
         strategy: St,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
-        genesis_allocations: Vec<(Address, Account)>,
     ) -> Self {
         Self {
             strategy,
             genesis_leader,
             transaction_namespace,
-            genesis_allocations,
             transaction_callback: None,
             _marker: PhantomData,
         }
@@ -290,21 +286,6 @@ where
     P: PublicKey,
     St: Strategy,
 {
-    /// Writes genesis allocations to the state batch (called once at height 1).
-    fn apply_genesis_allocations<E>(
-        &self,
-        batch: StateBatch<E, H, EightCap>,
-    ) -> StateBatch<E, H, EightCap>
-    where
-        E: Storage + Clock + Metrics,
-    {
-        self.genesis_allocations
-            .iter()
-            .fold(batch, |batch, (address, account)| {
-                batch.write(*address, Some(*account))
-            })
-    }
-
     /// Verifies signed wire transactions and returns verified execution transactions.
     fn verify_transactions<Txs>(&self, transactions: Txs) -> Option<Vec<VerifiedTransaction<P, H>>>
     where
@@ -446,10 +427,7 @@ where
     ) -> Option<Proposed<Self, E>> {
         let parent = ancestry.next().await?;
         let all_proposed = input.propose(&parent.header, &context).await;
-        let (mut state_batch, transaction_batch) = batches;
-        if parent.header.height == 0 {
-            state_batch = self.apply_genesis_allocations(state_batch);
-        }
+        let (state_batch, transaction_batch) = batches;
         let state = load_state(&state_batch, &all_proposed)
             .await
             .expect("proposal state loading must succeed");
@@ -560,10 +538,7 @@ where
         let deadline = self.block_deadline(block.header.timestamp);
         runtime.sleep_until(deadline).await;
 
-        let (mut state_batch, transaction_batch) = batches;
-        if parent.header.height == 0 {
-            state_batch = self.apply_genesis_allocations(state_batch);
-        }
+        let (state_batch, transaction_batch) = batches;
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("block state loading during verification must succeed");
@@ -661,11 +636,7 @@ where
             .verify_block(block)
             .expect("certified block contained an invalid signature");
 
-        let (mut state_batch, transaction_batch) = batches;
-        if block.header.height == 1 {
-            state_batch = self.apply_genesis_allocations(state_batch);
-        }
-
+        let (state_batch, transaction_batch) = batches;
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("state loading must succeed for certified apply");
@@ -921,7 +892,7 @@ mod tests {
     fn verify_test_application()
     -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), Sequential> {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(Sequential, genesis_leader, NAMESPACE, Vec::new())
+        Application::new(Sequential, genesis_leader, NAMESPACE)
     }
 
     fn counting_test_application(
@@ -929,7 +900,7 @@ mod tests {
     ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy>
     {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(strategy, genesis_leader, NAMESPACE, Vec::new())
+        Application::new(strategy, genesis_leader, NAMESPACE)
     }
 
     fn verified_wire_transaction() -> VerifyTestTransaction {

@@ -52,7 +52,7 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
 use constantinople_application::consensus::{Application, TransactionCallback};
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Account, Address, BlockCfg};
+use constantinople_primitives::BlockCfg;
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
@@ -158,7 +158,6 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    pub genesis_allocations: Vec<(Address, Account)>,
     pub transaction_callback: Option<TransactionCallback<H::Digest>>,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
@@ -335,7 +334,6 @@ where
             config.strategy.clone(),
             config.genesis_leader,
             config.transaction_namespace,
-            config.genesis_allocations,
         );
         if let Some(callback) = config.transaction_callback {
             application = application.with_transaction_callback(callback);

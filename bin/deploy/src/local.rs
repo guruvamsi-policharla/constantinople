@@ -1,7 +1,7 @@
 use crate::{
     BootstrapperEntry, ClusterMaterial, GenerateArgs, LocalArgs, ValidatorConfig, absolute_path,
     default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_cluster_material, load_genesis_allocations, write_toml_config,
+    generate_cluster_material, write_toml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -18,9 +18,8 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
 
-    let genesis_allocations = load_genesis_allocations(args.genesis.as_deref());
     let material = generate_cluster_material(args.validators);
-    let validators = build_validators(args, local, &output_dir, &genesis_allocations, &material);
+    let validators = build_validators(args, local, &output_dir, &material);
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
@@ -34,7 +33,6 @@ fn build_validators(
     args: &GenerateArgs,
     local: &LocalArgs,
     output_dir: &std::path::Path,
-    genesis_allocations: &[crate::GenesisAllocation],
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
@@ -86,7 +84,6 @@ fn build_validators(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers,
-            genesis_allocations: genesis_allocations.to_vec(),
         };
 
         validators.push(GeneratedValidator {

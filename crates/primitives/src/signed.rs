@@ -12,24 +12,6 @@ use crate::{Address, Sealable, Sealed, Transaction};
 use commonware_codec::{EncodeSize, Error, Read, Write};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Signature, Signer, Verifier};
 
-type VerifiedBy<T, H, P> = Verified<T, H, <P as Verifier>::Signature>;
-
-fn verified_transaction<D, P, H>(
-    signed: Signed<Transaction<D, P>, H, <P as Verifier>::Signature>,
-) -> VerifiedBy<Transaction<D, P>, H, P>
-where
-    D: Digest,
-    P: PublicKey,
-    H: Hasher,
-{
-    let mut hasher = H::default();
-    let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
-    Verified {
-        inner: signed,
-        signer,
-    }
-}
-
 /// A [`Sealed`] object with an attached signature over its seal.
 #[derive(Debug, Clone)]
 pub struct Signed<T, H, Sig>
@@ -309,6 +291,25 @@ pub trait Signable: Sealable {
 }
 
 impl<T: Sealable> Signable for T {}
+
+type VerifiedBy<T, H, P> = Verified<T, H, <P as Verifier>::Signature>;
+
+/// Converts a [`Signed<Transaction>`] into a [`Verified<Signed<Transaction>>`].
+fn verified_transaction<D, P, H>(
+    signed: Signed<Transaction<D, P>, H, <P as Verifier>::Signature>,
+) -> VerifiedBy<Transaction<D, P>, H, P>
+where
+    D: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let mut hasher = H::default();
+    let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
+    Verified {
+        inner: signed,
+        signer,
+    }
+}
 
 #[cfg(test)]
 mod test {

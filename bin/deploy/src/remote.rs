@@ -1,9 +1,8 @@
 use crate::{
-    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, GenesisAllocation,
-    NamedBootstrapperEntry, RemoteArgs, RemoteValidatorConfig, SPAMMER_CONFIG_FILE,
-    SPAMMER_INSTANCE_NAME, STORAGE_CLASS, TxSpammerConfig, absolute_path, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing, generate_cluster_material,
-    load_genesis_allocations, write_toml_config,
+    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, NamedBootstrapperEntry,
+    RemoteArgs, RemoteValidatorConfig, SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS,
+    TxSpammerConfig, absolute_path, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_cluster_material, write_toml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws;
@@ -38,9 +37,8 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
 
     let validator_binary = absolute_path(&remote.validator_binary);
     let dashboard = absolute_path(&remote.dashboard);
-    let genesis_allocations = load_genesis_allocations(args.genesis.as_deref());
     let material = generate_cluster_material(args.validators);
-    let validators = build_validators(args, remote, &output_dir, &genesis_allocations, &material);
+    let validators = build_validators(args, remote, &output_dir, &material);
     let spammer = build_spammer_deployment(remote, &output_dir, &validators);
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
@@ -72,7 +70,6 @@ fn build_validators(
     args: &GenerateArgs,
     remote: &RemoteArgs,
     output_dir: &Path,
-    genesis_allocations: &[GenesisAllocation],
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
@@ -110,7 +107,6 @@ fn build_validators(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers,
-            genesis_allocations: genesis_allocations.to_vec(),
         };
         let public_key_hex = hex(&public_key.encode());
 
@@ -256,7 +252,6 @@ mod tests {
             output_dir: PathBuf::from("artifacts"),
             log_level: "info".to_string(),
             worker_threads: 2,
-            genesis: None,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -277,7 +272,7 @@ mod tests {
             listen_port: 9000,
             http_port: 8080,
             profiling: true,
-            spammer_binary: Some(PathBuf::from("constantinople-tx")),
+            spammer_binary: Some(PathBuf::from("constantinople-spammer")),
             spammer_count: Some(NonZeroUsize::new(64).unwrap()),
             spammer_tps: Some(NonZeroU32::new(10_000).unwrap()),
             spammer_seed_start: 7,
@@ -306,7 +301,6 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers: Vec::new(),
-                genesis_allocations: Vec::new(),
             },
         }
     }

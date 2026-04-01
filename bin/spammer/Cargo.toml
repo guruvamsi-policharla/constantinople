@@ -1,5 +1,5 @@
 [package]
-name = "constantinople-tx"
+name = "constantinople-spammer"
 description = "Transaction spammer for Constantinople"
 version = "0.0.0"
 edition.workspace = true

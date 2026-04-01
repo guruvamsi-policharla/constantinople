@@ -11,7 +11,7 @@ use std::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "constantinople-tx")]
+#[command(name = "constantinople-spammer")]
 struct Cli {
     /// Number of accounts to create.
     #[arg(long)]
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn parses_local_spam_invocation() {
         let cli = Cli::try_parse_from([
-            "constantinople-tx",
+            "constantinople-spammer",
             "--count",
             "8",
             "--endpoint",
@@ -118,15 +118,15 @@ mod tests {
     #[test]
     fn parses_deployer_style_invocation() {
         let cli = Cli::try_parse_from([
-            "constantinople-tx",
+            "constantinople-spammer",
             "--hosts",
             "hosts.yaml",
             "--config",
-            "tx-spammer.toml",
+            "spammer.toml",
         ])
         .expect("deployer invocation should parse");
 
         assert_eq!(cli.hosts, Some(PathBuf::from("hosts.yaml")));
-        assert_eq!(cli.config, Some(PathBuf::from("tx-spammer.toml")));
+        assert_eq!(cli.config, Some(PathBuf::from("spammer.toml")));
     }
 }

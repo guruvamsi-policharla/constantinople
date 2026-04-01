@@ -982,7 +982,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "constantinople-tx"
+name = "constantinople-spammer"
 version = "0.0.0"
 dependencies = [
  "bytes",

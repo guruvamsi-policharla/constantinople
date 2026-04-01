@@ -12,7 +12,6 @@ use commonware_cryptography::{
 use commonware_deployer::aws::Hosts;
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::{NZU32, from_hex};
-use constantinople_primitives::{Account, Address};
 use std::{collections::HashMap, net::SocketAddr, path::Path};
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
@@ -42,8 +41,6 @@ pub struct ValidatorConfig {
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
     pub bootstrappers: Vec<BootstrapperEntry>,
-    #[serde(default)]
-    pub genesis_allocations: Vec<GenesisAllocation>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -65,8 +62,6 @@ pub struct DeployerValidatorConfig {
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
-    #[serde(default)]
-    pub genesis_allocations: Vec<GenesisAllocation>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -81,12 +76,6 @@ pub struct NamedBootstrapperEntry {
     pub name: String,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-pub struct GenesisAllocation {
-    pub address: String,
-    pub balance: u64,
-}
-
 /// Decoded key material and network info ready for use by the engine.
 pub struct DecodedConfig {
     pub signer: ed25519::PrivateKey,
@@ -97,7 +86,6 @@ pub struct DecodedConfig {
     pub listen: SocketAddr,
     pub bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
     pub partition_prefix: String,
-    pub genesis_allocations: Vec<(Address, Account)>,
 }
 
 pub struct LoadedConfig {
@@ -140,23 +128,6 @@ fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
     ed25519::PublicKey::read(&mut &bytes[..]).expect("failed to decode public key")
 }
 
-fn decode_genesis_allocations(allocations: &[GenesisAllocation]) -> Vec<(Address, Account)> {
-    allocations
-        .iter()
-        .map(|allocation| {
-            let bytes = decode_hex("genesis allocation address", &allocation.address);
-            let address = Address::read(&mut &bytes[..]).expect("failed to decode genesis address");
-            (
-                address,
-                Account {
-                    balance: allocation.balance,
-                    nonce: 0,
-                },
-            )
-        })
-        .collect()
-}
-
 impl ValidatorConfig {
     pub fn decode(&self) -> DecodedConfig {
         let signer = decode_private_key(&self.private_key);
@@ -189,7 +160,6 @@ impl ValidatorConfig {
             listen,
             bootstrappers,
             partition_prefix: self.partition_prefix.clone(),
-            genesis_allocations: decode_genesis_allocations(&self.genesis_allocations),
         }
     }
 }
@@ -237,7 +207,6 @@ impl DeployerValidatorConfig {
                 listen,
                 bootstrappers,
                 partition_prefix: self.partition_prefix.clone(),
-                genesis_allocations: decode_genesis_allocations(&self.genesis_allocations),
             },
             log_level: self.log_level.clone(),
             worker_threads: self.worker_threads,
@@ -276,8 +245,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 
 #[cfg(test)]
 mod tests {
-    use super::{DeployerValidatorConfig, GenesisAllocation, NamedBootstrapperEntry};
-    use commonware_codec::{Encode, FixedSize};
+    use super::{DeployerValidatorConfig, NamedBootstrapperEntry};
+    use commonware_codec::Encode;
     use commonware_cryptography::{
         Signer,
         bls12381::{
@@ -288,7 +257,6 @@ mod tests {
     };
     use commonware_deployer::aws::{Host, Hosts};
     use commonware_utils::{N3f1, TryCollect, hex};
-    use constantinople_primitives::Address;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
@@ -329,10 +297,6 @@ mod tests {
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: peer_name.clone(),
                 name: peer_name,
-            }],
-            genesis_allocations: vec![GenesisAllocation {
-                address: "00".repeat(Address::SIZE),
-                balance: 100,
             }],
         };
         let hosts = Hosts {

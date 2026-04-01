@@ -24,8 +24,8 @@ use std::{
 const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
-const SPAMMER_CONFIG_FILE: &str = "tx-spammer.toml";
-const SPAMMER_INSTANCE_NAME: &str = "tx-spammer";
+const SPAMMER_CONFIG_FILE: &str = "spammer.toml";
+const SPAMMER_INSTANCE_NAME: &str = "spammer";
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
@@ -49,8 +49,6 @@ pub(crate) struct GenerateArgs {
     log_level: String,
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
-    #[arg(long)]
-    genesis: Option<PathBuf>,
     #[command(subcommand)]
     target: GenerateTarget,
 }
@@ -123,18 +121,6 @@ pub(crate) struct NamedBootstrapperEntry {
     name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct GenesisAllocation {
-    address: String,
-    balance: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenesisFile {
-    #[serde(default)]
-    allocations: Vec<GenesisAllocation>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ValidatorConfig {
     private_key: String,
@@ -150,8 +136,6 @@ pub(crate) struct ValidatorConfig {
     max_propose_bytes: usize,
     max_pool_bytes: usize,
     bootstrappers: Vec<BootstrapperEntry>,
-    #[serde(default)]
-    genesis_allocations: Vec<GenesisAllocation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,8 +153,6 @@ pub(crate) struct RemoteValidatorConfig {
     max_propose_bytes: usize,
     max_pool_bytes: usize,
     bootstrappers: Vec<NamedBootstrapperEntry>,
-    #[serde(default)]
-    genesis_allocations: Vec<GenesisAllocation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,16 +182,6 @@ fn main() {
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
         },
     }
-}
-
-pub(crate) fn load_genesis_allocations(path: Option<&Path>) -> Vec<GenesisAllocation> {
-    let Some(path) = path else {
-        return Vec::new();
-    };
-
-    let raw = fs::read_to_string(path).expect("failed to read genesis file");
-    let parsed: GenesisFile = toml::from_str(&raw).expect("failed to parse genesis file");
-    parsed.allocations
 }
 
 pub(crate) fn absolute_path(path: &Path) -> PathBuf {

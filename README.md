@@ -9,7 +9,7 @@ simple blockchain that supports only account-to-account transfers.
 ```
 bin/
   validator/        CLI that assembles and runs a validator node
-  tx/               `constantinople-tx` transaction tool
+  spammer/          `constantinople-spammer` transaction spammer
 
 crates/
   primitives/       Core types: blocks, transactions, and accounts
@@ -41,14 +41,15 @@ account model:
 
 ## Quick Start
 
-### Setup
+### Generate Configs
 
-Generate validator configs for a local cluster (e.g. 4 validators):
+Generate local deployment configs for a validator cluster:
 
 ```sh
-cargo run --bin constantinople -- setup \
+cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./configs \
+  local \
   --base-port 3000 \
   --base-http-port 8080
 ```
@@ -58,20 +59,18 @@ cargo run --bin constantinople -- setup \
 Start each validator with its config:
 
 ```sh
-cargo run --bin constantinople -- run --config ./configs/validator-0.toml
+cargo run --bin constantinople -- --config ./configs/validator-0.toml
 ```
 
-Or use the `mprocs` command printed by `setup` to launch all validators at once.
+Or use the `mprocs` command printed by `constantinople-deploy` to launch all validators at once.
 
-### Submit a Transaction
+### Run The Spammer
 
 ```sh
-cargo run --bin constantinople-tx -- transfer \
-  --key <hex-private-key> \
-  --to <hex-address> \
-  --value 100 \
-  --nonce 0 \
-  --endpoint http://localhost:8080
+cargo run --bin constantinople-spammer -- \
+  --count 1024 \
+  --endpoint http://localhost:8080 \
+  --tps 10000
 ```
 
 ## Development

@@ -223,7 +223,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: b"constantinople-tx",
                 block_codec: Default::default(),
-                genesis_allocations: decoded.genesis_allocations,
                 transaction_callback: Some(transaction_callback),
                 bootstrapper: bootstrapper_mailbox.clone(),
             },
