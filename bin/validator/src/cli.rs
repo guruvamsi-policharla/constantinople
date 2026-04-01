@@ -1,51 +1,53 @@
 //! CLI definition.
 
 use std::path::PathBuf;
-use tracing::Level;
 
-#[derive(clap::Parser)]
+#[derive(Debug, clap::Parser)]
 #[command(name = "constantinople-validator")]
-pub enum Cli {
-    /// Generate TOML config files for a validator set.
-    Setup(SetupArgs),
-    /// Run a validator from a TOML config file.
-    Run {
-        /// Path to the validator TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Startup mode: marshal-sync or state-sync.
-        #[arg(long, value_enum, default_value_t = StartupArg::MarshalSync)]
-        mode: StartupArg,
-    },
+pub struct Cli {
+    /// Path to the validator TOML config.
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long, hide = true)]
+    pub hosts: Option<PathBuf>,
+    /// Startup mode: marshal-sync or state-sync.
+    #[arg(long, value_enum, default_value_t = StartupArg::MarshalSync)]
+    pub mode: StartupArg,
 }
 
-#[derive(clap::Args)]
-pub struct SetupArgs {
-    /// Number of validators to generate.
-    #[arg(long)]
-    pub validators: u32,
-    /// Directory to write config files into.
-    #[arg(long)]
-    pub output_dir: PathBuf,
-    /// First validator's listen port (increments per validator).
-    #[arg(long, default_value_t = 9000)]
-    pub base_port: u16,
-    /// Log level written into generated config files.
-    #[arg(long, default_value_t = Level::INFO)]
-    pub log_level: Level,
-    /// Number of tokio worker threads for the runtime.
-    #[arg(long, default_value_t = 2)]
-    pub worker_threads: usize,
-    /// First validator's HTTP port (increments per validator).
-    #[arg(long, default_value_t = 8080)]
-    pub base_http_port: u16,
-    /// Path to a TOML file with genesis allocations.
-    #[arg(long)]
-    pub genesis: Option<PathBuf>,
-}
-
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum StartupArg {
     MarshalSync,
     StateSync,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_local_invocation() {
+        let cli = Cli::try_parse_from(["constantinople", "--config", "validator.toml"])
+            .expect("local invocation should parse");
+
+        assert_eq!(cli.config, PathBuf::from("validator.toml"));
+        assert!(cli.hosts.is_none());
+    }
+
+    #[test]
+    fn parses_deployer_style_invocation() {
+        let cli = Cli::try_parse_from([
+            "constantinople",
+            "--hosts",
+            "hosts.yaml",
+            "--config",
+            "validator.toml",
+        ])
+        .expect("deployer invocation should parse");
+
+        assert_eq!(cli.config, PathBuf::from("validator.toml"));
+        assert_eq!(cli.hosts, Some(PathBuf::from("hosts.yaml")));
+    }
 }

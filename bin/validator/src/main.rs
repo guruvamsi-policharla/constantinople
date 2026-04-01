@@ -3,13 +3,15 @@
 mod cli;
 mod config;
 mod run;
-mod setup;
 
 use clap::Parser;
 
 fn main() {
-    match cli::Cli::parse() {
-        cli::Cli::Setup(args) => setup::setup(args),
-        cli::Cli::Run { config, mode } => run::run(config, mode),
+    let cli = cli::Cli::parse();
+    if let Some(hosts) = cli.hosts {
+        run::run_deployer(hosts, cli.config, cli.mode);
+        return;
     }
+
+    run::run_local(cli.config, cli.mode);
 }

@@ -1,6 +1,9 @@
 //! `run` subcommand — starts a validator from a TOML config.
 
-use crate::{cli::StartupArg, config::ValidatorConfig};
+use crate::{
+    cli::StartupArg,
+    config::{LoadedConfig, load_deployer_config, load_local_config},
+};
 use commonware_codec::Encode;
 use commonware_consensus::{
     Heightable, Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
@@ -21,7 +24,7 @@ use constantinople_engine::{
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::server::{Mempool, MempoolConfig, router};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,10 +45,25 @@ impl Reporter for NoopReporter {
     }
 }
 
-pub fn run(config_path: PathBuf, mode: StartupArg) {
-    let raw = std::fs::read_to_string(&config_path).expect("failed to read config file");
-    let cfg: ValidatorConfig = toml::from_str(&raw).expect("failed to parse config");
-    let decoded = cfg.decode();
+pub fn run_local(config_path: PathBuf, mode: StartupArg) {
+    let loaded = load_local_config(&config_path);
+    run_with_config(loaded, config_path, mode);
+}
+
+pub fn run_deployer(hosts_path: PathBuf, config_path: PathBuf, mode: StartupArg) {
+    let loaded = load_deployer_config(&hosts_path, &config_path);
+    run_with_config(loaded, config_path, mode);
+}
+
+fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg) {
+    let LoadedConfig {
+        decoded,
+        log_level,
+        worker_threads,
+        http_listen,
+        max_propose_bytes,
+        max_pool_bytes,
+    } = config;
 
     let config_dir = config_path
         .parent()
@@ -53,16 +71,14 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
     let storage_dir = config_dir.join(&decoded.partition_prefix);
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
-        .with_worker_threads(cfg.worker_threads);
+        .with_worker_threads(worker_threads);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
-
-    let http_port = cfg.http_port;
 
     runner.start(|context| async move {
         telemetry::init(
             context.with_label("telemetry"),
             Logging {
-                level: cfg.log_level.parse().expect("bad log_level in config"),
+                level: log_level.parse().expect("bad log_level in config"),
                 json: false,
             },
             None,
@@ -72,18 +88,16 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         info!(
             validator = %hex(&decoded.public_key.encode()),
             listen = %decoded.listen,
-            http_port,
+            http_listen = %http_listen,
             "starting validator"
         );
 
-        // Collect all validator public keys before moving bootstrappers.
         let all_pks = {
             let mut pks = vec![decoded.public_key.clone()];
             pks.extend(decoded.bootstrappers.iter().map(|(pk, _)| pk.clone()));
             pks
         };
 
-        // Build the p2p network.
         let (mut network, mut oracle) = discovery::Network::new(
             context.with_label("p2p"),
             discovery::Config::local(
@@ -96,12 +110,10 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             ),
         );
 
-        // Register all validators as peers.
         oracle
             .track(0, all_pks.into_iter().try_collect().unwrap())
             .await;
 
-        // Register channels.
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);
         let backlog = 1024;
         let channels = Channels {
@@ -136,7 +148,6 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
-        // Determine startup mode.
         let startup = match mode {
             StartupArg::MarshalSync => {
                 info!("starting in marshal-sync mode");
@@ -154,12 +165,11 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             }
         };
 
-        // Build mempool with transaction outcome callbacks.
         let mempool = Mempool::<Commitment, ed25519::PublicKey, Sha256>::new(
             b"constantinople-tx",
             MempoolConfig {
-                max_propose_bytes: cfg.max_propose_bytes,
-                max_pool_bytes: cfg.max_pool_bytes,
+                max_propose_bytes,
+                max_pool_bytes,
             },
         );
 
@@ -177,20 +187,17 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 });
             });
 
-        // Start HTTP server (state_reader filled after DB subscription).
         let router = router(&mempool);
-        let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
-        let http_listener = tokio::net::TcpListener::bind(http_addr)
+        let http_listener = tokio::net::TcpListener::bind(http_listen)
             .await
             .expect("failed to bind HTTP listener");
-        info!(%http_addr, "HTTP server listening");
+        info!(listen = %http_listen, "HTTP server listening");
         let http_handle = tokio::spawn(async move {
             axum::serve(http_listener, router)
                 .await
                 .expect("HTTP server failed");
         });
 
-        // Build and start the engine.
         info!("initializing engine");
         let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, _, _>::new(
             context.with_label("engine"),
