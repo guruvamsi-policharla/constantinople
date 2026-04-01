@@ -61,7 +61,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Shared QMDB handle for the application state database.
 pub(crate) type StateDatabase<E, H, T> =
@@ -483,6 +483,15 @@ where
         )
         .seal(&mut H::default());
 
+        info!(
+            epoch = block.header.context.round.epoch().get(),
+            view = block.header.context.round.view().get(),
+            height = block.header.height,
+            txs = block.body.len(),
+            timestamp = block.header.timestamp,
+            "proposed block"
+        );
+
         Some(Proposed {
             block,
             merkleized: (state_merkleized, transaction_merkleized),
@@ -604,6 +613,15 @@ where
                 .collect();
             callback(block.header.height, included, true);
         }
+
+        info!(
+            epoch = block.header.context.round.epoch().get(),
+            view = block.header.context.round.view().get(),
+            height = block.header.height,
+            txs = body.len(),
+            timestamp = block.header.timestamp,
+            "verified block"
+        );
 
         Some((state_merkleized, transaction_merkleized))
     }
