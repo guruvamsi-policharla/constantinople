@@ -14,7 +14,7 @@ use commonware_runtime::{
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex, union};
-use constantinople_application::consensus::{InclusionCallback, RejectionCallback};
+use constantinople_application::consensus::TransactionCallback;
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
@@ -154,7 +154,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             }
         };
 
-        // Build mempool with inclusion and rejection callbacks.
+        // Build mempool with transaction outcome callbacks.
         let mempool = Mempool::<Commitment, ed25519::PublicKey, Sha256>::new(
             b"constantinople-tx",
             MempoolConfig {
@@ -163,21 +163,17 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             },
         );
 
-        let inclusion_mempool = mempool.clone();
-        let inclusion_callback: InclusionCallback<<Sha256 as Hasher>::Digest> =
-            Arc::new(move |height, transaction_hashes| {
-                let mempool = inclusion_mempool.clone();
+        let callback_mempool = mempool.clone();
+        let transaction_callback: TransactionCallback<<Sha256 as Hasher>::Digest> =
+            Arc::new(move |height, transaction_hashes, included| {
+                let mempool = callback_mempool.clone();
                 tokio::spawn(async move {
-                    mempool.notify_included(height, &transaction_hashes).await;
-                });
-            });
+                    if included {
+                        mempool.notify_included(height, &transaction_hashes).await;
+                        return;
+                    }
 
-        let rejection_mempool = mempool.clone();
-        let rejection_callback: RejectionCallback<<Sha256 as Hasher>::Digest> =
-            Arc::new(move |rejected_hashes| {
-                let mempool = rejection_mempool.clone();
-                tokio::spawn(async move {
-                    mempool.notify_rejected(&rejected_hashes).await;
+                    mempool.notify_rejected(&transaction_hashes).await;
                 });
             });
 
@@ -221,8 +217,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 transaction_namespace: b"constantinople-tx",
                 block_codec: Default::default(),
                 genesis_allocations: decoded.genesis_allocations,
-                inclusion_callback: Some(inclusion_callback),
-                rejection_callback: Some(rejection_callback),
+                transaction_callback: Some(transaction_callback),
                 bootstrapper: bootstrapper_mailbox.clone(),
             },
         )

@@ -244,8 +244,7 @@ impl EngineDefinition for TestEngineDefinition {
                             transaction_namespace: TRANSACTION_NAMESPACE,
                             block_codec: Default::default(),
                             genesis_allocations: Vec::new(),
-                            inclusion_callback: None,
-                            rejection_callback: None,
+                            transaction_callback: None,
                             bootstrapper: bootstrapper_mailbox.clone(),
                         },
                     )

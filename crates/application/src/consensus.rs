@@ -126,7 +126,11 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let accounts = collect_preload_accounts(transactions);
+    let mut accounts = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    for transaction in transactions {
+        accounts.insert(transaction.signer());
+        accounts.insert(transaction.value().to);
+    }
 
     let account_keys = accounts.iter().copied().collect::<Vec<_>>();
     let account_results = futures::future::try_join_all(
@@ -146,42 +150,22 @@ where
     Ok(State::from_loaded(base_accounts, account_keys))
 }
 
-/// Collects the accounts that must be loaded for execution.
-///
-/// The result is de-duplicated across the whole block so state is loaded once
-/// before execution starts.
-fn collect_preload_accounts<P, H>(transactions: &[VerifiedTransaction<P, H>]) -> HashSet<Address>
-where
-    P: PublicKey,
-    H: Hasher,
-{
-    let mut accounts = HashSet::with_capacity(transactions.len().saturating_mul(2));
-
-    for transaction in transactions {
-        accounts.insert(transaction.signer());
-        accounts.insert(transaction.value().to);
-    }
-
-    accounts
-}
-
 /// Core constantinople application.
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-/// Type-erased callback for transaction inclusion notifications.
-pub type InclusionCallback<D> = Arc<dyn Fn(u64, Vec<D>) + Send + Sync>;
-
-/// Callback invoked with tx hashes that were filtered out during proposal.
-pub type RejectionCallback<D> = Arc<dyn Fn(Vec<D>) + Send + Sync>;
+/// Type-erased callback for transaction proposal outcomes.
+///
+/// The callback receives the block height, the transaction hashes, and whether
+/// the transactions were included in the block.
+pub type TransactionCallback<D> = Arc<dyn Fn(u64, Vec<D>, bool) + Send + Sync>;
 
 pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     genesis_allocations: Vec<(Address, Account)>,
-    inclusion_callback: Option<InclusionCallback<H::Digest>>,
-    rejection_callback: Option<RejectionCallback<H::Digest>>,
+    transaction_callback: Option<TransactionCallback<H::Digest>>,
     _marker: PhantomData<(C, S, I)>,
 }
 
@@ -195,8 +179,7 @@ where
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             genesis_allocations: self.genesis_allocations.clone(),
-            inclusion_callback: self.inclusion_callback.clone(),
-            rejection_callback: self.rejection_callback.clone(),
+            transaction_callback: self.transaction_callback.clone(),
             _marker: PhantomData,
         }
     }
@@ -225,21 +208,14 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
             genesis_leader,
             transaction_namespace,
             genesis_allocations,
-            inclusion_callback: None,
-            rejection_callback: None,
+            transaction_callback: None,
             _marker: PhantomData,
         }
     }
 
-    /// Sets a callback that receives included transaction hashes for each block.
-    pub fn with_inclusion_callback(mut self, callback: InclusionCallback<H::Digest>) -> Self {
-        self.inclusion_callback = Some(callback);
-        self
-    }
-
-    /// Sets a callback invoked with tx hashes filtered out during proposal.
-    pub fn with_rejection_callback(mut self, callback: RejectionCallback<H::Digest>) -> Self {
-        self.rejection_callback = Some(callback);
+    /// Sets a callback that receives proposal and verification transaction outcomes.
+    pub fn with_transaction_callback(mut self, callback: TransactionCallback<H::Digest>) -> Self {
+        self.transaction_callback = Some(callback);
         self
     }
 
@@ -277,10 +253,7 @@ where
     }
 
     /// Verifies signed wire transactions and returns verified execution transactions.
-    fn verify_transactions<Txs>(
-        &self,
-        transactions: Txs,
-    ) -> Option<Vec<VerifiedTransaction<P, H>>>
+    fn verify_transactions<Txs>(&self, transactions: Txs) -> Option<Vec<VerifiedTransaction<P, H>>>
     where
         Txs: IntoIterator<Item = WireTransaction<H, P>> + Send,
         Txs::IntoIter: Send,
@@ -435,12 +408,11 @@ where
             changeset,
         } = result;
 
-        // Notify rejected transaction waiters.
-        if let Some(ref callback) = self.rejection_callback
+        if let Some(ref callback) = self.transaction_callback
             && !invalid.is_empty()
         {
             let rejected: Vec<_> = invalid.iter().map(|tx| *tx.message_digest()).collect();
-            callback(rejected);
+            callback(parent.header.height + 1, rejected, false);
         }
 
         let transaction_batch = valid.iter().fold(transaction_batch, |batch, transaction| {
@@ -451,12 +423,12 @@ where
             .fold(state_batch, |batch, (address, account)| {
                 batch.write(*address, Some(*account))
             });
-        if let Some(ref callback) = self.inclusion_callback {
+        if let Some(ref callback) = self.transaction_callback {
             let included = valid
                 .iter()
                 .map(|transaction| *transaction.message_digest())
                 .collect();
-            callback(parent.header.height + 1, included);
+            callback(parent.header.height + 1, included, true);
         }
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
@@ -602,12 +574,12 @@ where
             );
             return None;
         }
-        if let Some(ref callback) = self.inclusion_callback {
+        if let Some(ref callback) = self.transaction_callback {
             let included = body
                 .iter()
                 .map(|transaction| *transaction.message_digest())
                 .collect();
-            callback(block.header.height, included);
+            callback(block.header.height, included, true);
         }
 
         Some((state_merkleized, transaction_merkleized))
@@ -910,7 +882,8 @@ mod tests {
 
     fn counting_test_application(
         strategy: CountingStrategy,
-    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy> {
+    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy>
+    {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
         Application::new(strategy, genesis_leader, NAMESPACE, Vec::new())
     }

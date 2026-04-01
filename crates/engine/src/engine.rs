@@ -52,7 +52,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
-use constantinople_application::consensus::{Application, InclusionCallback, RejectionCallback};
+use constantinople_application::consensus::{Application, TransactionCallback};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Address, BlockCfg};
 use futures::future::try_join_all;
@@ -162,8 +162,7 @@ where
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
     pub genesis_allocations: Vec<(Address, Account)>,
-    pub inclusion_callback: Option<InclusionCallback<H::Digest>>,
-    pub rejection_callback: Option<RejectionCallback<H::Digest>>,
+    pub transaction_callback: Option<TransactionCallback<H::Digest>>,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
 
@@ -341,11 +340,8 @@ where
             config.transaction_namespace,
             config.genesis_allocations,
         );
-        if let Some(callback) = config.inclusion_callback {
-            application = application.with_inclusion_callback(callback);
-        }
-        if let Some(callback) = config.rejection_callback {
-            application = application.with_rejection_callback(callback);
+        if let Some(callback) = config.transaction_callback {
+            application = application.with_transaction_callback(callback);
         }
         let (stateful, stateful_mailbox) = Stateful::init(
             context.with_label("stateful"),
