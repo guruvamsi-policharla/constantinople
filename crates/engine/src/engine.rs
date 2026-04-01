@@ -52,10 +52,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
-use constantinople_application::{
-    consensus::{Application, ReceiptCallback, RejectionCallback},
-    processor::Precompiles,
-};
+use constantinople_application::consensus::{Application, InclusionCallback, RejectionCallback};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Address, BlockCfg};
 use futures::future::try_join_all;
@@ -140,7 +137,7 @@ where
 }
 
 /// Engine initialization parameters.
-pub struct Config<C, M, B, V, T, I, R, H>
+pub struct Config<C, M, B, V, T, I, H>
 where
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
@@ -156,7 +153,6 @@ where
     pub output: Output<V, C::PublicKey>,
     pub share: Option<group::Share>,
     pub input: I,
-    pub precompiles: R,
     pub partition_prefix: String,
     pub freezer_table_initial_size: u32,
     pub strategy: T,
@@ -166,13 +162,13 @@ where
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
     pub genesis_allocations: Vec<(Address, Account)>,
-    pub receipt_callback: Option<ReceiptCallback<H::Digest>>,
+    pub inclusion_callback: Option<InclusionCallback<H::Digest>>,
     pub rejection_callback: Option<RejectionCallback<H::Digest>>,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, T, I, R>
+pub struct Engine<E, C, M, B, H, V, L, T, I>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -183,7 +179,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
-    R: Precompiles + Clone + Send + Sync + 'static,
 {
     context: ContextCell<E>,
     signer: C,
@@ -191,8 +186,8 @@ where
     blocker: B,
     state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, StateDb<E, H>>,
     transaction_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, TransactionDb<E, H>>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, R, T>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, R, T>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, T>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     #[expect(
@@ -214,10 +209,10 @@ where
     >,
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I, R>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I>,
 }
 
-impl<E, C, M, B, H, V, L, T, I, R> Engine<E, C, M, B, H, V, L, T, I, R>
+impl<E, C, M, B, H, V, L, T, I> Engine<E, C, M, B, H, V, L, T, I>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -228,7 +223,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
-    R: Precompiles + Clone + Send + Sync + 'static,
 {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
@@ -242,7 +236,7 @@ where
     }
 
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<C, M, B, V, T, I, R, H>) -> Self {
+    pub async fn new(context: E, config: Config<C, M, B, V, T, I, H>) -> Self {
         let page_cache = CacheRef::from_pooler(&context, PAGE_CACHE_PAGE_SIZE, PAGE_CACHE_CAPACITY);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
@@ -342,14 +336,13 @@ where
         );
 
         let mut application = Application::new(
-            config.precompiles.clone(),
             config.strategy.clone(),
             config.genesis_leader,
             config.transaction_namespace,
             config.genesis_allocations,
         );
-        if let Some(callback) = config.receipt_callback {
-            application = application.with_receipt_callback(callback);
+        if let Some(callback) = config.inclusion_callback {
+            application = application.with_inclusion_callback(callback);
         }
         if let Some(callback) = config.rejection_callback {
             application = application.with_rejection_callback(callback);

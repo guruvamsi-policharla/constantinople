@@ -4,17 +4,14 @@ use super::{
     schedule::{self, TransactionExecution},
     state::{AccountDiff, DiscoveryState, State, StateReader},
 };
-use bytes::Bytes;
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Account, Address, Receipt, ReceiptStatus, VerifiedTransaction};
+use constantinople_primitives::{Account, Address, VerifiedTransaction};
 use std::collections::{BTreeMap, HashMap};
 
 /// The final result of verifier-side execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionOutput<D: Digest> {
-    /// Receipts in transaction order.
-    pub receipts: Vec<Receipt<D>>,
+pub struct ExecutionOutput {
     /// Persistent account writes produced by execution.
     pub changeset: BTreeMap<Address, Account>,
 }
@@ -119,22 +116,18 @@ where
         &self,
         state: &mut DiscoveryState<R>,
         transactions: &[VerifiedTransaction<PK, H>],
-    ) -> ExecutionOutput<H::Digest>
+    ) -> ExecutionOutput
     where
         H: Hasher,
         PK: PublicKey,
         R: StateReader,
     {
-        let mut receipts = Vec::with_capacity(transactions.len());
-
         for transaction in transactions {
             let result = self.execute_transaction(state, transaction);
             state.apply(result.diff);
-            receipts.push(result.receipt);
         }
 
         ExecutionOutput {
-            receipts,
             changeset: state.changeset(),
         }
     }
@@ -144,7 +137,7 @@ where
         &self,
         state: State,
         transactions: &[VerifiedTransaction<PK, H>],
-    ) -> ExecutionOutput<H::Digest>
+    ) -> ExecutionOutput
     where
         H: Hasher,
         PK: PublicKey,
@@ -155,7 +148,6 @@ where
             });
 
         ExecutionOutput {
-            receipts: executed.receipts,
             changeset: executed.state.changeset(),
         }
     }
@@ -165,7 +157,7 @@ where
         &self,
         state: &V,
         transaction: &VerifiedTransaction<PK, H>,
-    ) -> TransactionExecution<H::Digest>
+    ) -> TransactionExecution
     where
         H: Hasher,
         PK: PublicKey,
@@ -175,13 +167,19 @@ where
         let tx = transaction.value();
         let value = tx.value.get();
         let sender_account = state.account(sender);
-        if sender_account.nonce != tx.nonce || sender_account.balance < value {
-            return Self::revert(transaction);
-        }
+        assert_eq!(
+            sender_account.nonce, tx.nonce,
+            "execution requires pre-validated nonces"
+        );
+        assert!(
+            sender_account.balance >= value,
+            "execution requires pre-validated balances"
+        );
 
-        let Some(next_nonce) = sender_account.nonce.checked_add(1) else {
-            return Self::revert(transaction);
-        };
+        let next_nonce = sender_account
+            .nonce
+            .checked_add(1)
+            .expect("execution requires incrementable nonces");
 
         let mut diff = AccountDiff::default();
         if sender == tx.to {
@@ -194,13 +192,14 @@ where
                 },
             );
 
-            return Self::success(transaction, diff);
+            return TransactionExecution { diff };
         }
 
         let recipient_account = state.account(tx.to);
-        let Some(recipient_balance) = recipient_account.balance.checked_add(value) else {
-            return Self::revert(transaction);
-        };
+        let recipient_balance = recipient_account
+            .balance
+            .checked_add(value)
+            .expect("execution requires incrementable recipient balances");
 
         diff.set_account(
             sender,
@@ -219,35 +218,6 @@ where
             },
         );
 
-        Self::success(transaction, diff)
-    }
-
-    fn success<H, PK>(
-        transaction: &VerifiedTransaction<PK, H>,
-        diff: AccountDiff,
-    ) -> TransactionExecution<H::Digest>
-    where
-        H: Hasher,
-        PK: PublicKey,
-    {
-        TransactionExecution {
-            receipt: Receipt::new(
-                *transaction.message_digest(),
-                ReceiptStatus::Success,
-                Bytes::new(),
-            ),
-            diff,
-        }
-    }
-
-    fn revert<H, PK>(transaction: &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest>
-    where
-        H: Hasher,
-        PK: PublicKey,
-    {
-        TransactionExecution {
-            receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
-            diff: AccountDiff::default(),
-        }
+        TransactionExecution { diff }
     }
 }

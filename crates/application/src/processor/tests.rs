@@ -5,10 +5,9 @@ use super::{
     state::{DiscoveryState, State},
 };
 use commonware_cryptography::{Signer, blake3, ed25519};
+use commonware_math::algebra::Random;
 use commonware_parallel::{Rayon, Sequential};
-use constantinople_primitives::{
-    Account, Address, ReceiptStatus, Transaction, VerifiedTransaction,
-};
+use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::{marker::PhantomData, num::NonZeroU64};
 use rand::rngs::OsRng;
 use std::{collections::HashMap, num::NonZeroUsize};
@@ -98,7 +97,6 @@ fn propose_and_verify_match_for_transfer_batch() {
     let proposal = processor.propose(&mut discovery, &validation.valid);
     let verification = processor.verify(State::new(accounts), &validation.valid);
 
-    assert_eq!(proposal.receipts, verification.receipts);
     assert_eq!(proposal.changeset, verification.changeset);
     assert_eq!(
         verification.changeset.get(&sender_a.address),
@@ -127,8 +125,6 @@ fn self_transfer_only_bumps_nonce() {
     );
     let output = processor.verify(State::new(accounts), &validation.valid);
 
-    assert_eq!(output.receipts.len(), 1);
-    assert_eq!(output.receipts[0].status, ReceiptStatus::Success);
     assert_eq!(output.changeset.get(&signer.address), Some(&account(9, 4)));
 }
 
@@ -160,6 +156,5 @@ fn parallel_verify_matches_sequential_verify() {
         sequential_processor.verify(State::new(accounts.clone()), &validation.valid);
     let parallel_output = parallel_processor.verify(State::new(accounts), &validation.valid);
 
-    assert_eq!(parallel_output.receipts, sequential_output.receipts);
     assert_eq!(parallel_output.changeset, sequential_output.changeset);
 }

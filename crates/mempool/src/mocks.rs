@@ -72,7 +72,6 @@ where
 mod tests {
     use super::StaticTransactionSource;
     use crate::TransactionSource;
-    use bytes::Bytes;
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -80,6 +79,7 @@ mod tests {
     use commonware_cryptography::{Digest, Signer, blake3, ed25519};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Address, Header, Transaction, VerifiedTransaction};
+    use core::{marker::PhantomData, num::NonZeroU64};
 
     const NAMESPACE: &[u8] = b"mempool-test";
 
@@ -91,10 +91,9 @@ mod tests {
         Transaction {
             sender: key.public_key(),
             to: Address::EMPTY,
-            input: Bytes::new(),
-            value: 1,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
-            _digest: core::marker::PhantomData,
+            _digest: PhantomData,
         }
         .seal_and_sign_verified(key, NAMESPACE, hasher)
     }
@@ -134,8 +133,6 @@ mod tests {
             state_range: non_empty_range!(0, 1),
             transactions_root: blake3::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
-            receipts_root: blake3::Digest::EMPTY,
-            block_access_list_hash: blake3::Digest::EMPTY,
         };
 
         let first = futures::executor::block_on(source.propose(&parent, &test_context()));

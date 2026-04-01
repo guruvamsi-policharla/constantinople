@@ -7,20 +7,17 @@
 //! - filtering or rejecting invalid signatures before execution
 //! - loading processor state from speculative database batches
 //! - executing transaction slices against that loaded state
-//! - finalizing state roots, transaction roots, and receipt roots
+//! - finalizing state roots and transaction roots
 //! - verifying and applying certified blocks
 //!
 //! The execution boundary is intentionally narrow: the [`Application`] owns
-//! the precompile registry, parallel strategy, and QMDB integration, while
-//! the processor owns the in-memory state transition logic.
+//! the execution strategy and QMDB integration, while the processor owns the
+//! in-memory state transition logic.
 
 use crate::processor::{
-    Precompiles,
-    executor::{Processor, VerificationError},
-    keys::{account_key, storage_key},
+    executor::Processor,
     state::{DiscoveryState, State, StateReader},
 };
-use commonware_codec::Encode;
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -37,7 +34,6 @@ use commonware_glue::stateful::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{
-    bmt,
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
     mmr,
@@ -56,8 +52,8 @@ use commonware_storage::{
 use commonware_utils::{non_empty_range, sync::AsyncRwLock};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
-    Access, Account, Address, Block, BlockAccessList, Header, Receipt, Sealable, Sealed,
-    SignedBlock, SignedTransaction, Slot, StateValue, VerifiedBlock, VerifiedTransaction,
+    Account, Address, Block, Header, Sealable, Sealed, SignedBlock, SignedTransaction,
+    VerifiedBlock, VerifiedTransaction,
 };
 use core::fmt;
 use futures::{StreamExt, executor::block_on};
@@ -73,7 +69,7 @@ use tracing::warn;
 
 /// Shared QMDB handle for the application state database.
 pub(crate) type StateDatabase<E, H, T> =
-    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Slot, StateValue, H, T>>>;
+    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 /// Signed transaction carried by the wire block format.
 type WireTransaction<H, P> = SignedTransaction<P, H>;
 /// Sealed block carried across the wire and through consensus.
@@ -99,10 +95,10 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Slot, FixedEncoding<StateValue>>>>,
+    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Address, FixedEncoding<Account>>>>,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<Slot, FixedEncoding<StateValue>>,
+    UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
 
 /// Unmerkleized transaction batch used for append-only transaction storage.
@@ -116,105 +112,60 @@ pub type ApplicationBatches<E, H, T> = (StateBatch<E, H, T>, TransactionBatch<E,
 pub enum ProcessorError {
     #[error("state database access failed")]
     Database(#[from] StorageError<mmr::Family>),
-    #[error("loaded value has wrong type for its key")]
-    MalformedState,
 }
 
-/// Hashes the encoded block access list.
+/// Loads the accounts needed by `transactions` from `batch`.
 ///
-/// The header commits to the exact BAL bytes so proposers and verifiers agree
-/// on both transaction access declarations and final writes.
-fn block_access_list_hash<H: Hasher>(access_list: &BlockAccessList) -> H::Digest {
-    H::hash(access_list.encode().as_ref())
-}
-
-/// Loads the declared processor state for `access_list` from `batch`.
-///
-/// The loader gathers every declared account and storage access across the
-/// block access list, reads each value at most once, and builds an in-memory
-/// [`State`] snapshot for verification.
-pub async fn load_state<E, H, T>(
+/// The loader gathers every unique sender and recipient across the block body,
+/// reads each account at most once, and builds an in-memory [`State`] snapshot
+/// for verification.
+pub async fn load_state<E, H, P, T>(
     batch: &StateBatch<E, H, T>,
-    access_list: &BlockAccessList,
+    transactions: &[VerifiedTransaction<P, H>],
 ) -> Result<State, ProcessorError>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
+    P: PublicKey,
     T: Translator,
 {
-    let (accounts, storage) = collect_preload_keys(access_list);
+    let accounts = collect_preload_accounts(transactions);
 
-    // Build all database keys up front so loads can run concurrently.
-    let account_keys: Vec<_> = accounts
-        .iter()
-        .map(|address| (account_key(*address), *address))
-        .collect();
-    let mut hasher = H::default();
-    let storage_keys: Vec<_> = storage
-        .iter()
-        .map(|(address, slot)| (storage_key(&mut hasher, *address, *slot), *address, *slot))
-        .collect();
-
-    // Load all accounts and storage slots in parallel.
-    let (account_results, storage_results) = futures::future::try_join(
-        futures::future::try_join_all(
-            account_keys
-                .iter()
-                .map(|(key, _)| async move { batch.get(key).await }),
-        ),
-        futures::future::try_join_all(
-            storage_keys
-                .iter()
-                .map(|(key, _, _)| async move { batch.get(key).await }),
-        ),
+    let account_keys = accounts.iter().copied().collect::<Vec<_>>();
+    let account_results = futures::future::try_join_all(
+        account_keys
+            .iter()
+            .map(|address| async move { batch.get(address).await }),
     )
     .await?;
 
-    // Assemble the account map.
     let mut base_accounts = HashMap::with_capacity(accounts.len());
-    for ((_, address), result) in account_keys.iter().zip(account_results) {
-        let Some(value) = result else { continue };
-        let StateValue::Account(account) = value else {
-            return Err(ProcessorError::MalformedState);
-        };
-        base_accounts.insert(*address, account);
-    }
-
-    // Assemble the storage map.
-    let mut base_storage = HashMap::with_capacity(storage.len());
-    for ((_, address, slot), result) in storage_keys.iter().zip(storage_results) {
-        let Some(value) = result else { continue };
-        let StateValue::Storage(storage_value) = value else {
-            return Err(ProcessorError::MalformedState);
-        };
-        base_storage.insert((*address, *slot), storage_value);
-    }
-
-    Ok(State::new(base_accounts, base_storage))
-}
-
-/// Collects the accounts and storage keys that must be loaded for execution.
-///
-/// The result is de-duplicated across the whole block so state is loaded once
-/// before execution starts.
-fn collect_preload_keys(
-    access_list: &BlockAccessList,
-) -> (HashSet<Address>, HashSet<(Address, Slot)>) {
-    let mut accounts = HashSet::with_capacity(access_list.tx_accesses.len());
-    let mut storage = HashSet::with_capacity(access_list.tx_accesses.len());
-
-    for access in &access_list.tx_accesses {
-        match access {
-            Access::Account(address, _) => {
-                accounts.insert(*address);
-            }
-            Access::Storage(address, slot, _) => {
-                storage.insert((*address, *slot));
-            }
+    for (address, result) in account_keys.iter().zip(account_results) {
+        if let Some(account) = result {
+            base_accounts.insert(*address, account);
         }
     }
 
-    (accounts, storage)
+    Ok(State::new(base_accounts))
+}
+
+/// Collects the accounts that must be loaded for execution.
+///
+/// The result is de-duplicated across the whole block so state is loaded once
+/// before execution starts.
+fn collect_preload_accounts<P, H>(transactions: &[VerifiedTransaction<P, H>]) -> HashSet<Address>
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    let mut accounts = HashSet::with_capacity(transactions.len().saturating_mul(2));
+
+    for transaction in transactions {
+        accounts.insert(transaction.signer());
+        accounts.insert(transaction.value().to);
+    }
+
+    accounts
 }
 
 /// Proposal-time state reader backed by a speculative database batch.
@@ -248,31 +199,12 @@ where
     T: Translator,
 {
     fn account(&self, address: Address) -> Account {
-        let loaded = block_on(self.batch.get(&account_key(address)))
-            .expect("proposal account load must succeed");
+        let loaded =
+            block_on(self.batch.get(&address)).expect("proposal account load must succeed");
 
         match loaded {
-            Some(StateValue::Account(account)) => account,
-            Some(_) => {
-                warn!("proposal account load returned malformed state");
-                Account::default()
-            }
+            Some(account) => account,
             None => Account::default(),
-        }
-    }
-
-    fn storage(&self, address: Address, slot: Slot) -> Slot {
-        let mut hasher = H::default();
-        let key = storage_key(&mut hasher, address, slot);
-        let loaded = block_on(self.batch.get(&key)).expect("proposal storage load must succeed");
-
-        match loaded {
-            Some(StateValue::Storage(value)) => value,
-            Some(_) => {
-                warn!("proposal storage load returned malformed state");
-                Slot::default()
-            }
-            None => Slot::default(),
         }
     }
 }
@@ -281,75 +213,71 @@ where
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-/// Type-erased callback for receipt notifications.
-pub type ReceiptCallback<D> = Arc<dyn Fn(u64, Vec<Receipt<D>>) + Send + Sync>;
+/// Type-erased callback for transaction inclusion notifications.
+pub type InclusionCallback<D> = Arc<dyn Fn(u64, Vec<D>) + Send + Sync>;
 
 /// Callback invoked with tx hashes that were filtered out during proposal.
 pub type RejectionCallback<D> = Arc<dyn Fn(Vec<D>) + Send + Sync>;
 
-pub struct Application<H: Hasher, C, S, P, I, R, St> {
-    precompiles: R,
+pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     genesis_allocations: Vec<(Address, Account)>,
-    receipt_callback: Option<ReceiptCallback<H::Digest>>,
+    inclusion_callback: Option<InclusionCallback<H::Digest>>,
     rejection_callback: Option<RejectionCallback<H::Digest>>,
     _marker: PhantomData<(C, S, I)>,
 }
 
-impl<H: Hasher, C, S, P, I, R: Clone, St: Clone> Clone for Application<H, C, S, P, I, R, St>
+impl<H: Hasher, C, S, P, I, St: Clone> Clone for Application<H, C, S, P, I, St>
 where
     P: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            precompiles: self.precompiles.clone(),
             strategy: self.strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             genesis_allocations: self.genesis_allocations.clone(),
-            receipt_callback: self.receipt_callback.clone(),
+            inclusion_callback: self.inclusion_callback.clone(),
             rejection_callback: self.rejection_callback.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<H: Hasher, C, S, P, I, R, St> fmt::Debug for Application<H, C, S, P, I, R, St> {
+impl<H: Hasher, C, S, P, I, St> fmt::Debug for Application<H, C, S, P, I, St> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Application").finish_non_exhaustive()
     }
 }
 
-impl<H: Hasher, C, S, P, I, R, St> Application<H, C, S, P, I, R, St> {
+impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     /// Creates an application.
     ///
-    /// The application keeps the precompile registry, execution strategy,
-    /// genesis leader, and transaction signing namespace for all later block
-    /// proposal, verification, and application.
+    /// The application keeps the execution strategy, genesis leader, and
+    /// transaction signing namespace for all later block proposal,
+    /// verification, and application.
     pub const fn new(
-        precompiles: R,
         strategy: St,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
         genesis_allocations: Vec<(Address, Account)>,
     ) -> Self {
         Self {
-            precompiles,
             strategy,
             genesis_leader,
             transaction_namespace,
             genesis_allocations,
-            receipt_callback: None,
+            inclusion_callback: None,
             rejection_callback: None,
             _marker: PhantomData,
         }
     }
 
-    /// Sets a callback that receives receipts after each finalized block.
-    pub fn with_receipt_callback(mut self, callback: ReceiptCallback<H::Digest>) -> Self {
-        self.receipt_callback = Some(callback);
+    /// Sets a callback that receives included transaction hashes for each block.
+    pub fn with_inclusion_callback(mut self, callback: InclusionCallback<H::Digest>) -> Self {
+        self.inclusion_callback = Some(callback);
         self
     }
 
@@ -357,11 +285,6 @@ impl<H: Hasher, C, S, P, I, R, St> Application<H, C, S, P, I, R, St> {
     pub fn with_rejection_callback(mut self, callback: RejectionCallback<H::Digest>) -> Self {
         self.rejection_callback = Some(callback);
         self
-    }
-
-    /// Returns the configured precompile registry.
-    pub const fn precompiles(&self) -> &R {
-        &self.precompiles
     }
 
     /// Returns the configured execution strategy.
@@ -375,12 +298,11 @@ impl<H: Hasher, C, S, P, I, R, St> Application<H, C, S, P, I, R, St> {
     }
 }
 
-impl<H, C, S, P, I, R, St> Application<H, C, S, P, I, R, St>
+impl<H, C, S, P, I, St> Application<H, C, S, P, I, St>
 where
     C: Digest,
     H: Hasher,
     P: PublicKey,
-    R: Precompiles,
     St: Strategy,
 {
     /// Writes genesis allocations to the state batch (called once at height 1).
@@ -394,7 +316,7 @@ where
         self.genesis_allocations
             .iter()
             .fold(batch, |batch, (address, account)| {
-                batch.write(account_key(*address), Some(StateValue::Account(*account)))
+                batch.write(*address, Some(*account))
             })
     }
 
@@ -419,16 +341,8 @@ where
     where
         WireTransaction<H, P>: Clone,
     {
-        if block.header.block_access_list_hash != block_access_list_hash::<H>(&block.access_list) {
-            return None;
-        }
-
         let body = self.verify_transactions(block.body.iter().cloned())?;
-        Some(ExecutionBlock::new(
-            block.header.clone(),
-            block.access_list.clone(),
-            body,
-        ))
+        Some(ExecutionBlock::new(block.header.clone(), body))
     }
 
     /// Returns the current Unix timestamp in milliseconds.
@@ -444,24 +358,6 @@ where
         u64::try_from(timestamp_ms).expect("timestamp milliseconds exceeded u64")
     }
 
-    /// Returns the binary Merkle root of `receipts`.
-    ///
-    /// Each receipt is first encoded and hashed into a leaf digest, then the
-    /// receipt root is derived from a binary Merkle tree over those leaves.
-    fn receipts_root(&self, receipts: &[Receipt<H::Digest>]) -> H::Digest {
-        if receipts.is_empty() {
-            return H::Digest::EMPTY;
-        }
-
-        let mut builder = bmt::Builder::<H>::new(receipts.len());
-        for receipt in receipts {
-            let leaf = H::hash(receipt.encode().as_ref());
-            builder.add(&leaf);
-        }
-
-        builder.build().root()
-    }
-
     /// Returns the absolute wakeup time for `block_timestamp_ms`.
     ///
     /// # Panics
@@ -474,7 +370,7 @@ where
             .expect("block timestamp exceeded maximum")
     }
 
-    /// Merkleizes the updated databases and computes the receipts root together.
+    /// Merkleizes the updated databases together.
     ///
     /// This runs the independent finalization work in parallel so proposal,
     /// verification, and application all share the same finalization path.
@@ -486,58 +382,27 @@ where
         &self,
         state_batch: StateBatch<E, H, EightCap>,
         transaction_batch: TransactionBatch<E, H>,
-        receipts: &[Receipt<H::Digest>],
     ) -> Result<
         (
             StateMerkleized<E, H, EightCap>,
             TransactionsMerkleized<E, H>,
-            H::Digest,
         ),
         StorageError<mmr::Family>,
     >
     where
         E: Storage + Clock + Metrics,
     {
-        futures::try_join!(
-            state_batch.merkleize(),
-            transaction_batch.merkleize(),
-            async { Ok::<H::Digest, StorageError<mmr::Family>>(self.receipts_root(receipts)) },
-        )
+        futures::try_join!(state_batch.merkleize(), transaction_batch.merkleize(),)
     }
 }
 
-fn apply_final_writes<E, H>(
-    mut batch: StateBatch<E, H, EightCap>,
-    access_list: &BlockAccessList,
-) -> StateBatch<E, H, EightCap>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-{
-    for write in &access_list.account_writes {
-        batch = batch.write(
-            account_key(write.address),
-            Some(StateValue::Account(write.account)),
-        );
-    }
-
-    for write in &access_list.storage_writes {
-        let mut hasher = H::default();
-        let key = storage_key(&mut hasher, write.address, write.slot);
-        batch = batch.write(key, Some(StateValue::Storage(write.value)));
-    }
-
-    batch
-}
-
-impl<E, H, C, S, P, I, R, St> CApplication<E> for Application<H, C, S, P, I, R, St>
+impl<E, H, C, S, P, I, St> CApplication<E> for Application<H, C, S, P, I, St>
 where
     E: Rng + Spawner + Storage + Metrics + Clock,
     H: Hasher,
     C: Digest,
     S: Scheme<PublicKey = P>,
     P: PublicKey,
-    R: Precompiles + Clone + Send + Sync + 'static,
     St: Strategy + Clone + Send + Sync + 'static,
     I: TransactionSource<C, P, H> + Sync,
 {
@@ -595,7 +460,7 @@ where
         if parent.header.height == 0 {
             state_batch = self.apply_genesis_allocations(state_batch);
         }
-        let processor = Processor::new(self.strategy(), self.precompiles());
+        let processor = Processor::new(self.strategy());
         let mut discovery_state = DiscoveryState::new(BatchStateReader::new(&state_batch));
         let result = processor.validate(&discovery_state, all_proposed);
 
@@ -621,14 +486,19 @@ where
         let state_batch = output
             .changeset
             .iter()
-            .fold(state_batch, |batch, (key, value)| {
-                batch.write(*key, Some(value.clone()))
+            .fold(state_batch, |batch, (address, account)| {
+                batch.write(*address, Some(*account))
             });
-        if let Some(ref callback) = self.receipt_callback {
-            callback(parent.header.height + 1, output.receipts.clone());
+        if let Some(ref callback) = self.inclusion_callback {
+            let included = result
+                .valid
+                .iter()
+                .map(|transaction| *transaction.message_digest())
+                .collect();
+            callback(parent.header.height + 1, included);
         }
-        let (state_merkleized, transaction_merkleized, receipts_root) = self
-            .finalize_execution(state_batch, transaction_batch, &output.receipts)
+        let (state_merkleized, transaction_merkleized) = self
+            .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed");
         let transactions_end =
@@ -649,12 +519,9 @@ where
                 parent.header.transactions_range.start(),
                 transactions_end
             ),
-            receipts_root,
-            block_access_list_hash: block_access_list_hash::<H>(&output.access_list),
         };
         let block = Block::new(
             header,
-            output.access_list,
             result
                 .valid
                 .into_iter()
@@ -712,25 +579,12 @@ where
         if parent.header.height == 0 {
             state_batch = self.apply_genesis_allocations(state_batch);
         }
-        if !verified_block
-            .access_list
-            .is_well_formed(verified_block.body.len())
-        {
-            warn!(
-                height = block.header.height,
-                "verify rejected: malformed block access list"
-            );
-            return None;
-        }
-
-        let state = load_state(&state_batch, &verified_block.access_list)
+        let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("block state loading during verification must succeed");
-        let processor = Processor::new(self.strategy(), self.precompiles());
+        let processor = Processor::new(self.strategy());
         let body_len = verified_block.body.len();
-        let Block {
-            access_list, body, ..
-        } = verified_block;
+        let Block { body, .. } = verified_block;
         let validation = processor.validate(&state, body);
         if !validation.invalid.is_empty() {
             warn!(
@@ -746,38 +600,15 @@ where
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let output = match processor.verify(state, &validation.valid, &access_list) {
-            Ok(output) => output,
-            Err(VerificationError::MalformedBlockAccessList) => {
-                warn!(
-                    height = block.header.height,
-                    "verify rejected: malformed block access list"
-                );
-                return None;
-            }
-            Err(VerificationError::AccessListMismatch { transaction_index }) => {
-                warn!(
-                    height = block.header.height,
-                    transaction_index, "verify rejected: block access list mismatch"
-                );
-                return None;
-            }
-            Err(VerificationError::FinalStateMismatch) => {
-                warn!(
-                    height = block.header.height,
-                    "verify rejected: final state mismatch"
-                );
-                return None;
-            }
-        };
+        let output = processor.verify(state, &validation.valid);
         let state_batch = output
             .changeset
             .iter()
-            .fold(state_batch, |batch, (key, value)| {
-                batch.write(*key, Some(value.clone()))
+            .fold(state_batch, |batch, (address, account)| {
+                batch.write(*address, Some(*account))
             });
-        let (state_merkleized, transaction_merkleized, receipts_root) = self
-            .finalize_execution(state_batch, transaction_batch, &output.receipts)
+        let (state_merkleized, transaction_merkleized) = self
+            .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization during verification must succeed");
         let transactions_end = parent.header.transactions_range.end() + body_len as u64 + 1;
@@ -817,16 +648,13 @@ where
             );
             return None;
         }
-        if receipts_root != block.header.receipts_root {
-            warn!(
-                height = block.header.height,
-                "verify rejected: receipts root mismatch"
-            );
-            return None;
-        }
-
-        if let Some(ref callback) = self.receipt_callback {
-            callback(block.header.height, output.receipts.clone());
+        if let Some(ref callback) = self.inclusion_callback {
+            let included = validation
+                .valid
+                .iter()
+                .map(|transaction| *transaction.message_digest())
+                .collect();
+            callback(block.header.height, included);
         }
 
         Some((state_merkleized, transaction_merkleized))
@@ -857,20 +685,29 @@ where
         if block.header.height == 1 {
             state_batch = self.apply_genesis_allocations(state_batch);
         }
-        assert!(
-            verified_block
-                .access_list
-                .is_well_formed(verified_block.body.len()),
-            "certified block contained a malformed block access list"
-        );
 
+        let state = load_state(&state_batch, &verified_block.body)
+            .await
+            .expect("state loading must succeed for certified apply");
+        let processor = Processor::new(self.strategy());
+        let validation = processor.validate(&state, verified_block.body.clone());
+        assert!(
+            validation.invalid.is_empty(),
+            "certified block contained a statically invalid transaction"
+        );
         let transaction_batch = verified_block
             .body
             .iter()
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let state_batch = apply_final_writes(state_batch, &verified_block.access_list);
+        let output = processor.verify(state, &validation.valid);
+        let state_batch = output
+            .changeset
+            .iter()
+            .fold(state_batch, |batch, (address, account)| {
+                batch.write(*address, Some(*account))
+            });
         let (state_merkleized, transaction_merkleized) =
             futures::try_join!(state_batch.merkleize(), transaction_batch.merkleize(),)
                 .expect("database merkleization must succeed");
@@ -892,7 +729,6 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    let access_list = BlockAccessList::default();
     let header = Header {
         context: Context {
             round: Round::zero(),
@@ -906,33 +742,22 @@ where
         state_range: non_empty_range!(0, 1),
         transactions_root: H::Digest::EMPTY,
         transactions_range: non_empty_range!(0, 1),
-        receipts_root: H::Digest::EMPTY,
-        block_access_list_hash: block_access_list_hash::<H>(&access_list),
     };
 
-    Block::<C, P, H>::new(header, access_list, Vec::new()).seal(hasher)
+    Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Application, ProcessorError, StateDatabase, WireBlock, block_access_list_hash, load_state,
-    };
-    use crate::processor::{
-        Precompiles,
-        executor::Processor,
-        frame::{Frame, FrameError},
-        keys::{account_key, storage_key},
-    };
-    use bytes::Bytes;
+    use super::{Application, StateDatabase, WireBlock, load_state};
     use commonware_codec::{Decode, DecodeExt, Encode, FixedSize};
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Round, View},
+        types::{Epoch, Round, View},
     };
     use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
     use commonware_glue::stateful::db::ManagedDb;
-    use commonware_parallel::{Sequential, Strategy};
+    use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::{
@@ -948,10 +773,10 @@ mod tests {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, sync::AsyncRwLock};
     use constantinople_primitives::{
-        Access, AccessMode, Address, Block, BlockAccessList, BlockCfg, Header, Sealable,
-        SignedTransaction, Slot, StateValue, Transaction, VerifiedTransaction,
+        Account, Address, Block, BlockCfg, Header, Sealable, SignedTransaction, Transaction,
+        VerifiedTransaction,
     };
-    use core::marker::PhantomData;
+    use core::{marker::PhantomData, num::NonZeroU64};
     use std::sync::Arc;
 
     const NAMESPACE: &[u8] = b"application-test";
@@ -968,28 +793,6 @@ mod tests {
     type VerifyTestSignedTransaction = SignedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestTransaction = VerifiedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestWireBlock = WireBlock<blake3::Digest, VerifyTestPublicKey, TestHasher>;
-
-    #[derive(Clone, Debug, Default)]
-    struct NoopPrecompiles;
-
-    impl Precompiles for NoopPrecompiles {
-        fn is_precompile(&self, _address: Address) -> bool {
-            false
-        }
-
-        fn execute<S, R>(
-            &self,
-            _address: Address,
-            _frame: &mut Frame<'_, R>,
-            _processor: &Processor<'_, S, Self>,
-        ) -> Result<Bytes, FrameError>
-        where
-            S: Strategy,
-            R: crate::processor::state::StateReader,
-        {
-            Err(FrameError::InvalidTransactionTarget)
-        }
-    }
 
     fn transaction_db_config(suffix: &str, context: &TestContext) -> ImmutableConfig<EightCap, ()> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
@@ -1049,7 +852,7 @@ mod tests {
         Arc::new(AsyncRwLock::new(db))
     }
 
-    async fn write_state(db: &TestStateDb, writes: impl IntoIterator<Item = (Slot, StateValue)>) {
+    async fn write_state(db: &TestStateDb, writes: impl IntoIterator<Item = (Address, Account)>) {
         let mut db = db.write().await;
         let mut batch = db.new_batch();
         for (key, value) in writes {
@@ -1069,40 +872,22 @@ mod tests {
         Address::decode(&[byte; Address::SIZE][..]).expect("address bytes should decode")
     }
 
-    fn slot(byte: u8) -> Slot {
-        Slot::from([byte; Slot::SIZE])
-    }
-
     fn signed_transaction(nonce: u64) -> TestTransaction {
         let private_key = recoverable::PrivateKey::from_seed(7);
         Transaction {
             sender: private_key.public_key(),
             to: Address::EMPTY,
-            input: Bytes::new(),
-            value: 0,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
             _digest: PhantomData,
         }
         .seal_and_sign_verified(&private_key, NAMESPACE, &mut TestHasher::default())
     }
 
-    fn verify_test_application() -> Application<
-        TestHasher,
-        blake3::Digest,
-        (),
-        VerifyTestPublicKey,
-        (),
-        NoopPrecompiles,
-        Sequential,
-    > {
+    fn verify_test_application()
+    -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), Sequential> {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(
-            NoopPrecompiles,
-            Sequential,
-            genesis_leader,
-            NAMESPACE,
-            Vec::new(),
-        )
+        Application::new(Sequential, genesis_leader, NAMESPACE, Vec::new())
     }
 
     fn verified_wire_transaction() -> VerifyTestTransaction {
@@ -1110,8 +895,7 @@ mod tests {
         Transaction {
             sender: private_key.public_key(),
             to: Address::EMPTY,
-            input: Bytes::new(),
-            value: 0,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce: 0,
             _digest: PhantomData,
         }
@@ -1122,10 +906,9 @@ mod tests {
         leader: VerifyTestPublicKey,
         transactions: usize,
     ) -> Header<blake3::Digest, blake3::Digest, VerifyTestPublicKey> {
-        let access_list = BlockAccessList::default();
         Header {
             context: Context {
-                round: Round::zero(),
+                round: Round::new(Epoch::zero(), View::zero()),
                 leader,
                 parent: (View::zero(), blake3::Digest::EMPTY),
             },
@@ -1136,8 +919,6 @@ mod tests {
             state_range: non_empty_range!(0, 1),
             transactions_root: blake3::Digest::EMPTY,
             transactions_range: non_empty_range!(0, transactions as u64 + 1),
-            receipts_root: blake3::Digest::EMPTY,
-            block_access_list_hash: block_access_list_hash::<TestHasher>(&access_list),
         }
     }
 
@@ -1169,7 +950,6 @@ mod tests {
         let block =
             Block::<blake3::Digest, VerifyTestPublicKey, TestHasher, VerifyTestTransaction>::new(
                 verify_test_header(transaction.value().sender.clone(), 1),
-                BlockAccessList::default(),
                 vec![transaction.clone()],
             )
             .seal(&mut TestHasher::default());
@@ -1201,7 +981,6 @@ mod tests {
             VerifyTestSignedTransaction,
         >::new(
             verify_test_header(transaction.value().sender.clone(), 1),
-            BlockAccessList::default(),
             vec![transaction.into_inner()],
         )
         .seal(&mut TestHasher::default());
@@ -1219,51 +998,69 @@ mod tests {
     }
 
     #[test]
-    fn malformed_loaded_account_value_returns_error() {
+    fn load_state_reads_sender_and_recipient_accounts() {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
-            let db = open_state_db(context, "malformed-account-value").await;
-            let sender = address(0x90);
+            let db = open_state_db(context, "load-state-accounts").await;
+            let recipient = address(0x91);
+            let key = ed25519::PrivateKey::from_seed(13);
+            let sender = Address::from_public_key(&mut TestHasher::default(), &key.public_key());
 
             write_state(
                 &db,
-                [(account_key(sender), StateValue::Storage(slot(0x01)))],
+                [
+                    (
+                        sender,
+                        Account {
+                            balance: 11,
+                            nonce: 2,
+                        },
+                    ),
+                    (
+                        recipient,
+                        Account {
+                            balance: 7,
+                            nonce: 0,
+                        },
+                    ),
+                ],
             )
             .await;
 
             let batch = ManagedDb::new_batch(&db).await;
-            let access_list = BlockAccessList::from_transactions(
-                [vec![Access::Account(sender, AccessMode::Write)]],
-                Vec::new(),
-                Vec::new(),
+            let transactions = vec![
+                Transaction {
+                    sender: key.public_key(),
+                    to: recipient,
+                    value: NonZeroU64::new(5).expect("test value should be non-zero"),
+                    nonce: 2,
+                    _digest: PhantomData,
+                }
+                .seal_and_sign_verified(
+                    &key,
+                    NAMESPACE,
+                    &mut TestHasher::default(),
+                ),
+            ];
+
+            let loaded = load_state(&batch, &transactions)
+                .await
+                .expect("state load should succeed");
+
+            assert_eq!(
+                loaded.account(sender),
+                Account {
+                    balance: 11,
+                    nonce: 2,
+                }
             );
-
-            let result = load_state(&batch, &access_list).await;
-            assert!(matches!(result, Err(ProcessorError::MalformedState)));
-        });
-    }
-
-    #[test]
-    fn malformed_loaded_storage_value_returns_error() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let db = open_state_db(context, "malformed-storage-value").await;
-            let owner = address(0x95);
-            let storage_slot = slot(0x96);
-            let mut hasher = TestHasher::default();
-            let key = storage_key(&mut hasher, owner, storage_slot);
-
-            write_state(&db, [(key, StateValue::Account(Default::default()))]).await;
-
-            let batch = ManagedDb::new_batch(&db).await;
-            let access_list = BlockAccessList::from_transactions(
-                [vec![Access::Storage(owner, storage_slot, AccessMode::Read)]],
-                Vec::new(),
-                Vec::new(),
+            assert_eq!(
+                loaded.account(recipient),
+                Account {
+                    balance: 7,
+                    nonce: 0,
+                }
             );
-
-            let result = load_state(&batch, &access_list).await;
-            assert!(matches!(result, Err(ProcessorError::MalformedState)));
         });
     }
 }

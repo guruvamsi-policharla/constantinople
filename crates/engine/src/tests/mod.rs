@@ -9,9 +9,8 @@ use crate::{
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use common::{
-    HeightMonitorReporter, NoopPrecompiles, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE,
-    TestHasher, TestPrivateKey, TestPublicKey, TestScheme, ValidatorState, state_sync_done,
-    validator_fixture,
+    HeightMonitorReporter, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
+    TestPrivateKey, TestPublicKey, TestScheme, ValidatorState, state_sync_done, validator_fixture,
 };
 use commonware_consensus::{Heightable, simplex::elector::RoundRobin, types::coding::Commitment};
 use commonware_cryptography::{
@@ -220,7 +219,7 @@ impl EngineDefinition for TestEngineDefinition {
                 let reporter =
                     HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
                 let engine =
-                    Engine::<_, _, _, _, TestHasher, MinSig, RoundRobin<TestHasher>, _, _, _>::new(
+                    Engine::<_, _, _, _, TestHasher, MinSig, RoundRobin<TestHasher>, _, _>::new(
                         context.with_label("engine"),
                         Config {
                             signer,
@@ -230,7 +229,6 @@ impl EngineDefinition for TestEngineDefinition {
                             output,
                             share,
                             input,
-                            precompiles: NoopPrecompiles,
                             partition_prefix,
                             freezer_table_initial_size: 1024,
                             strategy: Sequential,
@@ -246,7 +244,7 @@ impl EngineDefinition for TestEngineDefinition {
                             transaction_namespace: TRANSACTION_NAMESPACE,
                             block_codec: Default::default(),
                             genesis_allocations: Vec::new(),
-                            receipt_callback: None,
+                            inclusion_callback: None,
                             rejection_callback: None,
                             bootstrapper: bootstrapper_mailbox.clone(),
                         },

@@ -3,19 +3,16 @@
 
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use constantinople_primitives::{
-    Block, Header, Receipt, Sealed, SignedTransaction, VerifiedTransaction,
-};
+use constantinople_primitives::{Block, Header, Sealed, SignedTransaction, VerifiedTransaction};
 use core::future::Future;
 
 pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
 pub type PendingTransaction<P, H> = VerifiedTransaction<P, H>;
 
-/// A finalized block and its execution receipts.
+/// A finalized block ready to report back to the transaction source.
 #[derive(Debug, Clone)]
 pub struct Finalized<C: Digest, P: PublicKey, H: Hasher> {
     pub block: SealedBlock<C, P, H>,
-    pub receipts: Vec<Receipt<H::Digest>>,
 }
 
 /// Supplies transactions for block proposals and reacts to finalized blocks.

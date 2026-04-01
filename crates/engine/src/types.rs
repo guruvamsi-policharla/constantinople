@@ -23,7 +23,7 @@ use commonware_storage::{
 };
 use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::Application;
-use constantinople_primitives::{Block, Sealed};
+use constantinople_primitives::{Account, Address, Block, Sealed};
 use std::sync::Arc;
 
 /// A finalized block with its seal (commitment-based).
@@ -40,14 +40,7 @@ pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitme
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub(crate) type StateDb<E, H> = fixed::Db<
-    mmr::Family,
-    E,
-    constantinople_primitives::Slot,
-    constantinople_primitives::StateValue,
-    H,
-    EightCap,
->;
+pub(crate) type StateDb<E, H> = fixed::Db<mmr::Family, E, Address, Account, H, EightCap>;
 
 pub(crate) type TransactionDb<E, H> = commonware_storage::qmdb::immutable::Immutable<
     mmr::Family,
@@ -73,24 +66,23 @@ pub(crate) type TransactionResolverMailbox<E, H> = commonware_glue::stateful::db
     <TransactionSyncDb<E, H> as SyncResolver>::Digest,
 >;
 
-pub(crate) type App<H, P, V, I, R, T> =
-    Application<H, Commitment, ThresholdScheme<P, V>, P, I, R, T>;
+pub(crate) type App<H, P, V, I, T> = Application<H, Commitment, ThresholdScheme<P, V>, P, I, T>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, R, T> =
-    commonware_glue::stateful::Mailbox<E, App<H, P, V, I, R, T>>;
+pub(crate) type AppMailbox<E, H, P, V, I, T> =
+    commonware_glue::stateful::Mailbox<E, App<H, P, V, I, T>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, R, T> = Stateful<
+pub(crate) type StatefulApp<E, H, P, V, I, T> = Stateful<
     E,
-    App<H, P, V, I, R, T>,
+    App<H, P, V, I, T>,
     EngineMarshalMailbox<H, P, V>,
     (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, R, T> = Marshaled<
+pub(crate) type MarshaledApp<E, H, P, V, I, T> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, R, T>,
+    AppMailbox<E, H, P, V, I, T>,
     EngineBlock<H, P>,
     ReedSolomon<H>,
     H,
@@ -104,14 +96,14 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I, R> = simplex::Engine<
+pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
     B,
     Commitment,
-    MarshaledApp<E, H, P, V, I, R, T>,
-    MarshaledApp<E, H, P, V, I, R, T>,
+    MarshaledApp<E, H, P, V, I, T>,
+    MarshaledApp<E, H, P, V, I, T>,
     EngineMarshalMailbox<H, P, V>,
     T,
 >;

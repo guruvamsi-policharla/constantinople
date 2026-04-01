@@ -40,8 +40,6 @@ where
     pub transactions_root: D,
     /// The active range of the transactions database.
     pub transactions_range: NonEmptyRange<u64>,
-    /// A root of all transaction receipts in this block.
-    pub receipts_root: D,
 }
 
 impl<C, D, P> Header<C, D, P>
@@ -73,7 +71,6 @@ where
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
             + self.transactions_range.encode_size()
-            + self.receipts_root.encode_size()
     }
 }
 
@@ -92,7 +89,6 @@ where
         self.state_range.write(buf);
         self.transactions_root.write(buf);
         self.transactions_range.write(buf);
-        self.receipts_root.write(buf);
     }
 }
 
@@ -115,7 +111,6 @@ where
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
             transactions_range: NonEmptyRange::read(buf)?,
-            receipts_root: D::read(buf)?,
         })
     }
 }
@@ -137,7 +132,6 @@ where
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
             transactions_range: u.arbitrary()?,
-            receipts_root: u.arbitrary()?,
         })
     }
 }
@@ -367,7 +361,6 @@ mod tests {
             state_range: non_empty_range!(0, 1),
             transactions_root: blake3::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
-            receipts_root: blake3::Digest::EMPTY,
         }
     }
 

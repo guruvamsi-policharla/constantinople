@@ -17,6 +17,3 @@ pub use block::{
 
 mod transaction;
 pub use transaction::{Transaction, TransactionCfg};
-
-mod receipt;
-pub use receipt::{Receipt, ReceiptStatus};

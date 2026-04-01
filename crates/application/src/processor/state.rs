@@ -99,17 +99,6 @@ impl AccountDiff {
             .map(|(address, tracked)| (*address, tracked.current()))
             .collect()
     }
-
-    /// Returns the final changed account values in deterministic order.
-    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
-        let mut writes = self
-            .accounts
-            .iter()
-            .map(|(address, tracked)| (*address, tracked.current()))
-            .collect::<Vec<_>>();
-        writes.sort_unstable_by_key(|(address, _)| *address);
-        writes
-    }
 }
 
 /// In-memory processor state.
@@ -159,11 +148,6 @@ impl State {
     pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
         self.diff.changeset()
     }
-
-    /// Returns the final changed values in deterministic order.
-    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
-        self.diff.writes()
-    }
 }
 
 impl StateReader for State {
@@ -203,11 +187,6 @@ impl<R: StateReader> DiscoveryState<R> {
     /// Produces a deterministic changeset for the committed state diff.
     pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
         self.diff.changeset()
-    }
-
-    /// Returns the final changed values in deterministic order.
-    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
-        self.diff.writes()
     }
 
     fn load_account(&self, address: Address) -> Account {

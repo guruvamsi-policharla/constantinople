@@ -1,12 +1,11 @@
 //! Transaction utility for Constantinople.
 
-use bytes::Bytes;
 use clap::Parser;
 use commonware_codec::{Encode, ReadExt};
 use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
 use commonware_utils::{from_hex, hex};
 use constantinople_primitives::{Address, Signable, Transaction};
-use std::marker::PhantomData;
+use std::{marker::PhantomData, num::NonZeroU64};
 
 const TX_NAMESPACE: &[u8] = b"constantinople-tx";
 
@@ -66,8 +65,7 @@ fn build_transaction(
     Transaction {
         sender: key.public_key(),
         to,
-        input: Bytes::new(),
-        value,
+        value: NonZeroU64::new(value).expect("transfer value must be non-zero"),
         nonce,
         _digest: PhantomData,
     }

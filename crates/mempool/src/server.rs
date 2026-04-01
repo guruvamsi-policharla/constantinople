@@ -11,7 +11,7 @@ use commonware_codec::{EncodeSize, Read};
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::{from_hex, hex};
-use constantinople_primitives::{Header, Receipt, TransactionCfg};
+use constantinople_primitives::{Header, TransactionCfg};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -30,7 +30,6 @@ pub struct InclusionReceipt {
     pub tx_hash: String,
     pub included: bool,
     pub height: u64,
-    pub status: String,
 }
 
 /// Mempool size limits.
@@ -95,17 +94,16 @@ where
         }
     }
 
-    /// Notifies waiters that their transactions were included in a finalized block.
-    pub async fn notify_included(&self, height: u64, receipts: &[Receipt<H::Digest>]) {
+    /// Notifies waiters that their transactions were included in a block.
+    pub async fn notify_included(&self, height: u64, transaction_hashes: &[H::Digest]) {
         let mut inner = self.inner.lock().await;
-        for receipt in receipts {
-            let hash = receipt.transaction_hash.as_ref().to_vec();
+        for hash in transaction_hashes {
+            let hash = hash.as_ref().to_vec();
             if let Some(sender) = inner.waiters.remove(&hash) {
                 let _ = sender.send(InclusionReceipt {
                     tx_hash: hex(&hash),
                     included: true,
                     height,
-                    status: format!("{:?}", receipt.status),
                 });
             }
         }
@@ -121,7 +119,6 @@ where
                     tx_hash: hex(&hash_bytes),
                     included: false,
                     height: 0,
-                    status: "Rejected".to_string(),
                 });
             }
         }
@@ -140,14 +137,13 @@ where
         let height = finalized.block.header.height;
         let mut inner = self.inner.lock().await;
 
-        for (tx, receipt) in finalized.block.body.iter().zip(&finalized.receipts) {
+        for tx in &finalized.block.body {
             let hash = tx.message_digest().as_ref().to_vec();
             if let Some(sender) = inner.waiters.remove(&hash) {
                 let _ = sender.send(InclusionReceipt {
                     tx_hash: hex(&hash),
                     included: true,
                     height,
-                    status: format!("{:?}", receipt.status),
                 });
             }
         }

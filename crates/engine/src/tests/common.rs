@@ -2,7 +2,6 @@ use crate::{
     ThresholdScheme,
     types::{EngineBlock, EngineMarshalMailbox},
 };
-use bytes::Bytes;
 use commonware_consensus::{
     Reporter,
     marshal::{self, Identifier},
@@ -17,17 +16,9 @@ use commonware_cryptography::{
     ed25519,
 };
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Quota, Storage};
 use commonware_storage::metadata::{Config as MetadataConfig, Metadata};
 use commonware_utils::{Acknowledgement, N3f1, TryCollect, channel::mpsc, sequence::U64, test_rng};
-use constantinople_application::processor::{
-    Precompiles,
-    executor::Processor,
-    frame::{Frame, FrameError},
-    state::StateReader,
-};
-use constantinople_primitives::Address;
 use std::collections::BTreeMap;
 
 pub(crate) type TestHasher = Sha256;
@@ -136,28 +127,6 @@ impl ValidatorState {
 impl ProcessedHeight for ValidatorState {
     async fn processed_height(&self) -> u64 {
         self.processed_height().await
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct NoopPrecompiles;
-
-impl Precompiles for NoopPrecompiles {
-    fn is_precompile(&self, _address: Address) -> bool {
-        false
-    }
-
-    fn execute<S, R>(
-        &self,
-        _address: Address,
-        _frame: &mut Frame<'_, R>,
-        _processor: &Processor<'_, S, Self>,
-    ) -> Result<Bytes, FrameError>
-    where
-        S: Strategy,
-        R: StateReader,
-    {
-        Err(FrameError::InvalidTransactionTarget)
     }
 }
 

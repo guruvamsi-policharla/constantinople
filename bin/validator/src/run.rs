@@ -8,52 +8,21 @@ use commonware_consensus::{
 use commonware_cryptography::{Hasher, Sha256, bls12381::primitives::variant::MinSig, ed25519};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
-use commonware_parallel::{Sequential, Strategy};
+use commonware_parallel::Sequential;
 use commonware_runtime::{
     Metrics as _, Quota, Runner as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex, union};
-use constantinople_application::{
-    consensus::{ReceiptCallback, RejectionCallback},
-    processor::{
-        Precompiles,
-        executor::Processor,
-        frame::{Frame, FrameError},
-        state::StateReader,
-    },
-};
+use constantinople_application::consensus::{InclusionCallback, RejectionCallback};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::server::{Mempool, MempoolConfig, router};
-use constantinople_primitives::Address;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
-
-#[derive(Clone, Debug, Default)]
-struct NoopPrecompiles;
-
-impl Precompiles for NoopPrecompiles {
-    fn is_precompile(&self, _address: Address) -> bool {
-        false
-    }
-
-    fn execute<S, R>(
-        &self,
-        _address: Address,
-        _frame: &mut Frame<'_, R>,
-        _processor: &Processor<'_, S, Self>,
-    ) -> Result<bytes::Bytes, FrameError>
-    where
-        S: Strategy,
-        R: StateReader,
-    {
-        Err(FrameError::InvalidTransactionTarget)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NoopReporter;
@@ -185,7 +154,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             }
         };
 
-        // Build mempool with receipt callback.
+        // Build mempool with inclusion and rejection callbacks.
         let mempool = Mempool::<Commitment, ed25519::PublicKey, Sha256>::new(
             b"constantinople-tx",
             MempoolConfig {
@@ -194,12 +163,12 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             },
         );
 
-        let receipt_mempool = mempool.clone();
-        let receipt_callback: ReceiptCallback<<Sha256 as Hasher>::Digest> =
-            Arc::new(move |height, receipts| {
-                let mempool = receipt_mempool.clone();
+        let inclusion_mempool = mempool.clone();
+        let inclusion_callback: InclusionCallback<<Sha256 as Hasher>::Digest> =
+            Arc::new(move |height, transaction_hashes| {
+                let mempool = inclusion_mempool.clone();
                 tokio::spawn(async move {
-                    mempool.notify_included(height, &receipts).await;
+                    mempool.notify_included(height, &transaction_hashes).await;
                 });
             });
 
@@ -227,7 +196,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
 
         // Build and start the engine.
         info!("initializing engine");
-        let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, _, _, _>::new(
+        let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, _, _>::new(
             context.with_label("engine"),
             EngineConfig {
                 signer: decoded.signer,
@@ -237,7 +206,6 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 output: decoded.dkg_output,
                 share: Some(decoded.share),
                 input: mempool,
-                precompiles: NoopPrecompiles,
                 partition_prefix: decoded.partition_prefix,
                 freezer_table_initial_size: 1024,
                 strategy: Sequential,
@@ -253,7 +221,7 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
                 transaction_namespace: b"constantinople-tx",
                 block_codec: Default::default(),
                 genesis_allocations: decoded.genesis_allocations,
-                receipt_callback: Some(receipt_callback),
+                inclusion_callback: Some(inclusion_callback),
                 rejection_callback: Some(rejection_callback),
                 bootstrapper: bootstrapper_mailbox.clone(),
             },

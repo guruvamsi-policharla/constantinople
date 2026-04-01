@@ -9,25 +9,21 @@
 //! address in common.
 
 use super::state::{AccountDiff, State};
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Address, Receipt, VerifiedTransaction};
+use constantinople_primitives::{Address, VerifiedTransaction};
 use std::collections::HashMap;
 
 /// The result of executing one transaction batch before changeset export.
 #[derive(Debug)]
-pub(super) struct ExecutedTransactions<D: Digest> {
+pub(super) struct ExecutedTransactions {
     /// The final in-memory state after all transaction diffs have been merged.
     pub state: State,
-    /// Receipts in transaction order.
-    pub receipts: Vec<Receipt<D>>,
 }
 
 /// The result of executing one transaction against one state snapshot.
 #[derive(Debug)]
-pub(super) struct TransactionExecution<D: Digest> {
-    /// The final receipt reported for the transaction.
-    pub(super) receipt: Receipt<D>,
+pub(super) struct TransactionExecution {
     /// The committed diff that should merge into processor state.
     pub(super) diff: AccountDiff,
 }
@@ -176,12 +172,12 @@ pub(super) fn execute<H, PK, S, F>(
     mut state: State,
     transactions: &[VerifiedTransaction<PK, H>],
     execute_transaction: F,
-) -> ExecutedTransactions<H::Digest>
+) -> ExecutedTransactions
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest> + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution + Sync,
 {
     let writes = transactions
         .iter()
@@ -191,16 +187,15 @@ where
         transactions,
         execute_transaction,
     };
-    let mut receipts = vec![None; transactions.len()];
 
     if strategy.parallelism_hint().max(1) == 1 {
-        execute_transactions_inline(&mut state, &execution, &mut receipts);
-        return finish_execution(state, receipts);
+        execute_transactions_inline(&mut state, &execution);
+        return finish_execution(state);
     }
 
     let (round_for_transaction, stats) = schedule_rounds(&writes);
     if should_execute_sequentially(strategy, stats) {
-        execute_transactions_inline(&mut state, &execution, &mut receipts);
+        execute_transactions_inline(&mut state, &execution);
     } else {
         let rounds = MaterializedRounds::new(&round_for_transaction, stats.total_rounds);
         for round_index in 0..stats.total_rounds {
@@ -213,12 +208,12 @@ where
 
             for (transaction_index, result) in round.iter().copied().zip(results) {
                 state.apply(result.diff);
-                receipts[transaction_index] = Some(result.receipt);
+                let _ = transaction_index;
             }
         }
     }
 
-    finish_execution(state, receipts)
+    finish_execution(state)
 }
 
 /// Executes one dependency round either inline or in coarse parallel chunks.
@@ -227,12 +222,12 @@ fn execute_round<H, PK, S, F>(
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Vec<TransactionExecution<H::Digest>>
+) -> Vec<TransactionExecution>
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest> + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution + Sync,
 {
     if should_execute_round_inline(strategy, round) {
         return execute_round_inline(state, execution, round);
@@ -256,11 +251,11 @@ fn execute_round_inline<H, PK, F>(
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Vec<TransactionExecution<H::Digest>>
+) -> Vec<TransactionExecution>
 where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution,
 {
     let mut results = Vec::with_capacity(round.len());
 
@@ -276,31 +271,20 @@ where
 fn execute_transactions_inline<H, PK, F>(
     state: &mut State,
     execution: &ExecutionContext<'_, PK, H, F>,
-    receipts: &mut [Option<Receipt<H::Digest>>],
 ) where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution,
 {
-    for (transaction_index, transaction) in execution.transactions.iter().enumerate() {
+    for transaction in execution.transactions {
         let result = (execution.execute_transaction)(state, transaction);
         state.apply(result.diff);
-        receipts[transaction_index] = Some(result.receipt);
     }
 }
 
 /// Converts partially collected execution buffers into the final result.
-fn finish_execution<D: Digest>(
-    state: State,
-    receipts: Vec<Option<Receipt<D>>>,
-) -> ExecutedTransactions<D> {
-    ExecutedTransactions {
-        state,
-        receipts: receipts
-            .into_iter()
-            .map(|receipt| receipt.expect("every transaction must produce a receipt"))
-            .collect(),
-    }
+fn finish_execution(state: State) -> ExecutedTransactions {
+    ExecutedTransactions { state }
 }
 
 /// Builds greedy dependency rounds from inferred sender/recipient writes.
