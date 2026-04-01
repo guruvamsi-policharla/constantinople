@@ -6,7 +6,7 @@ use crate::{
     generate_deployer_tag, generate_remote_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
-use commonware_deployer::aws;
+use commonware_deployer::aws::{self, METRICS_PORT};
 use commonware_utils::hex;
 use std::{
     fs,
@@ -108,6 +108,7 @@ fn build_validators(
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
+            metrics_port: METRICS_PORT,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
@@ -263,6 +264,7 @@ mod tests {
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
+                base_metrics_port: 9090,
             }),
         }
     }
@@ -304,6 +306,7 @@ mod tests {
                 worker_threads: 2,
                 rayon_threads: 2,
                 http_port: 8080,
+                metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers: Vec::new(),

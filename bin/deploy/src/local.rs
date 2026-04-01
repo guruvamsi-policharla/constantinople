@@ -75,6 +75,10 @@ fn build_validators(
             .base_http_port
             .checked_add(index as u16)
             .expect("http port overflow");
+        let metrics_port = local
+            .base_metrics_port
+            .checked_add(index as u16)
+            .expect("metrics port overflow");
 
         let config = ValidatorConfig {
             private_key: hex(&material.signers[validator_index].encode()),
@@ -88,6 +92,7 @@ fn build_validators(
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
             http_port,
+            metrics_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),

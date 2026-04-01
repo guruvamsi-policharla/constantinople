@@ -59,6 +59,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         worker_threads,
         rayon_threads,
         http_listen,
+        metrics_listen,
         json_logs,
         deployer_managed,
         max_propose_bytes,
@@ -81,7 +82,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 level: log_level.parse().expect("bad log_level in config"),
                 json: json_logs,
             },
-            None,
+            Some(metrics_listen),
             None,
         );
 
@@ -90,14 +91,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             listen_bind = %decoded.listen_bind,
             listen_advertise = %decoded.listen_advertise,
             http_listen = %http_listen,
+            metrics_listen = %metrics_listen,
             "starting validator"
         );
-
-        let all_pks = {
-            let mut pks = vec![decoded.public_key.clone()];
-            pks.extend(decoded.bootstrappers.iter().map(|(pk, _)| pk.clone()));
-            pks
-        };
         let strategy = context
             .clone()
             .create_strategy(NZUsize!(rayon_threads))
@@ -127,7 +123,15 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             discovery::Network::new(context.with_label("p2p"), p2p_config);
 
         oracle
-            .track(0, all_pks.into_iter().try_collect().unwrap())
+            .track(
+                0,
+                decoded
+                    .participants
+                    .clone()
+                    .into_iter()
+                    .try_collect()
+                    .unwrap(),
+            )
             .await;
 
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);

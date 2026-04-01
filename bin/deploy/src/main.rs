@@ -82,6 +82,8 @@ pub(crate) struct LocalArgs {
     base_port: u16,
     #[arg(long, default_value_t = 8080)]
     base_http_port: u16,
+    #[arg(long, default_value_t = 9090)]
+    base_metrics_port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -137,6 +139,7 @@ pub(crate) struct ValidatorConfig {
     worker_threads: usize,
     rayon_threads: usize,
     http_port: u16,
+    metrics_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
     bootstrappers: Vec<NamedBootstrapperEntry>,
