@@ -2,20 +2,9 @@
 
 use constantinople_primitives::{Account, Address};
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
-
-/// Reads visible state values for execution.
-///
-/// This trait is implemented by both the fully preloaded verifier state and
-/// the proposer-side lazy discovery state. Missing accounts read as the
-/// default account value.
-pub trait StateReader {
-    /// Returns the visible account value for `address`.
-    fn account(&self, address: Address) -> Account;
-}
 
 /// Tracks one value that changed during execution.
 ///
@@ -147,65 +136,5 @@ impl State {
     /// Produces a deterministic changeset for the committed state diff.
     pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
         self.diff.changeset()
-    }
-}
-
-impl StateReader for State {
-    fn account(&self, address: Address) -> Account {
-        Self::account(self, address)
-    }
-}
-
-/// Proposal-time state with lazy base reads.
-///
-/// `DiscoveryState` wraps another [`StateReader`] and caches every base read
-/// on demand. The proposer executes sequentially over this state to build the
-/// final account changeset without preloading the entire block footprint up
-/// front.
-#[derive(Debug)]
-pub struct DiscoveryState<R: StateReader> {
-    reader: R,
-    base_accounts: RefCell<HashMap<Address, Account>>,
-    diff: AccountDiff,
-}
-
-impl<R: StateReader> DiscoveryState<R> {
-    /// Creates an empty lazy state backed by `reader`.
-    pub fn new(reader: R) -> Self {
-        Self {
-            reader,
-            base_accounts: RefCell::new(HashMap::new()),
-            diff: AccountDiff::default(),
-        }
-    }
-
-    /// Commits an execution diff into the state.
-    pub(crate) fn apply(&mut self, diff: AccountDiff) {
-        self.diff.merge(diff);
-    }
-
-    /// Produces a deterministic changeset for the committed state diff.
-    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
-        self.diff.changeset()
-    }
-
-    fn load_account(&self, address: Address) -> Account {
-        if let Some(account) = self.diff.account(address) {
-            return account;
-        }
-
-        if let Some(account) = self.base_accounts.borrow().get(&address).copied() {
-            return account;
-        }
-
-        let loaded = self.reader.account(address);
-        self.base_accounts.borrow_mut().insert(address, loaded);
-        loaded
-    }
-}
-
-impl<R: StateReader> StateReader for DiscoveryState<R> {
-    fn account(&self, address: Address) -> Account {
-        self.load_account(address)
     }
 }

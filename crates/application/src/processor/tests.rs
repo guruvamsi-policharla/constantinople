@@ -2,7 +2,7 @@
 
 use super::{
     executor::{Processor, ValidationResult},
-    state::{DiscoveryState, State},
+    state::State,
 };
 use commonware_cryptography::{Signer, blake3, ed25519};
 use commonware_math::algebra::Random;
@@ -93,9 +93,8 @@ fn propose_and_verify_match_for_transfer_batch() {
     let sequential = Sequential;
     let processor = Processor::new(&sequential);
     let validation = processor.validate(&State::new(accounts.clone()), transactions.clone());
-    let mut discovery = DiscoveryState::new(State::new(accounts.clone()));
-    let proposal = processor.propose(&mut discovery, &validation.valid);
-    let verification = processor.verify(State::new(accounts), &validation.valid);
+    let proposal = processor.execute(State::new(accounts.clone()), &validation.valid);
+    let verification = processor.execute(State::new(accounts), &validation.valid);
 
     assert_eq!(proposal.changeset, verification.changeset);
     assert_eq!(
@@ -123,8 +122,7 @@ fn self_transfer_only_bumps_nonce() {
         &State::new(accounts.clone()),
         vec![signer.sign(signer.address, 4, 3)],
     );
-    let output = processor.verify(State::new(accounts), &validation.valid);
-
+    let output = processor.execute(State::new(accounts), &validation.valid);
     assert_eq!(output.changeset.get(&signer.address), Some(&account(9, 4)));
 }
 
@@ -153,8 +151,8 @@ fn parallel_verify_matches_sequential_verify() {
     let validation = sequential_processor.validate(&State::new(accounts.clone()), transactions);
 
     let sequential_output =
-        sequential_processor.verify(State::new(accounts.clone()), &validation.valid);
-    let parallel_output = parallel_processor.verify(State::new(accounts), &validation.valid);
+        sequential_processor.execute(State::new(accounts.clone()), &validation.valid);
+    let parallel_output = parallel_processor.execute(State::new(accounts), &validation.valid);
 
     assert_eq!(parallel_output.changeset, sequential_output.changeset);
 }

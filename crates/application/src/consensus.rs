@@ -14,10 +14,7 @@
 //! the execution strategy and QMDB integration, while the processor owns the
 //! in-memory state transition logic.
 
-use crate::processor::{
-    executor::Processor,
-    state::{DiscoveryState, State, StateReader},
-};
+use crate::processor::{executor::Processor, state::State};
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -56,7 +53,7 @@ use constantinople_primitives::{
     VerifiedBlock, VerifiedTransaction,
 };
 use core::fmt;
-use futures::{StreamExt, executor::block_on};
+use futures::StreamExt;
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet},
@@ -166,47 +163,6 @@ where
     }
 
     accounts
-}
-
-/// Proposal-time state reader backed by a speculative database batch.
-///
-/// Discovery runs sequentially, so this adapter keeps the API simple and
-/// performs individual batch lookups on demand.
-struct BatchStateReader<'a, E, H, T>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-{
-    batch: &'a StateBatch<E, H, T>,
-}
-
-impl<'a, E, H, T> BatchStateReader<'a, E, H, T>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-{
-    const fn new(batch: &'a StateBatch<E, H, T>) -> Self {
-        Self { batch }
-    }
-}
-
-impl<E, H, T> StateReader for BatchStateReader<'_, E, H, T>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-{
-    fn account(&self, address: Address) -> Account {
-        let loaded =
-            block_on(self.batch.get(&address)).expect("proposal account load must succeed");
-
-        match loaded {
-            Some(account) => account,
-            None => Account::default(),
-        }
-    }
 }
 
 /// Core constantinople application.
@@ -442,11 +398,10 @@ where
 
     /// Proposes the next block from the mempool and current ancestry.
     ///
-    /// Proposal consumes already-verified mempool transactions and filters
-    /// out transactions that fail static processor validation before block
-    /// construction. The surviving transactions, including any that later
-    /// revert at runtime, are executed against speculative batches and
-    /// finalized into the proposed block header.
+    /// Proposal consumes already-verified mempool transactions, preloads the
+    /// touched accounts, filters out statically invalid transfers, and
+    /// executes the survivors against in-memory state before block
+    /// construction.
     async fn propose<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         (runtime, context): (E, Self::Context),
@@ -461,8 +416,10 @@ where
             state_batch = self.apply_genesis_allocations(state_batch);
         }
         let processor = Processor::new(self.strategy());
-        let mut discovery_state = DiscoveryState::new(BatchStateReader::new(&state_batch));
-        let result = processor.validate(&discovery_state, all_proposed);
+        let state = load_state(&state_batch, &all_proposed)
+            .await
+            .expect("proposal state loading must succeed");
+        let result = processor.validate(&state, all_proposed);
 
         // Notify rejected transaction waiters.
         if let Some(ref callback) = self.rejection_callback
@@ -482,7 +439,7 @@ where
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let output = processor.propose(&mut discovery_state, &result.valid);
+        let output = processor.execute(state, &result.valid);
         let state_batch = output
             .changeset
             .iter()
@@ -600,7 +557,7 @@ where
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let output = processor.verify(state, &validation.valid);
+        let output = processor.execute(state, &validation.valid);
         let state_batch = output
             .changeset
             .iter()
@@ -701,7 +658,7 @@ where
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let output = processor.verify(state, &validation.valid);
+        let output = processor.execute(state, &validation.valid);
         let state_batch = output
             .changeset
             .iter()

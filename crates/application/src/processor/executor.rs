@@ -2,7 +2,7 @@
 
 use super::{
     schedule::{self, TransactionExecution},
-    state::{AccountDiff, DiscoveryState, State, StateReader},
+    state::{AccountDiff, State},
 };
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -54,7 +54,7 @@ where
     /// Splits `transactions` into statically valid and invalid sets.
     pub fn validate<H, PK>(
         &self,
-        state: &impl StateReader,
+        state: &State,
         transactions: Vec<VerifiedTransaction<PK, H>>,
     ) -> ValidationResult<PK, H>
     where
@@ -111,29 +111,8 @@ where
         ValidationResult { valid, invalid }
     }
 
-    /// Sequentially executes `transactions` over a lazy state reader.
-    pub fn propose<H, PK, R>(
-        &self,
-        state: &mut DiscoveryState<R>,
-        transactions: &[VerifiedTransaction<PK, H>],
-    ) -> ExecutionOutput
-    where
-        H: Hasher,
-        PK: PublicKey,
-        R: StateReader,
-    {
-        for transaction in transactions {
-            let result = self.execute_transaction(state, transaction);
-            state.apply(result.diff);
-        }
-
-        ExecutionOutput {
-            changeset: state.changeset(),
-        }
-    }
-
-    /// Verifies pre-validated transactions against `state`.
-    pub fn verify<H, PK>(
+    /// Executes pre-validated transactions against fully loaded state.
+    pub fn execute<H, PK>(
         &self,
         state: State,
         transactions: &[VerifiedTransaction<PK, H>],
@@ -153,15 +132,14 @@ where
     }
 
     /// Executes a single transaction against `state`.
-    fn execute_transaction<H, PK, V>(
+    fn execute_transaction<H, PK>(
         &self,
-        state: &V,
+        state: &State,
         transaction: &VerifiedTransaction<PK, H>,
     ) -> TransactionExecution
     where
         H: Hasher,
         PK: PublicKey,
-        V: StateReader,
     {
         let sender = transaction.signer();
         let tx = transaction.value();
