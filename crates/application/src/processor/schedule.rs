@@ -1,34 +1,17 @@
-//! Greedy transaction scheduling and adaptive round execution.
+//! Greedy scheduling for transfer-only execution.
 //!
-//! This module keeps the processor's parallel policy out of the main
-//! transaction orchestration path. It has two jobs:
+//! Every transaction writes exactly two logical accounts:
 //!
-//! - build cheap dependency rounds from declared read/write sets
-//! - execute those rounds either inline or in coarse parallel chunks
+//! - the sender
+//! - the recipient
 //!
-//! The scheduler is intentionally greedy and linear. It does not build an
-//! explicit dependency graph or run a topological sort. Instead it tracks the
-//! latest round that read or wrote each key and places each transaction into
-//! the earliest legal round.
-//!
-//! Execution is adaptive:
-//!
-//! - schedules with little parallelism stay fully sequential
-//! - small rounds stay inline
-//! - wide rounds are chunked before they reach [`Strategy`]
-//!
-//! That keeps the hot path cheap and avoids paying thread-pool overhead for
-//! schedules that are effectively serial anyway.
+//! Two transactions may run in parallel only when they do not touch either
+//! address in common.
 
-use super::{
-    access::AccessSet,
-    state::{FrameDiff, State},
-};
+use super::state::{AccountDiff, State};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{
-    AccessList, AccessMode, Address, Receipt, Slot, VerifiedTransaction,
-};
+use constantinople_primitives::{Address, Receipt, VerifiedTransaction};
 use std::collections::HashMap;
 
 /// The result of executing one transaction batch before changeset export.
@@ -38,8 +21,6 @@ pub(super) struct ExecutedTransactions<D: Digest> {
     pub state: State,
     /// Receipts in transaction order.
     pub receipts: Vec<Receipt<D>>,
-    /// Observed accesses in transaction order.
-    pub observed_accesses: Vec<AccessList>,
 }
 
 /// The result of executing one transaction against one state snapshot.
@@ -48,9 +29,7 @@ pub(super) struct TransactionExecution<D: Digest> {
     /// The final receipt reported for the transaction.
     pub(super) receipt: Receipt<D>,
     /// The committed diff that should merge into processor state.
-    pub(super) diff: FrameDiff,
-    /// The accesses actually observed while executing the transaction.
-    pub(super) observed_accesses: AccessList,
+    pub(super) diff: AccountDiff,
 }
 
 /// Summary information about a greedy schedule.
@@ -135,14 +114,46 @@ impl ScheduleStats {
     }
 }
 
+/// The inferred write set for one transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionWrites {
+    sender: Address,
+    recipient: Address,
+}
+
+impl TransactionWrites {
+    fn new(sender: Address, recipient: Address) -> Self {
+        Self { sender, recipient }
+    }
+
+    fn from_transaction<PK, H>(transaction: &VerifiedTransaction<PK, H>) -> Self
+    where
+        PK: PublicKey,
+        H: Hasher,
+    {
+        Self::new(transaction.signer(), transaction.value().to)
+    }
+
+    fn addresses(self) -> impl Iterator<Item = Address> {
+        [self.sender, self.recipient]
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(index, address)| {
+                if index == 1 && address == self.sender {
+                    return None;
+                }
+
+                Some(address)
+            })
+    }
+}
+
 /// Shared execution inputs for one transaction batch.
 struct ExecutionContext<'a, PK, H, F>
 where
     H: Hasher,
     PK: PublicKey,
 {
-    /// Declared access sets for every transaction in the slice.
-    access_sets: &'a [AccessSet],
     /// The original verified transactions in slice order.
     transactions: &'a [VerifiedTransaction<PK, H>],
     /// The processor callback used to execute one transaction.
@@ -159,55 +170,37 @@ const MIN_PARALLEL_CHUNK_SIZE: usize = 32;
 /// Executes transactions against one in-memory state snapshot.
 ///
 /// Results are always merged back into committed state in original
-/// transaction order, even when one dependency round ran out of order or in
-/// parallel.
-///
-/// Returns the first transaction index that fails execution-time access
-/// validation.
+/// transaction order, even when one dependency round ran in parallel.
 pub(super) fn execute<H, PK, S, F>(
     strategy: &S,
     mut state: State,
-    access_sets: Vec<AccessSet>,
     transactions: &[VerifiedTransaction<PK, H>],
     execute_transaction: F,
-) -> Result<ExecutedTransactions<H::Digest>, usize>
+) -> ExecutedTransactions<H::Digest>
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(
-            &State,
-            &VerifiedTransaction<PK, H>,
-            &AccessSet,
-        ) -> Result<TransactionExecution<H::Digest>, ()>
-        + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest> + Sync,
 {
+    let writes = transactions
+        .iter()
+        .map(TransactionWrites::from_transaction)
+        .collect::<Vec<_>>();
     let execution = ExecutionContext {
-        access_sets: &access_sets,
         transactions,
         execute_transaction,
     };
     let mut receipts = vec![None; transactions.len()];
-    let mut observed_accesses = vec![None; transactions.len()];
 
     if strategy.parallelism_hint().max(1) == 1 {
-        execute_transactions_inline(
-            &mut state,
-            &execution,
-            &mut receipts,
-            &mut observed_accesses,
-        )?;
-        return Ok(finish_execution(state, receipts, observed_accesses));
+        execute_transactions_inline(&mut state, &execution, &mut receipts);
+        return finish_execution(state, receipts);
     }
 
-    let (round_for_transaction, stats) = schedule_rounds(&access_sets);
+    let (round_for_transaction, stats) = schedule_rounds(&writes);
     if should_execute_sequentially(strategy, stats) {
-        execute_transactions_inline(
-            &mut state,
-            &execution,
-            &mut receipts,
-            &mut observed_accesses,
-        )?;
+        execute_transactions_inline(&mut state, &execution, &mut receipts);
     } else {
         let rounds = MaterializedRounds::new(&round_for_transaction, stats.total_rounds);
         for round_index in 0..stats.total_rounds {
@@ -216,39 +209,30 @@ where
                 continue;
             }
 
-            let results = execute_round(strategy, &state, &execution, round)?;
+            let results = execute_round(strategy, &state, &execution, round);
 
             for (transaction_index, result) in round.iter().copied().zip(results) {
                 state.apply(result.diff);
                 receipts[transaction_index] = Some(result.receipt);
-                observed_accesses[transaction_index] = Some(result.observed_accesses);
             }
         }
     }
 
-    Ok(finish_execution(state, receipts, observed_accesses))
+    finish_execution(state, receipts)
 }
 
 /// Executes one dependency round either inline or in coarse parallel chunks.
-///
-/// Returns the first transaction index in the round that fails access
-/// validation.
 fn execute_round<H, PK, S, F>(
     strategy: &S,
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Result<Vec<TransactionExecution<H::Digest>>, usize>
+) -> Vec<TransactionExecution<H::Digest>>
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(
-            &State,
-            &VerifiedTransaction<PK, H>,
-            &AccessSet,
-        ) -> Result<TransactionExecution<H::Digest>, ()>
-        + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest> + Sync,
 {
     if should_execute_round_inline(strategy, round) {
         return execute_round_inline(state, execution, round);
@@ -261,42 +245,31 @@ where
 
     let mut results = Vec::with_capacity(round.len());
     for chunk in chunk_results {
-        let chunk = chunk?;
         results.extend(chunk);
     }
 
-    Ok(results)
+    results
 }
 
 /// Executes a contiguous subset of one dependency round inline.
-///
-/// Stops at the first failing transaction instead of collecting per-transaction
-/// access failures.
 fn execute_round_inline<H, PK, F>(
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Result<Vec<TransactionExecution<H::Digest>>, usize>
+) -> Vec<TransactionExecution<H::Digest>>
 where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(
-        &State,
-        &VerifiedTransaction<PK, H>,
-        &AccessSet,
-    ) -> Result<TransactionExecution<H::Digest>, ()>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest>,
 {
     let mut results = Vec::with_capacity(round.len());
 
     for &transaction_index in round {
         let transaction = &execution.transactions[transaction_index];
-        let access_set = &execution.access_sets[transaction_index];
-        let result = (execution.execute_transaction)(state, transaction, access_set)
-            .map_err(|()| transaction_index)?;
-        results.push(result);
+        results.push((execution.execute_transaction)(state, transaction));
     }
 
-    Ok(results)
+    results
 }
 
 /// Executes the entire batch inline without walking round boundaries.
@@ -304,35 +277,22 @@ fn execute_transactions_inline<H, PK, F>(
     state: &mut State,
     execution: &ExecutionContext<'_, PK, H, F>,
     receipts: &mut [Option<Receipt<H::Digest>>],
-    observed_accesses: &mut [Option<AccessList>],
-) -> Result<(), usize>
-where
+) where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(
-        &State,
-        &VerifiedTransaction<PK, H>,
-        &AccessSet,
-    ) -> Result<TransactionExecution<H::Digest>, ()>,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution<H::Digest>,
 {
-    for (transaction_index, access_set) in execution.access_sets.iter().enumerate() {
-        let transaction = &execution.transactions[transaction_index];
-        let result = (execution.execute_transaction)(state, transaction, access_set)
-            .map_err(|()| transaction_index)?;
-
+    for (transaction_index, transaction) in execution.transactions.iter().enumerate() {
+        let result = (execution.execute_transaction)(state, transaction);
         state.apply(result.diff);
         receipts[transaction_index] = Some(result.receipt);
-        observed_accesses[transaction_index] = Some(result.observed_accesses);
     }
-
-    Ok(())
 }
 
 /// Converts partially collected execution buffers into the final result.
 fn finish_execution<D: Digest>(
     state: State,
     receipts: Vec<Option<Receipt<D>>>,
-    observed_accesses: Vec<Option<AccessList>>,
 ) -> ExecutedTransactions<D> {
     ExecutedTransactions {
         state,
@@ -340,86 +300,34 @@ fn finish_execution<D: Digest>(
             .into_iter()
             .map(|receipt| receipt.expect("every transaction must produce a receipt"))
             .collect(),
-        observed_accesses: observed_accesses
-            .into_iter()
-            .map(|accesses| accesses.expect("every transaction must produce observed accesses"))
-            .collect(),
     }
 }
 
-/// Builds greedy dependency rounds from the effective access sets.
-fn schedule_rounds(access_sets: &[AccessSet]) -> (Vec<usize>, ScheduleStats) {
+/// Builds greedy dependency rounds from inferred sender/recipient writes.
+fn schedule_rounds(writes: &[TransactionWrites]) -> (Vec<usize>, ScheduleStats) {
     const NONE: usize = usize::MAX;
 
-    let total_accesses: usize = access_sets.iter().map(AccessSet::len).sum();
-    let mut accounts: HashMap<Address, (usize, usize)> =
-        HashMap::with_capacity(total_accesses.min(access_sets.len() * 2));
-    let mut storage: HashMap<(Address, Slot), (usize, usize)> =
-        HashMap::with_capacity(total_accesses);
-    let mut round_for_transaction = Vec::with_capacity(access_sets.len());
+    let mut touched = HashMap::with_capacity(writes.len().saturating_mul(2));
+    let mut round_for_transaction = Vec::with_capacity(writes.len());
     let mut round_widths = Vec::new();
     let mut stats = ScheduleStats::default();
 
-    for access_set in access_sets {
+    for write_set in writes {
         let mut ready_round = 0;
 
-        for (address, mode) in access_set.accounts() {
-            if let Some(&(last_read, last_write)) = accounts.get(&address) {
-                match mode {
-                    AccessMode::Read => {
-                        if last_write != NONE {
-                            ready_round = ready_round.max(last_write + 1);
-                        }
-                    }
-                    AccessMode::Write => {
-                        if last_read != NONE {
-                            ready_round = ready_round.max(last_read + 1);
-                        }
-                        if last_write != NONE {
-                            ready_round = ready_round.max(last_write + 1);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (address, slot, mode) in access_set.storage() {
-            if let Some(&(last_read, last_write)) = storage.get(&(address, slot)) {
-                match mode {
-                    AccessMode::Read => {
-                        if last_write != NONE {
-                            ready_round = ready_round.max(last_write + 1);
-                        }
-                    }
-                    AccessMode::Write => {
-                        if last_read != NONE {
-                            ready_round = ready_round.max(last_read + 1);
-                        }
-                        if last_write != NONE {
-                            ready_round = ready_round.max(last_write + 1);
-                        }
-                    }
-                }
+        for address in write_set.addresses() {
+            if let Some(&last_touch) = touched.get(&address)
+                && last_touch != NONE
+            {
+                ready_round = ready_round.max(last_touch + 1);
             }
         }
 
         round_for_transaction.push(ready_round);
         stats.record_round_assignment(&mut round_widths, ready_round);
 
-        for (address, mode) in access_set.accounts() {
-            let entry = accounts.entry(address).or_insert((NONE, NONE));
-            entry.0 = ready_round;
-            if mode == AccessMode::Write {
-                entry.1 = ready_round;
-            }
-        }
-
-        for (address, slot, mode) in access_set.storage() {
-            let entry = storage.entry((address, slot)).or_insert((NONE, NONE));
-            entry.0 = ready_round;
-            if mode == AccessMode::Write {
-                entry.1 = ready_round;
-            }
+        for address in write_set.addresses() {
+            touched.insert(address, ready_round);
         }
     }
 
@@ -464,34 +372,32 @@ fn parallel_grain_size(strategy: &impl Strategy, round_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MaterializedRounds, ScheduleStats, schedule_rounds};
-    use crate::processor::access::AccessSet;
+    use super::{MaterializedRounds, ScheduleStats, TransactionWrites, schedule_rounds};
     use commonware_codec::{DecodeExt, FixedSize};
-    use constantinople_primitives::{Access, AccessList, AccessMode, Address, Slot};
+    use constantinople_primitives::Address;
 
     #[test]
-    fn schedule_rounds_groups_conflicts_and_tracks_stats() {
-        let shared_a = address(0xa0);
-        let shared_b = address(0xb0);
-        let slot_a = slot(0x0a);
-        let slot_b = slot(0x0b);
-        let access_sets = vec![
-            access_set(vec![Access::Storage(shared_a, slot_a, AccessMode::Write)]),
-            access_set(vec![Access::Storage(shared_b, slot_b, AccessMode::Read)]),
-            access_set(vec![Access::Storage(shared_a, slot_a, AccessMode::Read)]),
-            access_set(vec![Access::Storage(shared_b, slot_b, AccessMode::Write)]),
-        ];
+    fn schedule_rounds_groups_sender_and_recipient_conflicts() {
+        let shared_sender = address(0xa0);
+        let shared_recipient = address(0xb0);
+        let other_a = address(0xc0);
+        let other_b = address(0xd0);
 
-        let (round_for_transaction, stats) = schedule_rounds(&access_sets);
+        let (round_for_transaction, stats) = schedule_rounds(&[
+            TransactionWrites::new(shared_sender, other_a),
+            TransactionWrites::new(other_b, shared_recipient),
+            TransactionWrites::new(shared_sender, shared_recipient),
+            TransactionWrites::new(address(0xe0), address(0xf0)),
+        ]);
 
-        assert_eq!(round_for_transaction, vec![0, 0, 1, 1]);
+        assert_eq!(round_for_transaction, vec![0, 0, 1, 0]);
         assert_eq!(
             stats,
             ScheduleStats {
                 total_rounds: 2,
-                singleton_rounds: 0,
-                max_width: 2,
-                parallel_transactions: 4,
+                singleton_rounds: 1,
+                max_width: 3,
+                parallel_transactions: 3,
             }
         );
     }
@@ -505,15 +411,7 @@ mod tests {
         assert_eq!(rounds.round(2), &[0, 2]);
     }
 
-    fn access_set(access_list: AccessList) -> AccessSet {
-        AccessSet::new(&access_list)
-    }
-
     fn address(byte: u8) -> Address {
         Address::decode(&[byte; Address::SIZE][..]).expect("address bytes should decode")
-    }
-
-    fn slot(byte: u8) -> Slot {
-        Slot::from([byte; Slot::SIZE])
     }
 }

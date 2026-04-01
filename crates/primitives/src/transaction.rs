@@ -53,10 +53,7 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
 
 impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
     fn encode_size(&self) -> usize {
-        self.sender.encode_size()
-            + self.to.encode_size()
-            + u64::SIZE
-            + self.nonce.encode_size()
+        self.sender.encode_size() + self.to.encode_size() + u64::SIZE + self.nonce.encode_size()
     }
 }
 
@@ -221,8 +218,10 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result =
-            Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(&mut &buf[..], &TransactionCfg);
+        let result = Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(
+            &mut &buf[..],
+            &TransactionCfg,
+        );
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 }

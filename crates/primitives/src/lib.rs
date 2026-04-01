@@ -11,7 +11,9 @@ mod account;
 pub use account::{Account, Address};
 
 mod block;
-pub use block::{Block, BlockCfg, Header, SignedBlock, SignedTransaction, VerifiedBlock, VerifiedTransaction};
+pub use block::{
+    Block, BlockCfg, Header, SignedBlock, SignedTransaction, VerifiedBlock, VerifiedTransaction,
+};
 
 mod transaction;
 pub use transaction::{Transaction, TransactionCfg};

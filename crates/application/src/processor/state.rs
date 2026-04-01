@@ -1,50 +1,27 @@
-//! In-memory processor state.
-//!
-//! This module contains the state overlay used by the processor during one
-//! execution pass. It tracks:
-//!
-//! - the loaded base account and storage snapshot
-//! - per-frame diffs that can be merged or discarded
-//! - deterministic export of the final database changeset
-//!
-//! The state layer is deliberately persistence-agnostic. It only knows how to
-//! represent visible values and produce the slot/value writes that should be
-//! applied back to the database.
-//!
-//! Access-list declarations and observed-access tracking live in the sibling
-//! `access` module.
+//! In-memory processor state for transfer-only execution.
 
-use super::keys::{account_key, storage_key};
-use commonware_cryptography::Hasher;
-use commonware_parallel::Strategy;
-use constantinople_primitives::{Account, AccountWrite, Address, Slot, StateValue, StorageWrite};
+use constantinople_primitives::{Account, Address};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
 
-type StorageKey = (Address, Slot);
-
 /// Reads visible state values for execution.
 ///
 /// This trait is implemented by both the fully preloaded verifier state and
-/// the proposer-side lazy discovery state. Callers always observe the current
-/// visible value for a key, with missing data represented as the default
-/// account or slot value.
+/// the proposer-side lazy discovery state. Missing accounts read as the
+/// default account value.
 pub trait StateReader {
     /// Returns the visible account value for `address`.
     fn account(&self, address: Address) -> Account;
-
-    /// Returns the visible storage value for `(address, slot)`.
-    fn storage(&self, address: Address, slot: Slot) -> Slot;
 }
 
 /// Tracks one value that changed during execution.
 ///
 /// The processor keeps both the original value and the latest visible value.
-/// This lets frames merge child changes, discard reverted children, and omit
-/// values that were changed and then restored back to their original state.
+/// This lets execution merge later writes while omitting values that were
+/// changed and then restored back to their original state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Tracked<T> {
     original: T,
@@ -71,25 +48,19 @@ where
     }
 }
 
-/// Stores the changes owned by one frame.
+/// Stores the account changes produced during execution.
 ///
 /// Each entry records both its original and current value. A value disappears
 /// from the diff once it is restored to its original state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct FrameDiff {
+pub(crate) struct AccountDiff {
     accounts: HashMap<Address, Tracked<Account>>,
-    storage: HashMap<StorageKey, Tracked<Slot>>,
 }
 
-impl FrameDiff {
+impl AccountDiff {
     /// Returns the changed account value for `address`, if present.
     pub(crate) fn account(&self, address: Address) -> Option<Account> {
         self.accounts.get(&address).map(Tracked::current)
-    }
-
-    /// Returns the changed storage value for `(address, slot)`, if present.
-    pub(crate) fn storage(&self, address: Address, slot: Slot) -> Option<Slot> {
-        self.storage.get(&(address, slot)).map(Tracked::current)
     }
 
     /// Records an account change.
@@ -114,116 +85,29 @@ impl FrameDiff {
             .insert(address, Tracked::new(original, current));
     }
 
-    /// Records a storage change.
-    ///
-    /// If the latest value equals the original value, the tracked entry is
-    /// removed so the diff contains only persistent changes.
-    pub(crate) fn set_storage(
-        &mut self,
-        address: Address,
-        slot: Slot,
-        original: Slot,
-        current: Slot,
-    ) {
-        let key = (address, slot);
-
-        if let Some(tracked) = self.storage.get_mut(&key) {
-            tracked.current = current;
-
-            if !tracked.is_changed() {
-                self.storage.remove(&key);
-            }
-            return;
-        }
-
-        if original == current {
-            return;
-        }
-
-        self.storage.insert(key, Tracked::new(original, current));
-    }
-
-    /// Merges a child diff into this diff.
-    ///
-    /// Child values become the latest visible values in the merged result,
-    /// while the original values remain anchored to the first write observed in
-    /// the parent chain.
+    /// Merges another diff into this diff.
     pub(crate) fn merge(&mut self, child: Self) {
         for (address, tracked) in child.accounts {
             self.set_account(address, tracked.original, tracked.current);
         }
-
-        for ((address, slot), tracked) in child.storage {
-            self.set_storage(address, slot, tracked.original, tracked.current);
-        }
     }
 
-    /// Produces a database changeset for the changed values in this diff.
-    ///
-    /// Accounts are emitted at their account keys and storage values are
-    /// emitted at their hashed storage keys. Only values that still differ from
-    /// their originals are included.
-    ///
-    /// # Panics
-    ///
-    /// Panics if two changed entries map to the same database key.
-    pub(crate) fn changeset<H: Hasher>(
-        &self,
-        strategy: &impl Strategy,
-    ) -> BTreeMap<Slot, StateValue> {
-        let mut changeset = BTreeMap::new();
-
-        for (address, tracked) in &self.accounts {
-            let key = account_key(*address);
-            let value = StateValue::Account(tracked.current());
-            let previous = changeset.insert(key, value);
-            assert!(previous.is_none(), "duplicate account key in changeset");
-        }
-
-        let storage_entries = strategy.map_init_collect_vec(
-            self.storage.iter(),
-            H::default,
-            |hasher, ((address, slot), tracked)| {
-                let key = storage_key(hasher, *address, *slot);
-                let value = StateValue::Storage(tracked.current());
-                (key, value)
-            },
-        );
-
-        for (key, value) in storage_entries {
-            let previous = changeset.insert(key, value);
-            assert!(previous.is_none(), "duplicate storage key in changeset");
-        }
-
-        changeset
+    /// Produces a deterministic changeset for the changed accounts in this diff.
+    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
+        self.accounts
+            .iter()
+            .map(|(address, tracked)| (*address, tracked.current()))
+            .collect()
     }
 
     /// Returns the final changed account values in deterministic order.
-    pub(crate) fn account_writes(&self) -> Vec<AccountWrite> {
+    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
         let mut writes = self
             .accounts
             .iter()
-            .map(|(address, tracked)| AccountWrite {
-                address: *address,
-                account: tracked.current(),
-            })
+            .map(|(address, tracked)| (*address, tracked.current()))
             .collect::<Vec<_>>();
-        writes.sort_unstable_by_key(|write| write.address);
-        writes
-    }
-
-    /// Returns the final changed storage values in deterministic order.
-    pub(crate) fn storage_writes(&self) -> Vec<StorageWrite> {
-        let mut writes = self
-            .storage
-            .iter()
-            .map(|((address, slot), tracked)| StorageWrite {
-                address: *address,
-                slot: *slot,
-                value: tracked.current(),
-            })
-            .collect::<Vec<_>>();
-        writes.sort_unstable_by_key(|write| (write.address, write.slot));
+        writes.sort_unstable_by_key(|(address, _)| *address);
         writes
     }
 }
@@ -240,24 +124,15 @@ impl FrameDiff {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
     base_accounts: Arc<HashMap<Address, Account>>,
-    base_storage: Arc<HashMap<StorageKey, Slot>>,
-    diff: FrameDiff,
+    diff: AccountDiff,
 }
 
 impl State {
-    /// Creates in-memory processor state from loaded accounts and storage.
-    ///
-    /// The input maps use logical account and storage coordinates rather than
-    /// database keys so callers can prepare state from any source, including
-    /// database reads, proofs, or other execution witnesses.
-    pub fn new(
-        base_accounts: HashMap<Address, Account>,
-        base_storage: HashMap<(Address, Slot), Slot>,
-    ) -> Self {
+    /// Creates in-memory processor state from loaded accounts.
+    pub fn new(base_accounts: HashMap<Address, Account>) -> Self {
         Self {
             base_accounts: Arc::new(base_accounts),
-            base_storage: Arc::new(base_storage),
-            diff: FrameDiff::default(),
+            diff: AccountDiff::default(),
         }
     }
 
@@ -275,46 +150,25 @@ impl State {
             .unwrap_or_default()
     }
 
-    /// Returns the visible storage value for `(address, slot)`.
-    ///
-    /// Missing storage values read as the default slot value.
-    pub(crate) fn storage(&self, address: Address, slot: Slot) -> Slot {
-        if let Some(value) = self.diff.storage(address, slot) {
-            return value;
-        }
-
-        self.base_storage
-            .get(&(address, slot))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Commits a frame diff into the state.
-    pub(crate) fn apply(&mut self, diff: FrameDiff) {
+    /// Commits an execution diff into the state.
+    pub(crate) fn apply(&mut self, diff: AccountDiff) {
         self.diff.merge(diff);
     }
 
-    /// Produces a database changeset for the committed state diff.
-    pub(crate) fn changeset<H: Hasher>(
-        &self,
-        strategy: &impl Strategy,
-    ) -> BTreeMap<Slot, StateValue> {
-        self.diff.changeset::<H>(strategy)
+    /// Produces a deterministic changeset for the committed state diff.
+    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
+        self.diff.changeset()
     }
 
     /// Returns the final changed values in deterministic order.
-    pub(crate) fn writes(&self) -> (Vec<AccountWrite>, Vec<StorageWrite>) {
-        (self.diff.account_writes(), self.diff.storage_writes())
+    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
+        self.diff.writes()
     }
 }
 
 impl StateReader for State {
     fn account(&self, address: Address) -> Account {
         Self::account(self, address)
-    }
-
-    fn storage(&self, address: Address, slot: Slot) -> Slot {
-        Self::storage(self, address, slot)
     }
 }
 
@@ -328,8 +182,7 @@ impl StateReader for State {
 pub struct DiscoveryState<R: StateReader> {
     reader: R,
     base_accounts: RefCell<HashMap<Address, Account>>,
-    base_storage: RefCell<HashMap<StorageKey, Slot>>,
-    diff: FrameDiff,
+    diff: AccountDiff,
 }
 
 impl<R: StateReader> DiscoveryState<R> {
@@ -338,27 +191,23 @@ impl<R: StateReader> DiscoveryState<R> {
         Self {
             reader,
             base_accounts: RefCell::new(HashMap::new()),
-            base_storage: RefCell::new(HashMap::new()),
-            diff: FrameDiff::default(),
+            diff: AccountDiff::default(),
         }
     }
 
-    /// Commits a frame diff into the state.
-    pub(crate) fn apply(&mut self, diff: FrameDiff) {
+    /// Commits an execution diff into the state.
+    pub(crate) fn apply(&mut self, diff: AccountDiff) {
         self.diff.merge(diff);
     }
 
-    /// Produces a database changeset for the committed state diff.
-    pub(crate) fn changeset<H: Hasher>(
-        &self,
-        strategy: &impl Strategy,
-    ) -> BTreeMap<Slot, StateValue> {
-        self.diff.changeset::<H>(strategy)
+    /// Produces a deterministic changeset for the committed state diff.
+    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
+        self.diff.changeset()
     }
 
     /// Returns the final changed values in deterministic order.
-    pub(crate) fn writes(&self) -> (Vec<AccountWrite>, Vec<StorageWrite>) {
-        (self.diff.account_writes(), self.diff.storage_writes())
+    pub(crate) fn writes(&self) -> Vec<(Address, Account)> {
+        self.diff.writes()
     }
 
     fn load_account(&self, address: Address) -> Account {
@@ -374,30 +223,10 @@ impl<R: StateReader> DiscoveryState<R> {
         self.base_accounts.borrow_mut().insert(address, loaded);
         loaded
     }
-
-    fn load_storage(&self, address: Address, slot: Slot) -> Slot {
-        if let Some(value) = self.diff.storage(address, slot) {
-            return value;
-        }
-
-        if let Some(value) = self.base_storage.borrow().get(&(address, slot)).copied() {
-            return value;
-        }
-
-        let loaded = self.reader.storage(address, slot);
-        self.base_storage
-            .borrow_mut()
-            .insert((address, slot), loaded);
-        loaded
-    }
 }
 
 impl<R: StateReader> StateReader for DiscoveryState<R> {
     fn account(&self, address: Address) -> Account {
         self.load_account(address)
-    }
-
-    fn storage(&self, address: Address, slot: Slot) -> Slot {
-        self.load_storage(address, slot)
     }
 }

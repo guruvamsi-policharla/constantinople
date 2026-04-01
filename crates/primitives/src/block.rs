@@ -5,7 +5,10 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{Sealable, Sealed, Signed, Verified, transaction::{Transaction, TransactionCfg}};
+use crate::{
+    Sealable, Sealed, Signed, Verified,
+    transaction::{Transaction, TransactionCfg},
+};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
@@ -395,10 +398,8 @@ mod tests {
 
     #[test]
     fn block_codec_roundtrip_empty_body() {
-        let block = Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
-            test_header(),
-            vec![],
-        );
+        let block =
+            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
 
         let mut buf = Vec::with_capacity(block.encode_size());
         block.write(&mut buf);
@@ -413,10 +414,8 @@ mod tests {
 
     #[test]
     fn block_encode_size_matches_written() {
-        let block = Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
-            test_header(),
-            vec![],
-        );
+        let block =
+            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
         let expected = block.encode_size();
 
         let mut buf = Vec::new();

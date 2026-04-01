@@ -34,10 +34,10 @@ use commonware_cryptography::{
 };
 use commonware_macros::select_loop;
 use commonware_p2p::{Blocker, Provider, Receiver, Recipients, Sender};
-use commonware_utils::{Faults, N3f1};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::channel::{fallible::OneshotExt, mpsc, oneshot};
+use commonware_utils::{Faults, N3f1};
 use constantinople_primitives::BlockCfg;
 use futures::future::{self, Either};
 use rand_core::CryptoRngCore;
