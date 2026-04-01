@@ -12,10 +12,10 @@ use std::{collections::HashMap, path::Path};
         .args(["peers", "hosts"])
 ))]
 pub struct Cli {
-    /// Path to the spammer TOML config.
+    /// Path to the spammer YAML config.
     #[arg(long)]
     pub config: std::path::PathBuf,
-    /// Path to the local peer topology TOML file.
+    /// Path to the local peer topology YAML file.
     #[arg(long, conflicts_with = "hosts")]
     pub peers: Option<std::path::PathBuf>,
     /// Path to the deployer-generated hosts file.
@@ -50,7 +50,7 @@ struct PeersFile {
 fn load_spammer_config(path: &Path) -> Result<SpammerConfig, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|err| format!("failed to read config: {err}"))?;
-    toml::from_str(&raw).map_err(|err| format!("failed to parse config: {err}"))
+    serde_yaml::from_str(&raw).map_err(|err| format!("failed to parse config: {err}"))
 }
 
 pub fn load_local_args(peers_path: &Path, config_path: &Path) -> Result<spam::Args, String> {
@@ -58,7 +58,7 @@ pub fn load_local_args(peers_path: &Path, config_path: &Path) -> Result<spam::Ar
     let raw_peers = std::fs::read_to_string(peers_path)
         .map_err(|err| format!("failed to read peers: {err}"))?;
     let peers: PeersFile =
-        toml::from_str(&raw_peers).map_err(|err| format!("failed to parse peers: {err}"))?;
+        serde_yaml::from_str(&raw_peers).map_err(|err| format!("failed to parse peers: {err}"))?;
     let peers_by_name = peers
         .validators
         .into_iter()
@@ -137,14 +137,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "constantinople-spammer",
             "--config",
-            "spammer.toml",
+            "spammer.yaml",
             "--peers",
-            "peers.toml",
+            "peers.yaml",
         ])
         .expect("local spam invocation should parse");
 
-        assert_eq!(cli.config, PathBuf::from("spammer.toml"));
-        assert_eq!(cli.peers, Some(PathBuf::from("peers.toml")));
+        assert_eq!(cli.config, PathBuf::from("spammer.yaml"));
+        assert_eq!(cli.peers, Some(PathBuf::from("peers.yaml")));
         assert!(cli.hosts.is_none());
     }
 
@@ -155,42 +155,40 @@ mod tests {
             "--hosts",
             "hosts.yaml",
             "--config",
-            "spammer.toml",
+            "spammer.yaml",
         ])
         .expect("deployer invocation should parse");
 
         assert_eq!(cli.hosts, Some(PathBuf::from("hosts.yaml")));
-        assert_eq!(cli.config, PathBuf::from("spammer.toml"));
+        assert_eq!(cli.config, PathBuf::from("spammer.yaml"));
         assert!(cli.peers.is_none());
     }
 
     #[test]
     fn load_local_args_uses_validator_order_from_config() {
-        let peers_path = temp_path("spammer-peers", ".toml");
-        let config_path = temp_path("spammer-config", ".toml");
+        let peers_path = temp_path("spammer-peers", ".yaml");
+        let config_path = temp_path("spammer-config", ".yaml");
 
         fs::write(
             &peers_path,
-            r#"[[validators]]
-name = "validator-b"
-p2p = "127.0.0.1:9001"
-http = "127.0.0.1:8081"
-
-[[validators]]
-name = "validator-a"
-p2p = "127.0.0.1:9000"
-http = "127.0.0.1:8080"
+            r#"validators:
+  - name: "validator-b"
+    p2p: "127.0.0.1:9001"
+    http: "127.0.0.1:8081"
+  - name: "validator-a"
+    p2p: "127.0.0.1:9000"
+    http: "127.0.0.1:8080"
 "#,
         )
         .expect("failed to write peers");
         fs::write(
             &config_path,
-            r#"count = 8
-validator_names = ["validator-a", "validator-b"]
-http_port = 8080
-seed_start = 3
-nonce = 9
-tps = 100
+            r#"count: 8
+validator_names: ["validator-a", "validator-b"]
+http_port: 8080
+seed_start: 3
+nonce: 9
+tps: 100
 "#,
         )
         .expect("failed to write config");
@@ -213,7 +211,7 @@ tps = 100
     #[test]
     fn load_remote_args_uses_validator_order_from_config() {
         let hosts_path = temp_path("hosts", ".yaml");
-        let config_path = temp_path("spam", ".toml");
+        let config_path = temp_path("spam", ".yaml");
 
         fs::write(
             &hosts_path,
@@ -230,12 +228,12 @@ hosts:
         .expect("failed to write hosts");
         fs::write(
             &config_path,
-            r#"count = 8
-validator_names = ["validator-a", "validator-b"]
-http_port = 8080
-seed_start = 3
-nonce = 9
-tps = 100
+            r#"count: 8
+validator_names: ["validator-a", "validator-b"]
+http_port: 8080
+seed_start: 3
+nonce: 9
+tps: 100
 "#,
         )
         .expect("failed to write config");

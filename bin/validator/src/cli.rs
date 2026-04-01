@@ -11,10 +11,10 @@ use std::path::PathBuf;
         .args(["peers", "hosts"])
 ))]
 pub struct Cli {
-    /// Path to the validator TOML config.
+    /// Path to the validator YAML config.
     #[arg(long)]
     pub config: PathBuf,
-    /// Path to the local peer topology TOML file.
+    /// Path to the local peer topology YAML file.
     #[arg(long, conflicts_with = "hosts")]
     pub peers: Option<PathBuf>,
     /// Path to the deployer-generated hosts file.
@@ -33,14 +33,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "constantinople",
             "--config",
-            "validator.toml",
+            "validator.yaml",
             "--peers",
-            "peers.toml",
+            "peers.yaml",
         ])
         .expect("local invocation should parse");
 
-        assert_eq!(cli.config, PathBuf::from("validator.toml"));
-        assert_eq!(cli.peers, Some(PathBuf::from("peers.toml")));
+        assert_eq!(cli.config, PathBuf::from("validator.yaml"));
+        assert_eq!(cli.peers, Some(PathBuf::from("peers.yaml")));
         assert!(cli.hosts.is_none());
     }
 
@@ -51,11 +51,11 @@ mod tests {
             "--hosts",
             "hosts.yaml",
             "--config",
-            "validator.toml",
+            "validator.yaml",
         ])
         .expect("deployer invocation should parse");
 
-        assert_eq!(cli.config, PathBuf::from("validator.toml"));
+        assert_eq!(cli.config, PathBuf::from("validator.yaml"));
         assert_eq!(cli.hosts, Some(PathBuf::from("hosts.yaml")));
         assert!(cli.peers.is_none());
     }

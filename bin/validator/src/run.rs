@@ -1,4 +1,4 @@
-//! Starts a validator from a TOML config.
+//! Starts a validator from a YAML config.
 
 use crate::config::{LoadedConfig, load_deployer_config, load_local_config};
 use commonware_codec::Encode;

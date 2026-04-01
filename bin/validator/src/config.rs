@@ -1,4 +1,4 @@
-//! TOML-serializable validator configuration.
+//! YAML-serializable validator configuration.
 
 use commonware_codec::{Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
@@ -118,7 +118,7 @@ fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {
     let raw = std::fs::read_to_string(path).expect("failed to read config file");
-    toml::from_str(&raw).expect("failed to parse config")
+    serde_yaml::from_str(&raw).expect("failed to parse config")
 }
 
 fn parse_socket(name: &str, socket: &str) -> SocketAddr {
@@ -171,7 +171,7 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
     let signer = decode_private_key(&config.private_key);
     let self_name = hex(&signer.public_key().encode());
     let raw_peers = std::fs::read_to_string(peers_path).expect("failed to read peers file");
-    let peers: PeersFile = toml::from_str(&raw_peers).expect("failed to parse peers file");
+    let peers: PeersFile = serde_yaml::from_str(&raw_peers).expect("failed to parse peers file");
     let peers_by_name = peers
         .validators
         .into_iter()
@@ -285,8 +285,8 @@ mod tests {
         let public_key = signer.public_key();
         let share = shares.get(&public_key).expect("missing share");
         let peer_name = hex(&public_keys[1].encode());
-        let config_path = temp_path("validator-config", ".toml");
-        let peers_path = temp_path("validator-peers", ".toml");
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("validator-peers", ".yaml");
 
         let config = ValidatorConfig {
             private_key: hex(&signer.encode()),
@@ -308,21 +308,19 @@ mod tests {
         };
         fs::write(
             &config_path,
-            toml::to_string_pretty(&config).expect("config should serialize"),
+            serde_yaml::to_string(&config).expect("config should serialize"),
         )
         .expect("config should write");
         fs::write(
             &peers_path,
             format!(
-                r#"[[validators]]
-name = "{self_name}"
-p2p = "127.0.0.1:9000"
-http = "127.0.0.1:8080"
-
-[[validators]]
-name = "{peer_name}"
-p2p = "127.0.0.1:9001"
-http = "127.0.0.1:8081"
+                r#"validators:
+  - name: "{self_name}"
+    p2p: "127.0.0.1:9000"
+    http: "127.0.0.1:8080"
+  - name: "{peer_name}"
+    p2p: "127.0.0.1:9001"
+    http: "127.0.0.1:8081"
 "#,
                 self_name = hex(&public_key.encode()),
             ),

@@ -25,8 +25,8 @@ use std::{
 const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
-const PEERS_CONFIG_FILE: &str = "peers.toml";
-const SPAMMER_CONFIG_FILE: &str = "spammer.toml";
+const PEERS_CONFIG_FILE: &str = "peers.yaml";
+const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const SPAMMER_INSTANCE_NAME: &str = "spammer";
 
 #[derive(Debug, Parser)]
@@ -214,8 +214,8 @@ pub(crate) fn generate_cluster_material(validators: u32) -> ClusterMaterial {
     }
 }
 
-pub(crate) fn write_toml_config<T: Serialize>(path: &Path, config: &T) {
-    let raw = toml::to_string_pretty(config).expect("failed to serialize config");
+pub(crate) fn write_yaml_config<T: Serialize>(path: &Path, config: &T) {
+    let raw = serde_yaml::to_string(config).expect("failed to serialize config");
     fs::write(path, raw).expect("failed to write config");
 }
 

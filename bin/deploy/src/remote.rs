@@ -2,7 +2,7 @@ use crate::{
     ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
     SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS, ValidatorConfig, absolute_path,
     build_spammer_config, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_cluster_material, write_toml_config,
+    ensure_output_dir_missing, generate_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws;
@@ -49,10 +49,10 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
-        write_toml_config(&validator.config_file, &validator.config);
+        write_yaml_config(&validator.config_file, &validator.config);
     }
     if let Some(spammer_config) = spammer_config.as_ref() {
-        write_toml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer_config);
+        write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer_config);
     }
 
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
@@ -121,7 +121,7 @@ fn build_validators(
 
         validators.push(GeneratedValidator {
             public_key_hex: public_key_hex.clone(),
-            config_file: output_dir.join(format!("{public_key_hex}.toml")),
+            config_file: output_dir.join(format!("{public_key_hex}.yaml")),
             config,
         });
     }
@@ -267,7 +267,7 @@ mod tests {
     fn validator(index: u32) -> super::GeneratedValidator {
         super::GeneratedValidator {
             public_key_hex: format!("validator-{index}"),
-            config_file: PathBuf::from(format!("/tmp/validator-{index}.toml")),
+            config_file: PathBuf::from(format!("/tmp/validator-{index}.yaml")),
             config: ValidatorConfig {
                 private_key: "private".to_string(),
                 dkg_output: "output".to_string(),

@@ -55,9 +55,9 @@ cargo run --bin constantinople-deploy -- generate \
 
 This writes:
 
-- `validator-0.toml`, `validator-1.toml`, ...
-- `peers.toml`
-- optionally `spammer.toml` if `--spammer-count` and `--spammer-tps` are supplied
+- `validator-0.yaml`, `validator-1.yaml`, ...
+- `peers.yaml`
+- optionally `spammer.yaml` if `--spammer-count` and `--spammer-tps` are supplied
 
 It also prints an `mprocs` command that starts the whole local cluster.
 
@@ -65,17 +65,17 @@ To run a single local validator directly:
 
 ```sh
 cargo run --bin constantinople -- \
-  --config ./configs/validator-0.toml \
-  --peers ./configs/peers.toml
+  --config ./configs/validator-0.yaml \
+  --peers ./configs/peers.yaml
 ```
 
 To run the whole local cluster, use the printed `mprocs` command, or run each validator in a separate terminal:
 
 ```sh
-cargo run --bin constantinople -- --config ./configs/validator-0.toml --peers ./configs/peers.toml
-cargo run --bin constantinople -- --config ./configs/validator-1.toml --peers ./configs/peers.toml
-cargo run --bin constantinople -- --config ./configs/validator-2.toml --peers ./configs/peers.toml
-cargo run --bin constantinople -- --config ./configs/validator-3.toml --peers ./configs/peers.toml
+cargo run --bin constantinople -- --config ./configs/validator-0.yaml --peers ./configs/peers.yaml
+cargo run --bin constantinople -- --config ./configs/validator-1.yaml --peers ./configs/peers.yaml
+cargo run --bin constantinople -- --config ./configs/validator-2.yaml --peers ./configs/peers.yaml
+cargo run --bin constantinople -- --config ./configs/validator-3.yaml --peers ./configs/peers.yaml
 ```
 
 To generate a local cluster plus a spammer config:
@@ -93,13 +93,13 @@ Then run the spammer against the local peer topology:
 
 ```sh
 cargo run --bin constantinople-spammer -- \
-  --config ./configs/spammer.toml \
-  --peers ./configs/peers.toml
+  --config ./configs/spammer.yaml \
+  --peers ./configs/peers.yaml
 ```
 
 ### Remote Deployment
 
-Remote deployments use the same service TOML configs, but networking is resolved from the deployer
+Remote deployments use the same service YAML configs, but networking is resolved from the deployer
 hosts file at runtime.
 
 Generate a remote deployment bundle:
@@ -124,8 +124,8 @@ cargo run --bin constantinople-deploy -- generate \
 
 This writes:
 
-- one validator TOML config per validator
-- optionally `spammer.toml`
+- one validator YAML config per validator
+- optionally `spammer.yaml`
 - `config.yaml` for `commonware-deployer`
 - a copied dashboard file for monitoring
 
@@ -136,15 +136,15 @@ The deploy command then prints the `commonware-deployer` command to run.
 Validator:
 
 ```sh
-constantinople --config ./validator.toml --peers ./peers.toml
-constantinople --config ./validator.toml --hosts ./hosts.yaml
+constantinople --config ./validator.yaml --peers ./peers.yaml
+constantinople --config ./validator.yaml --hosts ./hosts.yaml
 ```
 
 Spammer:
 
 ```sh
-constantinople-spammer --config ./spammer.toml --peers ./peers.toml
-constantinople-spammer --config ./spammer.toml --hosts ./hosts.yaml
+constantinople-spammer --config ./spammer.yaml --peers ./peers.yaml
+constantinople-spammer --config ./spammer.yaml --hosts ./hosts.yaml
 ```
 
 ## Development

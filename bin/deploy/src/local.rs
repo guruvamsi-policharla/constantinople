@@ -2,7 +2,7 @@ use crate::{
     ClusterMaterial, GenerateArgs, LocalArgs, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     SPAMMER_CONFIG_FILE, ValidatorConfig, absolute_path, build_spammer_config,
     default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_cluster_material, write_toml_config,
+    generate_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -39,11 +39,11 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
-        write_toml_config(&validator.config_file, &validator.config);
+        write_yaml_config(&validator.config_file, &validator.config);
     }
-    write_toml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
+    write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
     if let Some(spammer) = spammer.as_ref() {
-        write_toml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer);
+        write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer);
     }
 
     print_local_run_commands(&output_dir, args.validators, spammer.is_some());
@@ -105,7 +105,7 @@ fn build_validators(
         };
 
         validators.push(GeneratedValidator {
-            config_file: output_dir.join(format!("validator-{index}.toml")),
+            config_file: output_dir.join(format!("validator-{index}.yaml")),
             config,
             peer: PeerEntry {
                 name: public_key_hex,
@@ -122,7 +122,7 @@ fn print_local_run_commands(output_dir: &std::path::Path, validators: u32, spamm
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let commands = (0..validators)
         .map(|index| {
-            let path = output_dir.join(format!("validator-{index}.toml"));
+            let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
                 "cargo run --bin constantinople -- --config {} --peers {}",
                 path.display(),

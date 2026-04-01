@@ -21,7 +21,6 @@ commonware-utils.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_yaml = "0.9"
-toml = "0.8"
 tracing.workspace = true
 
 [[bin]]
