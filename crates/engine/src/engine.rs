@@ -76,7 +76,7 @@ const FREEZER_VALUE_COMPRESSION: Option<u8> = Some(3);
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(134_217_728);
+const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(8_192);
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(65_536);
 const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
@@ -634,5 +634,15 @@ fn transaction_db_config(
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PAGE_CACHE_CAPACITY;
+
+    #[test]
+    fn production_page_cache_capacity_stays_small() {
+        assert_eq!(PAGE_CACHE_CAPACITY.get(), 8_192);
     }
 }
