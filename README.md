@@ -9,7 +9,7 @@ simple blockchain that supports only account-to-account transfers.
 ```
 bin/
   validator/        CLI that assembles and runs a validator node
-  tx-cli/           `constantinople-tx` transaction tool
+  tx/               `constantinople-tx` transaction tool
 
 crates/
   primitives/       Core types: blocks, transactions, and accounts
