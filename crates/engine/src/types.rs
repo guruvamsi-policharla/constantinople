@@ -42,7 +42,7 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 
 pub(crate) type StateDb<E, H> = fixed::Db<mmr::Family, E, Address, Account, H, EightCap>;
 
-pub(crate) type TransactionDb<E, H> = commonware_storage::qmdb::immutable::Immutable<
+pub(crate) type TransactionDb<E, H> = commonware_storage::qmdb::immutable::fixed::Db<
     mmr::Family,
     E,
     <H as Hasher>::Digest,

@@ -44,11 +44,9 @@ use commonware_runtime::{
 };
 use commonware_storage::{
     archive::immutable,
-    journal::contiguous::{
-        fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
-    },
+    journal::contiguous::fixed::Config as FixedJournalConfig,
     mmr::journaled::Config as MmrConfig,
-    qmdb::{any::FixedConfig, immutable::Config as ImmutableConfig},
+    qmdb::{any::FixedConfig, immutable::fixed as immutable_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
@@ -80,7 +78,6 @@ const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(131_072);
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(4_096);
-const ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
 const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: usize = 1024;
@@ -622,8 +619,8 @@ fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig
 fn transaction_db_config(
     partition_prefix: &str,
     page_cache: &CacheRef,
-) -> ImmutableConfig<EightCap, ()> {
-    ImmutableConfig {
+) -> immutable_fixed::Config<EightCap> {
+    immutable_fixed::Config {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-transactions-journal"),
             metadata_partition: format!("{partition_prefix}-transactions-metadata"),
@@ -632,12 +629,10 @@ fn transaction_db_config(
             thread_pool: None,
             page_cache: page_cache.clone(),
         },
-        log: VariableJournalConfig {
+        log: FixedJournalConfig {
             partition: format!("{partition_prefix}-transactions-log"),
-            items_per_section: ITEMS_PER_SECTION,
-            compression: None,
-            codec_config: (),
             page_cache: page_cache.clone(),
+            items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
