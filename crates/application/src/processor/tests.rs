@@ -1,7 +1,7 @@
 //! End-to-end processor tests for transfer-only execution.
 
 use super::{
-    executor::{execute, propose, ProposalOutput},
+    executor::{ProposalOutput, execute, propose},
     state::State,
 };
 use commonware_cryptography::{Signer, blake3, ed25519};

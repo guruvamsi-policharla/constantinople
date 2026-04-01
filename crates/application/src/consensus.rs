@@ -15,7 +15,7 @@
 //! in-memory state transition logic.
 
 use crate::processor::{
-    executor::{self, ProposalOutput},
+    executor::{self, Changeset, ProposalOutput},
     state::State,
 };
 use commonware_consensus::{
@@ -172,6 +172,35 @@ where
     }
 
     Ok(State::from_loaded(base_accounts, account_keys))
+}
+
+/// Writes a changeset of account updates to a state batch.
+fn apply_changeset<E, H>(
+    batch: StateBatch<E, H, EightCap>,
+    changeset: &Changeset,
+) -> StateBatch<E, H, EightCap>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+{
+    changeset.iter().fold(batch, |batch, (address, account)| {
+        batch.write(*address, Some(*account))
+    })
+}
+
+/// Records verified transaction digests in the transaction batch.
+fn record_transactions<E, H, PK>(
+    batch: TransactionBatch<E, H>,
+    transactions: &[VerifiedTransaction<PK, H>],
+) -> TransactionBatch<E, H>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    PK: PublicKey,
+{
+    transactions.iter().fold(batch, |batch, transaction| {
+        batch.set(*transaction.message_digest(), ())
+    })
 }
 
 /// Core constantinople application.
@@ -437,15 +466,8 @@ where
             callback(parent.header.height + 1, rejected, false);
         }
 
-        let transaction_batch: TransactionBatch<E, H> =
-            valid.iter().fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
-        let state_batch = changeset
-            .iter()
-            .fold(state_batch, |batch, (address, account)| {
-                batch.write(*address, Some(*account))
-            });
+        let transaction_batch = record_transactions(transaction_batch, &valid);
+        let state_batch = apply_changeset(state_batch, &changeset);
         if let Some(ref callback) = self.transaction_callback {
             let included = valid
                 .iter()
@@ -555,15 +577,8 @@ where
             return None;
         };
 
-        let transaction_batch: TransactionBatch<E, H> =
-            body.iter().fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
-        let state_batch = changeset
-            .iter()
-            .fold(state_batch, |batch, (address, account)| {
-                batch.write(*address, Some(*account))
-            });
+        let transaction_batch = record_transactions(transaction_batch, &body);
+        let state_batch = apply_changeset(state_batch, &changeset);
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
             .await
@@ -656,18 +671,8 @@ where
             .expect("state loading must succeed for certified apply");
         let changeset = executor::execute(state, &verified_block.body)
             .expect("certified block contained a statically invalid transaction");
-        let transaction_batch: TransactionBatch<E, H> =
-            verified_block
-                .body
-                .iter()
-                .fold(transaction_batch, |batch, transaction| {
-                    batch.set(*transaction.message_digest(), ())
-                });
-        let state_batch = changeset
-            .iter()
-            .fold(state_batch, |batch, (address, account)| {
-                batch.write(*address, Some(*account))
-            });
+        let transaction_batch = record_transactions(transaction_batch, &verified_block.body);
+        let state_batch = apply_changeset(state_batch, &changeset);
         self.finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed")
@@ -719,9 +724,7 @@ mod tests {
     use commonware_parallel::{Sequential, Strategy};
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
-        journal::contiguous::{
-            fixed::Config as FixedJournalConfig,
-        },
+        journal::contiguous::fixed::Config as FixedJournalConfig,
         mmr,
         mmr::journaled::Config as MmrConfig,
         qmdb::{
@@ -752,14 +755,7 @@ mod tests {
     type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
     type TestTransactionDb = Arc<
         AsyncRwLock<
-            immutable_fixed::Db<
-                mmr::Family,
-                TestContext,
-                blake3::Digest,
-                (),
-                TestHasher,
-                EightCap,
-            >,
+            immutable_fixed::Db<mmr::Family, TestContext, blake3::Digest, (), TestHasher, EightCap>,
         >,
     >;
     type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
@@ -830,7 +826,10 @@ mod tests {
         }
     }
 
-    fn transaction_db_config(suffix: &str, context: &TestContext) -> immutable_fixed::Config<EightCap> {
+    fn transaction_db_config(
+        suffix: &str,
+        context: &TestContext,
+    ) -> immutable_fixed::Config<EightCap> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
         immutable_fixed::Config {
             merkle_config: MmrConfig {
@@ -873,9 +872,10 @@ mod tests {
     }
 
     async fn open_transaction_db(context: TestContext, suffix: &str) -> TestTransactionDb {
-        let db = immutable_fixed::Db::init(context.clone(), transaction_db_config(suffix, &context))
-            .await
-            .expect("transaction db init should succeed");
+        let db =
+            immutable_fixed::Db::init(context.clone(), transaction_db_config(suffix, &context))
+                .await
+                .expect("transaction db init should succeed");
         Arc::new(AsyncRwLock::new(db))
     }
 

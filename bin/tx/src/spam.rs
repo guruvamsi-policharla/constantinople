@@ -6,17 +6,14 @@ use constantinople_primitives::Address;
 use std::{
     collections::VecDeque,
     future::Future,
+    num::{NonZeroU32, NonZeroUsize},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    num::{NonZeroU32, NonZeroUsize},
     time::Duration,
 };
-use tokio::{
-    task::JoinSet,
-    time,
-};
+use tokio::{task::JoinSet, time};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -118,7 +115,9 @@ fn build_endpoint_states(endpoints: Vec<String>) -> Vec<EndpointState> {
 
 fn assign_accounts_to_endpoints(accounts: &[RingAccount], endpoints: &mut [EndpointState]) {
     for (sender_index, account) in accounts.iter().enumerate() {
-        endpoints[account.endpoint_index].ready.push_back(sender_index);
+        endpoints[account.endpoint_index]
+            .ready
+            .push_back(sender_index);
     }
 }
 
@@ -133,7 +132,10 @@ fn endpoint_tps(total_tps: u64, endpoint_count: usize, endpoint_index: usize) ->
     base
 }
 
-fn next_ring_transfer(accounts: &[RingAccount], ready: &mut VecDeque<usize>) -> Option<RingTransfer> {
+fn next_ring_transfer(
+    accounts: &[RingAccount],
+    ready: &mut VecDeque<usize>,
+) -> Option<RingTransfer> {
     let sender_index = ready.pop_front()?;
     let sender = &accounts[sender_index];
 
@@ -162,9 +164,7 @@ fn handle_submission_result(
     endpoint.ready.push_back(sender_index);
 
     if submission.is_ok() {
-        accounts[sender_index].next_nonce = nonce
-            .checked_add(1)
-            .expect("sender nonce overflowed");
+        accounts[sender_index].next_nonce = nonce.checked_add(1).expect("sender nonce overflowed");
         return;
     }
 
@@ -172,10 +172,7 @@ fn handle_submission_result(
     let from = hex(from.as_ref());
     let to = hex(to.as_ref());
     let err = submission.expect_err("failed submission should carry an error");
-    eprintln!(
-        "{} {from} -> {to} nonce={nonce}: {err}",
-        endpoint.endpoint
-    );
+    eprintln!("{} {from} -> {to} nonce={nonce}: {err}", endpoint.endpoint);
 }
 
 fn drain_completed_submissions(
@@ -246,11 +243,7 @@ where
     }
 
     loop {
-        drain_completed_submissions(
-            &mut accounts,
-            &mut endpoints,
-            &mut tasks,
-        );
+        drain_completed_submissions(&mut accounts, &mut endpoints, &mut tasks);
 
         if should_stop.load(Ordering::Relaxed) {
             stop_spammer(&mut tasks).await;
@@ -350,8 +343,14 @@ where
         }
     }
 
-    let completed = endpoints.iter().map(|endpoint| endpoint.completed).sum::<usize>();
-    let failed = endpoints.iter().map(|endpoint| endpoint.failed).sum::<usize>();
+    let completed = endpoints
+        .iter()
+        .map(|endpoint| endpoint.completed)
+        .sum::<usize>();
+    let failed = endpoints
+        .iter()
+        .map(|endpoint| endpoint.failed)
+        .sum::<usize>();
     println!("completed: {completed}");
     println!("failed: {failed}");
     for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
@@ -432,7 +431,10 @@ mod tests {
     use std::{
         collections::{HashSet, VecDeque},
         num::{NonZeroU32, NonZeroUsize},
-        sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
     use tokio::time;
@@ -553,9 +555,11 @@ mod tests {
         let stopper = start_stop_timer(Duration::from_millis(10), should_stop.clone());
         let result = time::timeout(
             Duration::from_millis(100),
-            run_until_stopped(test_args(100_000), should_stop, |_client, _endpoint, _tx_bytes| async {
-                Ok(())
-            }),
+            run_until_stopped(
+                test_args(100_000),
+                should_stop,
+                |_client, _endpoint, _tx_bytes| async { Ok(()) },
+            ),
         )
         .await;
 
@@ -624,7 +628,8 @@ mod tests {
             run_until_stopped(args, should_stop, move |_client, endpoint, _tx_bytes| {
                 let seen = seen.clone();
                 async move {
-                    seen.lock().expect("endpoint set lock should succeed")
+                    seen.lock()
+                        .expect("endpoint set lock should succeed")
                         .insert(endpoint);
                     Ok(())
                 }

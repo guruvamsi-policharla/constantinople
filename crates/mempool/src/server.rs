@@ -315,10 +315,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MempoolInner, MempoolConfig, RouterState, SubmissionReceipt, accept_tx, router,
+    use super::{MempoolConfig, MempoolInner, RouterState, SubmissionReceipt, accept_tx, router};
+    use axum::{
+        Json,
+        body::Body,
+        extract::State,
+        http::{Request, StatusCode},
     };
-    use axum::{Json, body::Body, extract::State, http::{Request, StatusCode}};
     use commonware_codec::Encode;
     use commonware_cryptography::{Digest, Signer, blake3, ed25519};
     use commonware_utils::hex;
@@ -345,16 +348,18 @@ mod tests {
 
     #[tokio::test]
     async fn accept_tx_enqueues_without_registering_waiter() {
-        let state = Arc::new(RouterState::<blake3::Digest, ed25519::PublicKey, blake3::Blake3> {
-            inner: Arc::new(Mutex::new(MempoolInner {
-                pending: Default::default(),
-                pending_bytes: 0,
-                waiters: Default::default(),
-            })),
-            namespace: NAMESPACE,
-            max_pool_bytes: 1024 * 1024,
-            _marker: PhantomData,
-        });
+        let state = Arc::new(
+            RouterState::<blake3::Digest, ed25519::PublicKey, blake3::Blake3> {
+                inner: Arc::new(Mutex::new(MempoolInner {
+                    pending: Default::default(),
+                    pending_bytes: 0,
+                    waiters: Default::default(),
+                })),
+                namespace: NAMESPACE,
+                max_pool_bytes: 1024 * 1024,
+                _marker: PhantomData,
+            },
+        );
         let body = hex(&signed_bytes(0));
 
         let result = accept_tx::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>(
@@ -363,8 +368,7 @@ mod tests {
         )
         .await;
 
-        let (status, Json(SubmissionReceipt { tx_hash })) =
-            result.expect("accept should succeed");
+        let (status, Json(SubmissionReceipt { tx_hash })) = result.expect("accept should succeed");
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(!tx_hash.is_empty());
 
