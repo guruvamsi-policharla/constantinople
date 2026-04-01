@@ -1,0 +1,265 @@
+//! Deployment generator for Constantinople.
+
+mod local;
+mod remote;
+
+use clap::{Args, Parser, Subcommand};
+use commonware_codec::Encode;
+use commonware_cryptography::{
+    Signer,
+    bls12381::{
+        dkg,
+        primitives::{group::Share, variant::MinSig},
+    },
+    ed25519,
+};
+use commonware_utils::{N3f1, TryCollect, hex};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fs,
+    num::{NonZeroU32, NonZeroUsize},
+    path::{Path, PathBuf},
+};
+const STORAGE_CLASS: &str = "gp3";
+const DASHBOARD_FILE: &str = "dashboard.json";
+const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
+const SPAMMER_CONFIG_FILE: &str = "tx-spammer.toml";
+const SPAMMER_INSTANCE_NAME: &str = "tx-spammer";
+
+#[derive(Debug, Parser)]
+#[command(name = "constantinople-deploy")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Generate(GenerateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GenerateArgs {
+    #[arg(long)]
+    validators: u32,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, default_value = "info")]
+    log_level: String,
+    #[arg(long, default_value_t = 2)]
+    worker_threads: usize,
+    #[arg(long)]
+    genesis: Option<PathBuf>,
+    #[command(subcommand)]
+    target: GenerateTarget,
+}
+
+#[derive(Debug, Subcommand)]
+enum GenerateTarget {
+    Local(LocalArgs),
+    Remote(RemoteArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LocalArgs {
+    #[arg(long, default_value_t = 9000)]
+    base_port: u16,
+    #[arg(long, default_value_t = 8080)]
+    base_http_port: u16,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RemoteArgs {
+    #[arg(long)]
+    tag: String,
+    #[arg(long)]
+    validator_binary: PathBuf,
+    #[arg(long, value_delimiter = ',')]
+    regions: Vec<String>,
+    #[arg(long)]
+    instance_type: String,
+    #[arg(long)]
+    storage_size: i32,
+    #[arg(long)]
+    monitoring_instance_type: String,
+    #[arg(long)]
+    monitoring_storage_size: i32,
+    #[arg(long)]
+    dashboard: PathBuf,
+    #[arg(long, default_value_t = 9000)]
+    listen_port: u16,
+    #[arg(long, default_value_t = 8080)]
+    http_port: u16,
+    #[arg(long, default_value_t = false)]
+    profiling: bool,
+    #[arg(long)]
+    spammer_binary: Option<PathBuf>,
+    #[arg(long)]
+    spammer_count: Option<NonZeroUsize>,
+    #[arg(long)]
+    spammer_tps: Option<NonZeroU32>,
+    #[arg(long, default_value_t = 0)]
+    spammer_seed_start: u64,
+    #[arg(long, default_value_t = 0)]
+    spammer_nonce: u64,
+    #[arg(long)]
+    spammer_region: Option<String>,
+    #[arg(long)]
+    spammer_instance_type: Option<String>,
+    #[arg(long)]
+    spammer_storage_size: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BootstrapperEntry {
+    public_key: String,
+    address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NamedBootstrapperEntry {
+    public_key: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct GenesisAllocation {
+    address: String,
+    balance: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenesisFile {
+    #[serde(default)]
+    allocations: Vec<GenesisAllocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ValidatorConfig {
+    private_key: String,
+    dkg_output: String,
+    dkg_share: String,
+    listen: String,
+    genesis_leader: String,
+    partition_prefix: String,
+    num_validators: u32,
+    log_level: String,
+    worker_threads: usize,
+    http_port: u16,
+    max_propose_bytes: usize,
+    max_pool_bytes: usize,
+    bootstrappers: Vec<BootstrapperEntry>,
+    #[serde(default)]
+    genesis_allocations: Vec<GenesisAllocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RemoteValidatorConfig {
+    private_key: String,
+    dkg_output: String,
+    dkg_share: String,
+    listen_port: u16,
+    genesis_leader: String,
+    partition_prefix: String,
+    num_validators: u32,
+    log_level: String,
+    worker_threads: usize,
+    http_port: u16,
+    max_propose_bytes: usize,
+    max_pool_bytes: usize,
+    bootstrappers: Vec<NamedBootstrapperEntry>,
+    #[serde(default)]
+    genesis_allocations: Vec<GenesisAllocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TxSpammerConfig {
+    count: usize,
+    validator_names: Vec<String>,
+    http_port: u16,
+    seed_start: u64,
+    nonce: u64,
+    tps: u32,
+}
+
+pub(crate) struct ClusterMaterial {
+    signers: Vec<ed25519::PrivateKey>,
+    public_keys: Vec<ed25519::PublicKey>,
+    dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
+    shares: BTreeMap<ed25519::PublicKey, Share>,
+    genesis_leader: String,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Generate(args) => match &args.target {
+            GenerateTarget::Local(local_args) => local::generate(args, local_args),
+            GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
+        },
+    }
+}
+
+pub(crate) fn load_genesis_allocations(path: Option<&Path>) -> Vec<GenesisAllocation> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+
+    let raw = fs::read_to_string(path).expect("failed to read genesis file");
+    let parsed: GenesisFile = toml::from_str(&raw).expect("failed to parse genesis file");
+    parsed.allocations
+}
+
+pub(crate) fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .expect("failed to read current directory")
+        .join(path)
+}
+
+pub(crate) fn ensure_output_dir_missing(output_dir: &Path) {
+    if fs::metadata(output_dir).is_ok() {
+        panic!("output directory already exists: {}", output_dir.display());
+    }
+}
+
+pub(crate) fn generate_cluster_material(validators: u32) -> ClusterMaterial {
+    let signers = (0..validators)
+        .map(|index| ed25519::PrivateKey::from_seed(index.into()))
+        .collect::<Vec<_>>();
+    let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
+
+    let participants = public_keys.clone().into_iter().try_collect().unwrap();
+    let mut rng = commonware_utils::test_rng();
+    let (dkg_output, raw_shares) =
+        dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+            .expect("DKG deal failed");
+    let shares = raw_shares.into_iter().collect();
+    let genesis_leader = hex(&public_keys[0].encode());
+
+    ClusterMaterial {
+        signers,
+        public_keys,
+        dkg_output,
+        shares,
+        genesis_leader,
+    }
+}
+
+pub(crate) fn write_toml_config<T: Serialize>(path: &Path, config: &T) {
+    let raw = toml::to_string_pretty(config).expect("failed to serialize config");
+    fs::write(path, raw).expect("failed to write config");
+}
+
+pub(crate) const fn default_max_propose_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+pub(crate) const fn default_max_pool_bytes() -> usize {
+    64 * 1024 * 1024
+}

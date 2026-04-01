@@ -13,19 +13,16 @@ publish = false
 workspace = true
 
 [dependencies]
-constantinople-primitives.workspace = true
-
 commonware-codec.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-deployer.workspace = true
 commonware-utils.workspace = true
 
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+tracing.workspace = true
 
 [[bin]]
 name = "constantinople-deploy"

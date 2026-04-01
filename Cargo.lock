@@ -610,6 +610,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonware-deployer"
+version = "2026.3.0"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#8f4e57cfb972171d2ba662c1070e2430c37593c2"
+dependencies = [
+ "cfg-if",
+ "commonware-macros",
+ "serde",
+]
+
+[[package]]
 name = "commonware-glue"
 version = "2026.3.0"
 source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#8f4e57cfb972171d2ba662c1070e2430c37593c2"
@@ -889,6 +899,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-deploy"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-deployer",
+ "commonware-utils",
+ "serde",
+ "serde_yaml",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "constantinople-engine"
 version = "0.1.0"
 dependencies = [
@@ -964,10 +989,14 @@ dependencies = [
  "clap",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-deployer",
  "commonware-utils",
  "constantinople-primitives",
  "reqwest",
+ "serde",
+ "serde_yaml",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -980,6 +1009,7 @@ dependencies = [
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
+ "commonware-deployer",
  "commonware-glue",
  "commonware-p2p",
  "commonware-parallel",
@@ -990,6 +1020,7 @@ dependencies = [
  "constantinople-mempool",
  "constantinople-primitives",
  "serde",
+ "serde_yaml",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -2985,6 +3016,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha2"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3621,6 +3665,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
