@@ -102,7 +102,24 @@ cargo run --bin constantinople-spammer -- \
 Remote deployments use the same service YAML configs, but networking is resolved from the deployer
 hosts file at runtime.
 
-Generate a remote deployment bundle:
+Build the deployable ARM64 binaries first:
+
+```sh
+docker buildx bake -f docker/docker-bake.hcl constantinople-validator
+docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
+
+docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
+docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
+```
+
+This writes:
+
+- `docker/validator`
+- `docker/validator-debug`
+- `docker/spammer`
+- `docker/spammer-debug`
+
+Then generate a remote deployment bundle:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -111,7 +128,6 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer-count 4096 \
   --spammer-tps 50000 \
   remote \
-  --tag constantinople-testnet \
   --validator-binary ./docker/validator \
   --regions us-east-1,us-west-2 \
   --instance-type c8g.large \
