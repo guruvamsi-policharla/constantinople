@@ -50,6 +50,10 @@ pub fn tx_url(endpoint: &str) -> String {
     format!("{}/tx", endpoint.trim_end_matches('/'))
 }
 
+pub fn accept_tx_url(endpoint: &str) -> String {
+    format!("{}/tx/accept", endpoint.trim_end_matches('/'))
+}
+
 pub async fn submit_transaction(
     client: &reqwest::Client,
     endpoint: &str,
@@ -69,6 +73,30 @@ pub async fn submit_transaction(
 
     if status.is_success() {
         return Ok(body);
+    }
+
+    Err(format!("error ({status}): {body}"))
+}
+
+pub async fn accept_transaction(
+    client: &reqwest::Client,
+    endpoint: &str,
+    tx_bytes: Vec<u8>,
+) -> Result<(), String> {
+    let resp = client
+        .post(accept_tx_url(endpoint))
+        .body(hex(&tx_bytes))
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| format!("response body failed: {err}"))?;
+
+    if status.is_success() {
+        return Ok(());
     }
 
     Err(format!("error ({status}): {body}"))

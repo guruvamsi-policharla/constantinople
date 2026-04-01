@@ -37,3 +37,4 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-math = { workspace = true, features = ["std"] }
 futures = { workspace = true, features = ["std", "executor"] }
 rand.workspace = true
+tower = { version = "0.5", features = ["util"] }

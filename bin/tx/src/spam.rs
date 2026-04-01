@@ -1,15 +1,16 @@
-use crate::shared::{build_signed_transaction_bytes, submit_transaction, tx_url};
+use crate::shared::{accept_transaction, build_signed_transaction_bytes, tx_url};
 use clap::Args as ClapArgs;
 use commonware_cryptography::{Sha256, Signer, ed25519};
 use commonware_utils::hex;
 use constantinople_primitives::Address;
 use std::{
+    collections::VecDeque,
     num::{NonZeroU32, NonZeroUsize},
     time::Duration,
 };
 use tokio::{
     task::JoinSet,
-    time::{self, MissedTickBehavior},
+    time,
 };
 
 #[derive(Debug, ClapArgs)]
@@ -33,8 +34,10 @@ pub struct Args {
 
 #[derive(Debug)]
 struct RingTransfer {
+    sender_index: usize,
     from: Address,
     to: Address,
+    nonce: u64,
     tx_bytes: Vec<u8>,
 }
 
@@ -75,52 +78,82 @@ fn build_ring_accounts(count: NonZeroUsize, seed_start: u64, nonce: u64) -> Vec<
     accounts
 }
 
-fn next_ring_transfer(accounts: &mut [RingAccount], cursor: &mut usize) -> RingTransfer {
-    let sender = &mut accounts[*cursor];
-    let tx_bytes = build_signed_transaction_bytes(&sender.key, sender.to, 1, sender.next_nonce);
-    sender.next_nonce = sender
-        .next_nonce
-        .checked_add(1)
-        .expect("sender nonce overflowed");
+fn next_ring_transfer(accounts: &[RingAccount], ready: &mut VecDeque<usize>) -> Option<RingTransfer> {
+    let sender_index = ready.pop_front()?;
+    let sender = &accounts[sender_index];
 
-    let transfer = RingTransfer {
+    Some(RingTransfer {
+        sender_index,
         from: sender.from,
         to: sender.to,
-        tx_bytes,
-    };
+        nonce: sender.next_nonce,
+        tx_bytes: build_signed_transaction_bytes(&sender.key, sender.to, 1, sender.next_nonce),
+    })
+}
 
-    *cursor = (*cursor + 1) % accounts.len();
-    transfer
+fn handle_submission_result(
+    accounts: &mut [RingAccount],
+    ready: &mut VecDeque<usize>,
+    sender_index: usize,
+    submission: Result<(), String>,
+    completed: &mut usize,
+    failed: &mut usize,
+    from: Address,
+    to: Address,
+    nonce: u64,
+) {
+    *completed += 1;
+    ready.push_back(sender_index);
+
+    if submission.is_ok() {
+        accounts[sender_index].next_nonce = nonce
+            .checked_add(1)
+            .expect("sender nonce overflowed");
+        return;
+    }
+
+    *failed += 1;
+    let from = hex(from.as_ref());
+    let to = hex(to.as_ref());
+    let err = submission.expect_err("failed submission should carry an error");
+    eprintln!("{from} -> {to} nonce={nonce}: {err}");
 }
 
 fn drain_completed_submissions(
-    tasks: &mut JoinSet<(Address, Address, Result<String, String>)>,
+    accounts: &mut [RingAccount],
+    ready: &mut VecDeque<usize>,
+    tasks: &mut JoinSet<(usize, Address, Address, u64, Result<(), String>)>,
     completed: &mut usize,
     failed: &mut usize,
 ) {
     while let Some(result) = tasks.try_join_next() {
-        let (from, to, submission) = result.expect("spam task panicked");
-        *completed += 1;
-
-        if let Err(err) = submission {
-            *failed += 1;
-            let from = hex(from.as_ref());
-            let to = hex(to.as_ref());
-            eprintln!("{from} -> {to}: {err}");
-        }
+        let (sender_index, from, to, nonce, submission) =
+            result.expect("spam task panicked");
+        handle_submission_result(
+            accounts,
+            ready,
+            sender_index,
+            submission,
+            completed,
+            failed,
+            from,
+            to,
+            nonce,
+        );
     }
 }
 
 pub async fn run(args: Args) -> Result<(), String> {
     let mut accounts = build_ring_accounts(args.count, args.seed_start, args.nonce);
-    let mut cursor = 0usize;
+    let mut ready = (0..accounts.len()).collect::<VecDeque<_>>();
     let client = reqwest::Client::new();
     let url = tx_url(&args.endpoint);
     let mut tasks = JoinSet::new();
-    let mut ticker = time::interval(Duration::from_secs_f64(1.0 / f64::from(args.tps.get())));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut completed = 0usize;
     let mut failed = 0usize;
+    let mut dispatched = 0u64;
+    let started = time::Instant::now();
+    let tps = u64::from(args.tps.get());
 
     println!(
         "submitting ring transfers to {url} at {} tx/s. Press Ctrl-C to stop.",
@@ -128,26 +161,80 @@ pub async fn run(args: Args) -> Result<(), String> {
     );
 
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let transfer = next_ring_transfer(&mut accounts, &mut cursor);
-                let client = client.clone();
-                let endpoint = args.endpoint.clone();
+        drain_completed_submissions(
+            &mut accounts,
+            &mut ready,
+            &mut tasks,
+            &mut completed,
+            &mut failed,
+        );
 
-                tasks.spawn(async move {
-                    let RingTransfer { from, to, tx_bytes } = transfer;
-                    let result = submit_transaction(&client, &endpoint, tx_bytes).await;
-                    (from, to, result)
-                });
+        let target = ((started.elapsed().as_nanos() * u128::from(tps)) / 1_000_000_000) as u64;
+        let mut submitted = false;
 
-                drain_completed_submissions(&mut tasks, &mut completed, &mut failed);
+        while dispatched < target {
+            let Some(transfer) = next_ring_transfer(&accounts, &mut ready) else {
+                break;
+            };
+
+            submitted = true;
+            dispatched += 1;
+
+            let client = client.clone();
+            let endpoint = args.endpoint.clone();
+
+            tasks.spawn(async move {
+                let RingTransfer {
+                    sender_index,
+                    from,
+                    to,
+                    nonce,
+                    tx_bytes,
+                } = transfer;
+                let result = accept_transaction(&client, &endpoint, tx_bytes).await;
+                (sender_index, from, to, nonce, result)
+            });
+        }
+
+        if submitted {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        if tasks.is_empty() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("stopping spammer...");
+                    break;
+                }
+                _ = time::sleep(Duration::from_millis(1)) => {}
             }
+            continue;
+        }
+
+        tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("stopping spammer...");
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
                 break;
             }
+            Some(result) = tasks.join_next() => {
+                let (sender_index, from, to, nonce, submission) =
+                    result.expect("spam task panicked");
+                handle_submission_result(
+                    &mut accounts,
+                    &mut ready,
+                    sender_index,
+                    submission,
+                    &mut completed,
+                    &mut failed,
+                    from,
+                    to,
+                    nonce,
+                );
+            }
+            _ = time::sleep(Duration::from_millis(1)) => {}
         }
     }
 
@@ -163,12 +250,12 @@ pub async fn run(args: Args) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ring_accounts, next_ring_transfer};
+    use super::{build_ring_accounts, next_ring_transfer, RingAccount};
     use crate::shared::Digest;
     use commonware_codec::Read;
     use commonware_cryptography::{Sha256, ed25519};
     use constantinople_primitives::{Signed, Transaction, TransactionCfg};
-    use std::num::NonZeroUsize;
+    use std::{collections::VecDeque, num::NonZeroUsize};
 
     #[test]
     fn ring_accounts_wrap_back_to_the_first_account() {
@@ -182,11 +269,12 @@ mod tests {
 
     #[test]
     fn next_ring_transfer_increments_sender_nonce() {
-        let mut accounts = build_ring_accounts(NonZeroUsize::new(2).unwrap(), 11, 7);
-        let mut cursor = 0usize;
+        let accounts = build_ring_accounts(NonZeroUsize::new(2).unwrap(), 11, 7);
+        let mut ready = VecDeque::from(vec![0usize, 1]);
 
-        let first = next_ring_transfer(&mut accounts, &mut cursor);
-        let second = next_ring_transfer(&mut accounts, &mut cursor);
+        let first = next_ring_transfer(&accounts, &mut ready).expect("first transfer should exist");
+        let second =
+            next_ring_transfer(&accounts, &mut ready).expect("second transfer should exist");
 
         let first_decoded = Signed::<
             Transaction<Digest, ed25519::PublicKey>,
@@ -209,7 +297,11 @@ mod tests {
         .expect("second ring transfer should decode");
         assert_eq!(second_decoded.value().nonce, 7);
 
-        let third = next_ring_transfer(&mut accounts, &mut cursor);
+        let mut accounts = accounts;
+        accounts[0].next_nonce = 8;
+        ready.push_back(0);
+
+        let third = next_ring_transfer(&accounts, &mut ready).expect("third transfer should exist");
         let third_decoded = Signed::<
             Transaction<Digest, ed25519::PublicKey>,
             Sha256,
@@ -220,5 +312,19 @@ mod tests {
         .expect("third ring transfer should decode");
         assert_eq!(third.from, first.from);
         assert_eq!(third_decoded.value().nonce, 8);
+    }
+
+    #[test]
+    fn next_ring_transfer_skips_busy_senders() {
+        let accounts: Vec<RingAccount> = build_ring_accounts(NonZeroUsize::new(3).unwrap(), 11, 7);
+        let mut ready = VecDeque::from(vec![1usize, 2]);
+
+        let first = next_ring_transfer(&accounts, &mut ready).expect("first transfer should exist");
+        let second =
+            next_ring_transfer(&accounts, &mut ready).expect("second transfer should exist");
+
+        assert_ne!(first.sender_index, 0);
+        assert_ne!(second.sender_index, 0);
+        assert!(next_ring_transfer(&accounts, &mut ready).is_none());
     }
 }

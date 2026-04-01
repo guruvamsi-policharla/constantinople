@@ -32,6 +32,12 @@ pub struct InclusionReceipt {
     pub height: u64,
 }
 
+/// Immediate submission confirmation returned to HTTP callers.
+#[derive(Debug, serde::Serialize)]
+pub struct SubmissionReceipt {
+    pub tx_hash: String,
+}
+
 /// Mempool size limits.
 #[derive(Debug, Clone, Copy)]
 pub struct MempoolConfig {
@@ -191,32 +197,8 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    let bytes = decode_body_hex(&body)?;
-
-    let tx = SignedTransaction::<P, H>::read_cfg(&mut &bytes[..], &TransactionCfg::default())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad transaction: {e}")))?;
-    let tx = tx
-        .into_verified(state.namespace)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature".to_string()))?;
-
-    let tx_bytes = tx.encode_size();
-    let hash = tx.message_digest().as_ref().to_vec();
-    let tx_hash_hex = hex(&hash);
-
-    let (sender, receiver) = oneshot::channel();
-
-    {
-        let mut inner = state.inner.lock().await;
-        if inner.pending_bytes + tx_bytes > state.max_pool_bytes {
-            warn!(tx_hash = %tx_hash_hex, "mempool full, rejecting transaction");
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "mempool full".to_string()));
-        }
-        inner.pending_bytes += tx_bytes;
-        inner.waiters.insert(hash.clone(), sender);
-        inner.pending.push_back(tx);
-    }
-
-    info!(tx_hash = %tx_hash_hex, "accepted transaction");
+    let tx = decode_transaction(&state, &body)?;
+    let (hash, _tx_hash_hex, receiver) = enqueue_transaction(&state, tx, true).await?;
 
     match tokio::time::timeout(Duration::from_secs(30), receiver).await {
         Ok(Ok(receipt)) => Ok(Json(receipt)),
@@ -230,6 +212,75 @@ where
             Err((StatusCode::REQUEST_TIMEOUT, "inclusion timeout".to_string()))
         }
     }
+}
+
+async fn accept_tx<C, P, H>(
+    State(state): State<Arc<RouterState<C, P, H>>>,
+    body: String,
+) -> Result<(StatusCode, Json<SubmissionReceipt>), (StatusCode, String)>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let tx = decode_transaction(&state, &body)?;
+    let (_hash, tx_hash_hex, _) = enqueue_transaction(&state, tx, false).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmissionReceipt {
+            tx_hash: tx_hash_hex,
+        }),
+    ))
+}
+
+fn decode_transaction<C, P, H>(
+    state: &RouterState<C, P, H>,
+    body: &str,
+) -> Result<PendingTransaction<P, H>, (StatusCode, String)>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let bytes = decode_body_hex(body)?;
+    let tx = SignedTransaction::<P, H>::read_cfg(&mut &bytes[..], &TransactionCfg::default())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad transaction: {e}")))?;
+
+    tx.into_verified(state.namespace)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature".to_string()))
+}
+
+async fn enqueue_transaction<C, P, H>(
+    state: &RouterState<C, P, H>,
+    tx: PendingTransaction<P, H>,
+    wait_for_inclusion: bool,
+) -> Result<(Vec<u8>, String, oneshot::Receiver<InclusionReceipt>), (StatusCode, String)>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let tx_bytes = tx.encode_size();
+    let hash = tx.message_digest().as_ref().to_vec();
+    let tx_hash_hex = hex(&hash);
+    let (sender, receiver) = oneshot::channel();
+
+    {
+        let mut inner = state.inner.lock().await;
+        if inner.pending_bytes + tx_bytes > state.max_pool_bytes {
+            warn!(tx_hash = %tx_hash_hex, "mempool full, rejecting transaction");
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "mempool full".to_string()));
+        }
+
+        inner.pending_bytes += tx_bytes;
+        if wait_for_inclusion {
+            inner.waiters.insert(hash.clone(), sender);
+        }
+        inner.pending.push_back(tx);
+    }
+
+    info!(tx_hash = %tx_hash_hex, "accepted transaction");
+    Ok((hash, tx_hash_hex, receiver))
 }
 
 struct RouterState<C, P, H>
@@ -259,6 +310,92 @@ where
 
     Router::new()
         .route("/tx", post(submit_tx::<C, P, H>))
+        .route("/tx/accept", post(accept_tx::<C, P, H>))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MempoolInner, MempoolConfig, RouterState, SubmissionReceipt, accept_tx, router,
+    };
+    use axum::{Json, body::Body, extract::State, http::{Request, StatusCode}};
+    use commonware_codec::Encode;
+    use commonware_cryptography::{Digest, Signer, blake3, ed25519};
+    use commonware_utils::hex;
+    use constantinople_primitives::{Address, Transaction};
+    use core::{marker::PhantomData, num::NonZeroU64};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    const NAMESPACE: &[u8] = b"mempool-test";
+
+    fn signed_bytes(nonce: u64) -> Vec<u8> {
+        let key = ed25519::PrivateKey::from_seed(7);
+        Transaction {
+            sender: key.public_key(),
+            to: Address::EMPTY,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
+            nonce,
+            _digest: PhantomData::<blake3::Digest>,
+        }
+        .seal_and_sign_verified(&key, NAMESPACE, &mut blake3::Blake3::default())
+        .encode()
+        .to_vec()
+    }
+
+    #[tokio::test]
+    async fn accept_tx_enqueues_without_registering_waiter() {
+        let state = Arc::new(RouterState::<blake3::Digest, ed25519::PublicKey, blake3::Blake3> {
+            inner: Arc::new(Mutex::new(MempoolInner {
+                pending: Default::default(),
+                pending_bytes: 0,
+                waiters: Default::default(),
+            })),
+            namespace: NAMESPACE,
+            max_pool_bytes: 1024 * 1024,
+            _marker: PhantomData,
+        });
+        let body = hex(&signed_bytes(0));
+
+        let result = accept_tx::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>(
+            State(state.clone()),
+            body,
+        )
+        .await;
+
+        let (status, Json(SubmissionReceipt { tx_hash })) =
+            result.expect("accept should succeed");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(!tx_hash.is_empty());
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.pending.len(), 1);
+        assert!(inner.waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_route_returns_immediately() {
+        let mempool = super::Mempool::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
+            NAMESPACE,
+            MempoolConfig {
+                max_propose_bytes: 1024 * 1024,
+                max_pool_bytes: 1024 * 1024,
+            },
+        );
+        let app = router(&mempool);
+        let request = Request::post("/tx/accept")
+            .body(Body::from(hex(&signed_bytes(0))))
+            .expect("request should build");
+
+        use tower::ServiceExt;
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("accept route should respond");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
 }
