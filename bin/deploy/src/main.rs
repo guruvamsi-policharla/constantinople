@@ -14,16 +14,18 @@ use commonware_cryptography::{
     ed25519,
 };
 use commonware_utils::{N3f1, TryCollect, hex};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::BTreeMap,
     fs,
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
+
 const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
+const PEERS_CONFIG_FILE: &str = "peers.toml";
 const SPAMMER_CONFIG_FILE: &str = "spammer.toml";
 const SPAMMER_INSTANCE_NAME: &str = "spammer";
 
@@ -49,6 +51,14 @@ pub(crate) struct GenerateArgs {
     log_level: String,
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
+    #[arg(long)]
+    spammer_count: Option<NonZeroUsize>,
+    #[arg(long)]
+    spammer_tps: Option<NonZeroU32>,
+    #[arg(long, default_value_t = 0)]
+    spammer_seed_start: u64,
+    #[arg(long, default_value_t = 0)]
+    spammer_nonce: u64,
     #[command(subcommand)]
     target: GenerateTarget,
 }
@@ -94,14 +104,6 @@ pub(crate) struct RemoteArgs {
     #[arg(long)]
     spammer_binary: Option<PathBuf>,
     #[arg(long)]
-    spammer_count: Option<NonZeroUsize>,
-    #[arg(long)]
-    spammer_tps: Option<NonZeroU32>,
-    #[arg(long, default_value_t = 0)]
-    spammer_seed_start: u64,
-    #[arg(long, default_value_t = 0)]
-    spammer_nonce: u64,
-    #[arg(long)]
     spammer_region: Option<String>,
     #[arg(long)]
     spammer_instance_type: Option<String>,
@@ -109,37 +111,14 @@ pub(crate) struct RemoteArgs {
     spammer_storage_size: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BootstrapperEntry {
-    public_key: String,
-    address: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedBootstrapperEntry {
     public_key: String,
     name: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ValidatorConfig {
-    private_key: String,
-    dkg_output: String,
-    dkg_share: String,
-    listen: String,
-    genesis_leader: String,
-    partition_prefix: String,
-    num_validators: u32,
-    log_level: String,
-    worker_threads: usize,
-    http_port: u16,
-    max_propose_bytes: usize,
-    max_pool_bytes: usize,
-    bootstrappers: Vec<BootstrapperEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RemoteValidatorConfig {
     private_key: String,
     dkg_output: String,
     dkg_share: String,
@@ -155,8 +134,20 @@ pub(crate) struct RemoteValidatorConfig {
     bootstrappers: Vec<NamedBootstrapperEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TxSpammerConfig {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PeerEntry {
+    name: String,
+    p2p: String,
+    http: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PeersConfig {
+    validators: Vec<PeerEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SpammerConfig {
     count: usize,
     validator_names: Vec<String>,
     http_port: u16,
@@ -226,6 +217,36 @@ pub(crate) fn generate_cluster_material(validators: u32) -> ClusterMaterial {
 pub(crate) fn write_toml_config<T: Serialize>(path: &Path, config: &T) {
     let raw = toml::to_string_pretty(config).expect("failed to serialize config");
     fs::write(path, raw).expect("failed to write config");
+}
+
+pub(crate) fn spammer_enabled(args: &GenerateArgs) -> bool {
+    args.spammer_count.is_some() || args.spammer_tps.is_some()
+}
+
+pub(crate) fn build_spammer_config(
+    args: &GenerateArgs,
+    validator_names: Vec<String>,
+    http_port: u16,
+) -> Option<SpammerConfig> {
+    if !spammer_enabled(args) {
+        return None;
+    }
+
+    let count = args
+        .spammer_count
+        .expect("spammer_count is required when enabling the spammer");
+    let tps = args
+        .spammer_tps
+        .expect("spammer_tps is required when enabling the spammer");
+
+    Some(SpammerConfig {
+        count: count.get(),
+        validator_names,
+        http_port,
+        seed_start: args.spammer_seed_start,
+        nonce: args.spammer_nonce,
+        tps: tps.get(),
+    })
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
