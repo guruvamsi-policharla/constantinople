@@ -13,7 +13,9 @@ use commonware_cryptography::{
     },
     ed25519,
 };
+use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, TryCollect, hex};
+use rand_core::OsRng;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -29,6 +31,8 @@ const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const SPAMMER_INSTANCE_NAME: &str = "spammer";
+const VALIDATOR_BINARY_FILE: &str = "validator";
+const DEFAULT_BOOTSTRAPPERS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
@@ -52,9 +56,9 @@ pub(crate) struct GenerateArgs {
     log_level: String,
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
-    #[arg(long)]
+    #[arg(long, requires = "spammer_tps")]
     spammer_count: Option<NonZeroUsize>,
-    #[arg(long)]
+    #[arg(long, requires = "spammer_count")]
     spammer_tps: Option<NonZeroU32>,
     #[arg(long, default_value_t = 0)]
     spammer_seed_start: u64,
@@ -98,6 +102,8 @@ pub(crate) struct RemoteArgs {
     listen_port: u16,
     #[arg(long, default_value_t = 8080)]
     http_port: u16,
+    #[arg(long = "http-cidr", value_delimiter = ',')]
+    http_cidrs: Vec<String>,
     #[arg(long, default_value_t = false)]
     profiling: bool,
     #[arg(long)]
@@ -190,16 +196,30 @@ pub(crate) fn ensure_output_dir_missing(output_dir: &Path) {
     }
 }
 
-pub(crate) fn generate_cluster_material(validators: u32) -> ClusterMaterial {
+pub(crate) fn generate_local_cluster_material(validators: u32) -> ClusterMaterial {
     let signers = (0..validators)
         .map(|index| ed25519::PrivateKey::from_seed(index.into()))
         .collect::<Vec<_>>();
+    build_cluster_material(signers, &mut commonware_utils::test_rng())
+}
+
+pub(crate) fn generate_remote_cluster_material(validators: u32) -> ClusterMaterial {
+    let mut signers = (0..validators)
+        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .collect::<Vec<_>>();
+    signers.sort_by_key(Signer::public_key);
+    build_cluster_material(signers, &mut OsRng)
+}
+
+fn build_cluster_material(
+    signers: Vec<ed25519::PrivateKey>,
+    rng: &mut impl rand_core::CryptoRngCore,
+) -> ClusterMaterial {
     let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
 
     let participants = public_keys.clone().into_iter().try_collect().unwrap();
-    let mut rng = commonware_utils::test_rng();
     let (dkg_output, raw_shares) =
-        dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+        dkg::deal::<MinSig, _, N3f1>(rng, Default::default(), participants)
             .expect("DKG deal failed");
     let shares = raw_shares.into_iter().collect();
     let genesis_leader = hex(&public_keys[0].encode());
@@ -216,6 +236,22 @@ pub(crate) fn generate_cluster_material(validators: u32) -> ClusterMaterial {
 pub(crate) fn write_yaml_config<T: Serialize>(path: &Path, config: &T) {
     let raw = serde_yaml::to_string(config).expect("failed to serialize config");
     fs::write(path, raw).expect("failed to write config");
+}
+
+pub(crate) fn default_bootstrappers(
+    public_keys: &[ed25519::PublicKey],
+) -> Vec<NamedBootstrapperEntry> {
+    public_keys
+        .iter()
+        .take(DEFAULT_BOOTSTRAPPERS.min(public_keys.len()))
+        .map(|public_key| {
+            let name = hex(&public_key.encode());
+            NamedBootstrapperEntry {
+                public_key: name.clone(),
+                name,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn spammer_enabled(args: &GenerateArgs) -> bool {
@@ -263,4 +299,69 @@ pub(crate) fn generate_deployer_tag() -> String {
         .as_nanos();
     let process_id = std::process::id();
     format!("{timestamp:x}-{process_id:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, GenerateTarget};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn generate_requires_matching_spammer_flags() {
+        let result = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-count",
+            "128",
+            "local",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remote_parses_http_cidrs() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--validator-binary",
+            "validator",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+            "--http-cidr",
+            "10.0.0.0/8,198.51.100.4/32",
+        ])
+        .expect("remote invocation should parse");
+
+        let Command::Generate(generate) = cli.command;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+
+        assert_eq!(remote.validator_binary, PathBuf::from("validator"));
+        assert_eq!(
+            remote.http_cidrs,
+            vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
+        );
+    }
 }

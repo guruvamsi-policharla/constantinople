@@ -129,23 +129,36 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer-tps 50000 \
   remote \
   --validator-binary ./docker/validator \
+  --http-cidr 0.0.0.0/0 \
+  --spammer-binary ./docker/spammer \
   --regions us-east-1,us-west-2 \
   --instance-type c8g.large \
   --storage-size 25 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./monitoring/dashboard.json \
-  --spammer-binary ./docker/spammer
+  --dashboard ./monitoring/dashboard.json
 ```
 
 This writes:
 
+- copied deployable binaries:
+  - `validator`
+  - optionally `spammer`
 - one validator YAML config per validator
 - optionally `spammer.yaml`
 - `config.yaml` for `commonware-deployer`
 - a copied dashboard file for monitoring
 
-The deploy command then prints the `commonware-deployer` command to run.
+The deploy command then prints the exact commands to run:
+
+```sh
+cd ./deploy
+deployer aws create --config config.yaml
+```
+
+`--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments. If you
+deploy a spammer alongside the validators, you must explicitly decide what CIDR(s) should be able
+to submit transactions.
 
 ### Runtime Interfaces
 

@@ -1,8 +1,8 @@
 use crate::{
     ClusterMaterial, GenerateArgs, LocalArgs, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     SPAMMER_CONFIG_FILE, ValidatorConfig, absolute_path, build_spammer_config,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_cluster_material, write_yaml_config,
+    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -20,7 +20,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
 
-    let material = generate_cluster_material(args.validators);
+    let material = generate_local_cluster_material(args.validators);
     let validators = build_validators(args, local, &output_dir, &material);
     let peers = PeersConfig {
         validators: validators
@@ -57,6 +57,8 @@ fn build_validators(
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
 
+    let bootstrappers = default_bootstrappers(&material.public_keys);
+
     for index in 0..args.validators {
         let validator_index = index as usize;
         let public_key = &material.public_keys[validator_index];
@@ -74,20 +76,6 @@ fn build_validators(
             .checked_add(index as u16)
             .expect("http port overflow");
 
-        let bootstrappers = material
-            .public_keys
-            .iter()
-            .enumerate()
-            .filter(|(peer_index, _)| *peer_index != validator_index)
-            .map(|(_, peer_key)| {
-                let name = hex(&peer_key.encode());
-                crate::NamedBootstrapperEntry {
-                    public_key: name.clone(),
-                    name,
-                }
-            })
-            .collect();
-
         let config = ValidatorConfig {
             private_key: hex(&material.signers[validator_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -101,7 +89,7 @@ fn build_validators(
             http_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
-            bootstrappers,
+            bootstrappers: bootstrappers.clone(),
         };
 
         validators.push(GeneratedValidator {

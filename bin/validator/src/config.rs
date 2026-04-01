@@ -81,6 +81,7 @@ pub struct LoadedConfig {
     pub worker_threads: usize,
     pub http_listen: SocketAddr,
     pub json_logs: bool,
+    pub deployer_managed: bool,
     pub max_propose_bytes: usize,
     pub max_pool_bytes: usize,
 }
@@ -161,6 +162,7 @@ fn decode_with_network(
         worker_threads: config.worker_threads,
         http_listen,
         json_logs,
+        deployer_managed: json_logs,
         max_propose_bytes: config.max_propose_bytes,
         max_pool_bytes: config.max_pool_bytes,
     }
@@ -238,7 +240,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 
 #[cfg(test)]
 mod tests {
-    use super::{NamedBootstrapperEntry, ValidatorConfig, load_local_config};
+    use super::{NamedBootstrapperEntry, ValidatorConfig, load_deployer_config, load_local_config};
     use commonware_codec::Encode;
     use commonware_cryptography::{
         Signer,
@@ -330,6 +332,7 @@ mod tests {
         let loaded = load_local_config(&peers_path, &config_path);
 
         assert!(!loaded.json_logs);
+        assert!(!loaded.deployer_managed);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
@@ -343,5 +346,88 @@ mod tests {
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);
+    }
+
+    #[test]
+    fn deployer_config_resolves_bootstrapper_hosts() {
+        let validators = (0_u64..2)
+            .map(ed25519::PrivateKey::from_seed)
+            .collect::<Vec<_>>();
+        let public_keys = validators
+            .iter()
+            .map(Signer::public_key)
+            .collect::<Vec<_>>();
+        let participants = public_keys.clone().into_iter().try_collect().unwrap();
+        let mut rng = commonware_utils::test_rng();
+        let (dkg_output, raw_shares) =
+            dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+                .expect("DKG deal failed");
+        let shares = raw_shares
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, Share>>();
+        let signer = &validators[0];
+        let public_key = signer.public_key();
+        let share = shares.get(&public_key).expect("missing share");
+        let peer_name = hex(&public_keys[1].encode());
+        let self_name = hex(&public_key.encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let hosts_path = temp_path("validator-hosts", ".yaml");
+
+        let config = ValidatorConfig {
+            private_key: hex(&signer.encode()),
+            dkg_output: hex(&dkg_output.encode()),
+            dkg_share: hex(&share.encode()),
+            listen_port: 9000,
+            genesis_leader: hex(&public_key.encode()),
+            partition_prefix: "validator-0".to_string(),
+            num_validators: 2,
+            log_level: "info".to_string(),
+            worker_threads: 2,
+            http_port: 8080,
+            max_propose_bytes: super::default_max_propose_bytes(),
+            max_pool_bytes: super::default_max_pool_bytes(),
+            bootstrappers: vec![NamedBootstrapperEntry {
+                public_key: peer_name.clone(),
+                name: peer_name.clone(),
+            }],
+        };
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &hosts_path,
+            format!(
+                r#"monitoring: 10.0.0.1
+hosts:
+  - name: "{self_name}"
+    region: us-east-1
+    ip: 203.0.113.1
+  - name: "{peer_name}"
+    region: us-west-2
+    ip: 203.0.113.2
+"#,
+            ),
+        )
+        .expect("hosts should write");
+
+        let loaded = load_deployer_config(&hosts_path, &config_path);
+
+        assert!(loaded.json_logs);
+        assert!(loaded.deployer_managed);
+        assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
+        assert_eq!(
+            loaded.decoded.listen_advertise,
+            "203.0.113.1:9000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            loaded.decoded.bootstrappers[0].1,
+            commonware_p2p::Ingress::Socket("203.0.113.2:9000".parse().unwrap())
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(hosts_path);
     }
 }

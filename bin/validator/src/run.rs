@@ -59,6 +59,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         worker_threads,
         http_listen,
         json_logs,
+        deployer_managed,
         max_propose_bytes,
         max_pool_bytes,
     } = config;
@@ -97,8 +98,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             pks
         };
 
-        let (mut network, mut oracle) = discovery::Network::new(
-            context.with_label("p2p"),
+        let p2p_config = if deployer_managed {
+            discovery::Config::recommended(
+                decoded.signer.clone(),
+                b"constantinople",
+                decoded.listen_bind,
+                Ingress::Socket(decoded.listen_advertise),
+                decoded.bootstrappers,
+                12 * 1024 * 1024,
+            )
+        } else {
             discovery::Config::local(
                 decoded.signer.clone(),
                 b"constantinople",
@@ -106,8 +115,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
                 12 * 1024 * 1024,
-            ),
-        );
+            )
+        };
+
+        let (mut network, mut oracle) =
+            discovery::Network::new(context.with_label("p2p"), p2p_config);
 
         oracle
             .track(0, all_pks.into_iter().try_collect().unwrap())
