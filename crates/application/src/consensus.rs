@@ -725,7 +725,7 @@ mod tests {
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::{
-            fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+            fixed::Config as FixedJournalConfig,
         },
         mmr,
         mmr::journaled::Config as MmrConfig,
@@ -846,12 +846,10 @@ mod tests {
                 thread_pool: None,
                 page_cache: page_cache.clone(),
             },
-            log: VariableJournalConfig {
+            log: FixedJournalConfig {
                 partition: format!("tx-log-{suffix}"),
-                items_per_section: NZU64!(7),
-                compression: None,
-                codec_config: (),
                 page_cache,
+                items_per_blob: NZU64!(7),
                 write_buffer: NZUsize!(1024),
             },
             translator: EightCap,

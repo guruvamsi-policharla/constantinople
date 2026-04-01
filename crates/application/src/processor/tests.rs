@@ -138,6 +138,33 @@ fn self_transfer_only_bumps_nonce() {
 }
 
 #[test]
+fn self_transfer_is_included_and_preserves_balance() {
+    let signer = TestSigner::new();
+    let mut accounts = HashMap::new();
+    accounts.insert(signer.address, account(12, 5));
+
+    let transaction = signer.sign(signer.address, 7, 5);
+    let processor = processor();
+    let proposal = processor.propose(State::new(accounts.clone()), vec![transaction]);
+
+    assert_eq!(proposal.valid.len(), 1);
+    assert!(proposal.invalid.is_empty());
+    assert_eq!(
+        changeset_account(&proposal.changeset, signer.address),
+        Some(account(12, 6))
+    );
+
+    let output = processor
+        .execute(State::new(accounts), &proposal.valid)
+        .expect("self-transfer should execute successfully");
+    assert_eq!(
+        changeset_account(&output.changeset, signer.address),
+        Some(account(12, 6))
+    );
+    assert_eq!(proposal.changeset, output.changeset);
+}
+
+#[test]
 fn missing_recipient_starts_with_default_balance() {
     let signer = TestSigner::new();
     let recipient = TestSigner::new();
