@@ -151,7 +151,10 @@ fn missing_recipient_starts_with_default_balance() {
         vec![signer.sign(recipient.address, 4, 0)],
     );
     let output = processor
-        .execute(State::from_loaded(accounts, loaded_addresses), &proposal.valid)
+        .execute(
+            State::from_loaded(accounts, loaded_addresses),
+            &proposal.valid,
+        )
         .expect("valid proposal transactions should execute");
 
     assert_eq!(
