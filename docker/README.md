@@ -37,8 +37,8 @@ docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
 
 This writes:
 
-* `docker/validator`
-* `docker/validator-debug`
+* `deploy/validator`
+* `deploy/validator-debug`
 
 #### Build Spammer Binary
 
@@ -49,8 +49,8 @@ docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
 
 This writes:
 
-* `docker/spammer`
-* `docker/spammer-debug`
+* `deploy/spammer`
+* `deploy/spammer-debug`
 
 #### Troubleshooting
 

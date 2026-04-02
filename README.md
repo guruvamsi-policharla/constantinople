@@ -118,10 +118,10 @@ docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
 
 This writes:
 
-- `docker/validator`
-- `docker/validator-debug`
-- `docker/spammer`
-- `docker/spammer-debug`
+- `deploy/validator`
+- `deploy/validator-debug`
+- `deploy/spammer`
+- `deploy/spammer-debug`
 
 Then generate a remote deployment bundle:
 
@@ -134,9 +134,9 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer-count 4096 \
   --spammer-tps 32768 \
   remote \
-  --validator-binary ./docker/validator \
+  --validator-binary ./deploy/validator \
   --http-cidr 0.0.0.0/0 \
-  --spammer-binary ./docker/spammer \
+  --spammer-binary ./deploy/spammer \
   --regions us-east-1,us-west-2 \
   --instance-type c8g.2xlarge \
   --storage-size 75 \

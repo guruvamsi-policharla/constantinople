@@ -32,4 +32,4 @@ ENV OUTPUT_NAME="${OUTPUT_NAME}"
 WORKDIR /constantinople
 
 ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target aarch64-unknown-linux-gnu && cp target/aarch64-unknown-linux-gnu/release/${BINARY_NAME} docker/${OUTPUT_NAME}-debug && strip -o docker/${OUTPUT_NAME} docker/${OUTPUT_NAME}-debug"]
+CMD ["mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target aarch64-unknown-linux-gnu && cp target/aarch64-unknown-linux-gnu/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && strip -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]
