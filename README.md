@@ -9,7 +9,6 @@ simple blockchain that supports only account-to-account transfers.
 ```
 bin/
   validator/        CLI that assembles and runs a validator node
-  spammer/          `constantinople-spammer` transaction spammer
 
 crates/
   primitives/       Core types: blocks, transactions, and accounts
@@ -38,7 +37,7 @@ account model:
   balance transfers and sender nonce increments.
 - **Execution model**: blocks execute as a simple sequential in-memory account update pass.
 
-### Mempool and Spammer
+### Mempool
 
 - **Mempool core**: `crates/mempool` uses a FIFO queue with hash-indexed entries, lease batches,
   direct in-flight retries, lazy tombstones, and recent terminal status caching so proposal and
@@ -46,9 +45,6 @@ account model:
 - **Hot-path HTTP**: validators keep compatibility routes for single hex transactions, and also
   expose `POST /tx/accept_batch` plus `POST /tx/wait_batch` for binary batch ingestion and
   long-poll batch status waits.
-- **Round driver**: `constantinople-spammer` builds a ring of accounts, submits one transfer per
-  account with `nonce = base_nonce + round`, waits for the whole round to be included, and only
-  retries ambiguous outcomes using the exact same signed bytes.
 
 ## Quick Start
 
@@ -71,7 +67,6 @@ This writes:
 
 - `validator-0.yaml`, `validator-1.yaml`, ...
 - `peers.yaml`
-- optionally `spammer.yaml` if `--spammer-count` is supplied
 
 It also prints an `mprocs` command that starts the whole local cluster.
 
@@ -92,31 +87,11 @@ cargo run --bin constantinople -- --config ./local/validator-2.yaml --peers ./lo
 cargo run --bin constantinople -- --config ./local/validator-3.yaml --peers ./local/peers.yaml
 ```
 
-To generate a local cluster plus a spammer config:
-
-```sh
-cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
-  --output-dir ./local \
-  --worker-threads 2 \
-  --rayon-threads 2 \
-  --spammer-count 128 \
-  local
-```
-
-Then use the printed `mprocs` command, or run the spammer against the local peer topology:
-
-```sh
-cargo run --bin constantinople-spammer -- \
-  --config ./local/spammer.yaml \
-  --peers ./local/peers.yaml
-```
-
 ### Remote Deployment
 
 Remote deployments use the same service YAML configs, but networking is resolved from the deployer
 hosts file at runtime. `generate remote` does not build binaries. It only writes the deployment
-bundle, and you build `validator` and optional `spammer` into that same directory afterwards.
+bundle, and you build `validator` into that directory afterwards.
 
 Generate the remote deployment bundle first:
 
@@ -126,7 +101,6 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
-  --spammer-count 4096 \
   remote \
   --http-cidr 0.0.0.0/0 \
   --regions us-east-1,us-west-2 \
@@ -140,7 +114,6 @@ cargo run --bin constantinople-deploy -- generate \
 The generate step writes:
 
 - one validator YAML config per validator
-- optionally `spammer.yaml`
 - `config.yaml` for `commonware-deployer`
 - a copied dashboard file for monitoring
 
@@ -154,8 +127,6 @@ The Docker build step then writes:
 
 - `deploy/validator`
 - `deploy/validator-debug`
-- `deploy/spammer`
-- `deploy/spammer-debug`
 
 The deploy command then prints the exact commands to run:
 
@@ -164,9 +135,7 @@ cd ./deploy
 deployer aws create --config config.yaml
 ```
 
-`--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments. If you
-deploy a spammer alongside the validators, you must explicitly decide what CIDR(s) should be able
-to submit transactions.
+`--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments.
 
 ### Runtime Interfaces
 
@@ -175,13 +144,6 @@ Validator:
 ```sh
 constantinople --config ./validator.yaml --peers ./peers.yaml
 constantinople --config ./validator.yaml --hosts ./hosts.yaml
-```
-
-Spammer:
-
-```sh
-constantinople-spammer --config ./spammer.yaml --peers ./peers.yaml
-constantinople-spammer --config ./spammer.yaml --hosts ./hosts.yaml
 ```
 
 ## Development

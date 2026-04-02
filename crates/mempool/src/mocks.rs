@@ -1,10 +1,10 @@
 //! Mock transaction sources for tests.
 
-use crate::{PendingTransaction, TransactionSource};
+use crate::TransactionSource;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
-use constantinople_primitives::Header;
+use constantinople_primitives::{Header, VerifiedTransaction};
 use core::{
     future::{Future, ready},
     marker::PhantomData,
@@ -18,7 +18,7 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: VecDeque<Vec<PendingTransaction<P, H>>>,
+    proposals: VecDeque<Vec<VerifiedTransaction<P, H>>>,
     _marker: PhantomData<C>,
 }
 
@@ -29,7 +29,7 @@ where
     H: Hasher,
 {
     /// Creates a new static source from queued proposal batches.
-    pub fn new(proposals: Vec<Vec<PendingTransaction<P, H>>>) -> Self {
+    pub fn new(proposals: Vec<Vec<VerifiedTransaction<P, H>>>) -> Self {
         Self {
             proposals: proposals.into(),
             _marker: PhantomData,
@@ -37,7 +37,7 @@ where
     }
 
     /// Appends another proposal batch to the queue.
-    pub fn push(&mut self, transactions: Vec<PendingTransaction<P, H>>) {
+    pub fn push(&mut self, transactions: Vec<VerifiedTransaction<P, H>>) {
         self.proposals.push_back(transactions);
     }
 }
@@ -53,7 +53,7 @@ where
         &mut self,
         _parent: &Header<C, H::Digest, P>,
         _context: &Context<C, P>,
-    ) -> impl Future<Output = Vec<PendingTransaction<P, H>>> + Send {
+    ) -> impl Future<Output = Vec<VerifiedTransaction<P, H>>> + Send {
         ready(self.proposals.pop_front().unwrap_or_default())
     }
 }

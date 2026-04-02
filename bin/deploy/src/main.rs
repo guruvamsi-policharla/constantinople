@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -31,8 +30,6 @@ const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
-const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
-const SPAMMER_INSTANCE_NAME: &str = "spammer";
 const VALIDATOR_BINARY_FILE: &str = "validator";
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 
@@ -70,12 +67,6 @@ pub(crate) struct GenerateArgs {
     rayon_threads: usize,
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
-    #[arg(long)]
-    spammer_count: Option<NonZeroUsize>,
-    #[arg(long, default_value_t = 0)]
-    spammer_seed_start: u64,
-    #[arg(long, default_value_t = 0)]
-    spammer_nonce: u64,
     #[command(subcommand)]
     target: GenerateTarget,
 }
@@ -118,12 +109,6 @@ pub(crate) struct RemoteArgs {
     http_cidrs: Vec<String>,
     #[arg(long, default_value_t = false)]
     profiling: bool,
-    #[arg(long)]
-    spammer_region: Option<String>,
-    #[arg(long)]
-    spammer_instance_type: Option<String>,
-    #[arg(long)]
-    spammer_storage_size: Option<i32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -162,15 +147,6 @@ pub(crate) struct PeerEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PeersConfig {
     validators: Vec<PeerEntry>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SpammerConfig {
-    count: usize,
-    validator_names: Vec<String>,
-    http_port: u16,
-    seed_start: u64,
-    nonce: u64,
 }
 
 pub(crate) struct ClusterMaterial {
@@ -276,32 +252,6 @@ pub(crate) fn default_bootstrappers(
         .collect()
 }
 
-pub(crate) const fn spammer_enabled(args: &GenerateArgs) -> bool {
-    args.spammer_count.is_some()
-}
-
-pub(crate) fn build_spammer_config(
-    args: &GenerateArgs,
-    validator_names: Vec<String>,
-    http_port: u16,
-) -> Option<SpammerConfig> {
-    if !spammer_enabled(args) {
-        return None;
-    }
-
-    let count = args
-        .spammer_count
-        .expect("spammer_count is required when enabling the spammer");
-
-    Some(SpammerConfig {
-        count: count.get(),
-        validator_names,
-        http_port,
-        seed_start: args.spammer_seed_start,
-        nonce: args.spammer_nonce,
-    })
-}
-
 pub(crate) const fn default_max_propose_bytes() -> usize {
     4 * 1024 * 1024
 }
@@ -323,23 +273,6 @@ pub(crate) fn generate_deployer_tag() -> String {
 mod tests {
     use super::{Cli, Command, GenerateTarget};
     use clap::Parser;
-
-    #[test]
-    fn generate_accepts_spammer_count_without_tps() {
-        let result = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-count",
-            "128",
-            "local",
-        ]);
-
-        assert!(result.is_ok());
-    }
 
     #[test]
     fn remote_parses_http_cidrs() {

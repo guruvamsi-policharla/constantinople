@@ -17,6 +17,7 @@ constantinople-engine.workspace = true
 constantinople-application.workspace = true
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
+commonware-macros.workspace = true
 
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
@@ -36,6 +37,7 @@ serde_yaml = "0.9"
 tracing.workspace = true
 tracing-subscriber = "0.3"
 tokio = { version = "1.50", features = ["full"] }
+rand_core.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

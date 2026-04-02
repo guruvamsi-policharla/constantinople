@@ -3,11 +3,10 @@
 
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use constantinople_primitives::{Block, Header, Sealed, SignedTransaction, VerifiedTransaction};
+use constantinople_primitives::{Block, Header, Sealed, VerifiedTransaction};
 use std::future::Future;
 
 pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
-pub type PendingTransaction<P, H> = VerifiedTransaction<P, H>;
 
 /// Supplies transactions for block proposals and finalized block updates.
 pub trait TransactionSource<C, P, H>:
@@ -22,11 +21,8 @@ where
         &mut self,
         parent: &Header<C, H::Digest, P>,
         context: &Context<C, P>,
-    ) -> impl Future<Output = Vec<PendingTransaction<P, H>>> + Send;
+    ) -> impl Future<Output = Vec<VerifiedTransaction<P, H>>> + Send;
 }
 
 #[cfg(feature = "mocks")]
 pub mod mocks;
-
-mod core;
-pub mod server;

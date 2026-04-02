@@ -1,7 +1,6 @@
 use crate::{
-    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
-    SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS, VALIDATOR_BINARY_FILE,
-    ValidatorConfig, absolute_path, build_spammer_config, default_bootstrappers,
+    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs, STORAGE_CLASS,
+    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
     default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
     generate_deployer_tag, generate_remote_cluster_material, write_yaml_config,
 };
@@ -21,10 +20,6 @@ struct GeneratedValidator {
     config: ValidatorConfig,
 }
 
-struct SpammerDeployment {
-    instance: aws::InstanceConfig,
-}
-
 pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     assert!(args.validators >= 1, "need at least one validator");
     assert!(!remote.regions.is_empty(), "need at least one region");
@@ -39,34 +34,16 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     let dashboard = absolute_path(&remote.dashboard);
     let material = generate_remote_cluster_material(args.validators);
     let validators = build_validators(args, remote, &output_dir, &material);
-    let spammer_config = build_spammer_config(
-        args,
-        validators
-            .iter()
-            .map(|validator| validator.public_key_hex.clone())
-            .collect(),
-        remote.http_port,
-    );
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
         write_yaml_config(&validator.config_file, &validator.config);
     }
-    if let Some(spammer_config) = spammer_config.as_ref() {
-        write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer_config);
-    }
 
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
     fs::copy(&dashboard, &copied_dashboard).expect("failed to copy dashboard");
-    let spammer = build_spammer_deployment(args, remote);
-
-    let deployer_config = build_deployer_config(
-        remote,
-        VALIDATOR_BINARY_FILE,
-        DASHBOARD_FILE,
-        &validators,
-        spammer,
-    );
+    let deployer_config =
+        build_deployer_config(remote, VALIDATOR_BINARY_FILE, DASHBOARD_FILE, &validators);
     let config_path = output_dir.join(DEPLOYER_CONFIG_FILE);
     let raw = serde_yaml::to_string(&deployer_config).expect("failed to serialize deployer config");
     fs::write(&config_path, raw).expect("failed to write deployer config");
@@ -74,21 +51,12 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     info!(
         output_dir = %output_dir.display(),
         validators = args.validators,
-        spammer = crate::spammer_enabled(args),
         "generated remote deployment bundle"
     );
-    if crate::spammer_enabled(args) {
-        info!(
-            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-            spammer_binary = %output_dir.join(SPAMMER_INSTANCE_NAME).display(),
-            "build ARM64 binaries into the deployment directory before creating the remote deployment"
-        );
-    } else {
-        info!(
-            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-            "build the validator ARM64 binary into the deployment directory before creating the remote deployment"
-        );
-    }
+    info!(
+        validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
+        "build the validator ARM64 binary into the deployment directory before creating the remote deployment"
+    );
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -145,39 +113,13 @@ fn build_validators(
     validators
 }
 
-fn build_spammer_deployment(args: &GenerateArgs, remote: &RemoteArgs) -> Option<SpammerDeployment> {
-    if !crate::spammer_enabled(args) {
-        return None;
-    }
-
-    Some(SpammerDeployment {
-        instance: aws::InstanceConfig {
-            name: SPAMMER_INSTANCE_NAME.to_string(),
-            region: remote
-                .spammer_region
-                .clone()
-                .unwrap_or_else(|| remote.regions[0].clone()),
-            instance_type: remote
-                .spammer_instance_type
-                .clone()
-                .unwrap_or_else(|| remote.instance_type.clone()),
-            storage_size: remote.spammer_storage_size.unwrap_or(remote.storage_size),
-            storage_class: STORAGE_CLASS.to_string(),
-            binary: SPAMMER_INSTANCE_NAME.to_string(),
-            config: SPAMMER_CONFIG_FILE.to_string(),
-            profiling: false,
-        },
-    })
-}
-
 fn build_deployer_config(
     remote: &RemoteArgs,
     validator_binary: &str,
     dashboard: &str,
     validators: &[GeneratedValidator],
-    spammer: Option<SpammerDeployment>,
 ) -> aws::Config {
-    let mut instances = validators
+    let instances = validators
         .iter()
         .enumerate()
         .map(|(index, validator)| aws::InstanceConfig {
@@ -191,10 +133,6 @@ fn build_deployer_config(
             profiling: remote.profiling,
         })
         .collect::<Vec<_>>();
-
-    if let Some(spammer) = spammer {
-        instances.push(spammer.instance);
-    }
 
     aws::Config {
         tag: generate_deployer_tag(),
@@ -229,13 +167,12 @@ fn port_configs(remote: &RemoteArgs) -> Vec<aws::PortConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_spammer_deployment, port_configs};
+    use super::{build_deployer_config, port_configs};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs, SPAMMER_INSTANCE_NAME, STORAGE_CLASS,
-        StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
-        default_max_propose_bytes,
+        GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs, STORAGE_CLASS, StartupModeConfig,
+        VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
     };
-    use std::{num::NonZeroUsize, path::PathBuf};
+    use std::path::PathBuf;
 
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
@@ -245,9 +182,6 @@ mod tests {
             worker_threads: 2,
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
-            spammer_count: Some(NonZeroUsize::new(64).unwrap()),
-            spammer_seed_start: 7,
-            spammer_nonce: 11,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -268,9 +202,6 @@ mod tests {
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             profiling: true,
-            spammer_region: Some("us-west-2".to_string()),
-            spammer_instance_type: Some("c8g.xlarge".to_string()),
-            spammer_storage_size: Some(50),
         }
     }
 
@@ -301,39 +232,22 @@ mod tests {
     }
 
     #[test]
-    fn remote_spammer_defaults_to_validator_shape() {
-        let args = generate_args();
-        let remote = remote_args();
-        let spammer = build_spammer_deployment(&args, &remote).unwrap();
-
-        assert_eq!(spammer.instance.name, SPAMMER_INSTANCE_NAME);
-        assert_eq!(spammer.instance.binary, SPAMMER_INSTANCE_NAME);
-        assert_eq!(spammer.instance.region, "us-west-2");
-        assert_eq!(spammer.instance.instance_type, "c8g.xlarge");
-        assert_eq!(spammer.instance.storage_size, 50);
-    }
-
-    #[test]
-    fn remote_deployer_config_includes_spammer_when_present() {
+    fn remote_deployer_config_only_includes_validators() {
         let args = generate_args();
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
-        let spammer = build_spammer_deployment(&args, &remote);
-
         let config = build_deployer_config(
             &remote,
             VALIDATOR_BINARY_FILE,
             "dashboard.json",
             &validators,
-            spammer,
         );
 
         assert!(!config.tag.is_empty());
-        assert_eq!(config.instances.len(), args.validators as usize + 1);
+        assert_eq!(config.instances.len(), args.validators as usize);
         assert_eq!(config.instances[0].region, "us-east-1");
         assert_eq!(config.instances[1].region, "us-west-2");
         assert_eq!(config.instances[2].region, "us-east-1");
-        assert_eq!(config.instances[3].name, SPAMMER_INSTANCE_NAME);
         assert_eq!(config.instances[0].storage_class, STORAGE_CLASS);
         assert_eq!(config.instances[0].binary, VALIDATOR_BINARY_FILE);
         assert_eq!(config.instances[0].config, "validator-0.yaml");

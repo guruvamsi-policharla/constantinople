@@ -55,7 +55,7 @@ use constantinople_primitives::{
     VerifiedBlock, VerifiedTransaction,
 };
 use core::fmt;
-use futures::StreamExt;
+use futures::{StreamExt, future::try_join_all};
 use prometheus_client::metrics::counter::Counter;
 use rand::Rng;
 use std::{
@@ -67,19 +67,23 @@ use std::{
 use thiserror::Error;
 use tracing::{info, warn};
 
-/// Shared QMDB handle for the application state database.
-pub(crate) type StateDatabase<E, H, T> =
-    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
+/// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
+///
+/// Different platforms have different `SystemTime` limits, so we use a fixed
+/// timestamp to ensure consistent application of block validity rules.
+const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
+
 /// Signed transaction carried by the wire block format.
 type WireTransaction<H, P> = SignedTransaction<P, H>;
+
 /// Sealed block carried across the wire and through consensus.
 type WireBlock<C, P, H> = Sealed<SignedBlock<C, P, H>, H>;
+
 /// In-memory verified block used during execution.
 type ExecutionBlock<C, P, H> = VerifiedBlock<C, P, H>;
-type TransactionJournal<E, H> = FixedJournal<
-    E,
-    commonware_storage::qmdb::immutable::fixed::Operation<<H as Hasher>::Digest, ()>,
->;
+
+/// Shared QMDB handle for the application state database.
+type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
 /// Shared immutable transaction database handle.
 type TransactionDatabase<E, H> = Arc<
@@ -94,21 +98,12 @@ type TransactionDatabase<E, H> = Arc<
         >,
     >,
 >;
+
 /// The pair of backing databases owned by the application.
 type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
-/// Merkleized state database produced after finalization.
-type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
-/// Merkleized transaction database produced after finalization.
-type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
-
-/// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
-///
-/// Different platforms have different `SystemTime` limits, so we use a fixed
-/// timestamp to ensure consistent application of block validity rules.
-const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Unmerkleized application state batch used for processor read-through.
-pub type StateBatch<E, H, T> = AnyUnmerkleized<
+type StateBatch<E, H, T> = AnyUnmerkleized<
     E,
     FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Address, FixedEncoding<Account>>>>,
     UnorderedIndex<T, mmr::Location>,
@@ -116,8 +111,13 @@ pub type StateBatch<E, H, T> = AnyUnmerkleized<
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
 
+type TransactionJournal<E, H> = FixedJournal<
+    E,
+    commonware_storage::qmdb::immutable::fixed::Operation<<H as Hasher>::Digest, ()>,
+>;
+
 /// Unmerkleized transaction batch used for append-only transaction storage.
-pub type TransactionBatch<E, H> = ImmutableUnmerkleized<
+type TransactionBatch<E, H> = ImmutableUnmerkleized<
     E,
     <H as Hasher>::Digest,
     FixedEncoding<()>,
@@ -126,8 +126,11 @@ pub type TransactionBatch<E, H> = ImmutableUnmerkleized<
     EightCap,
 >;
 
-/// Unmerkleized batch tuple passed to application execution.
-pub type ApplicationBatches<E, H, T> = (StateBatch<E, H, T>, TransactionBatch<E, H>);
+/// Merkleized state database produced after finalization.
+type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
+
+/// Merkleized transaction database produced after finalization.
+type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
 
 /// Errors raised while preparing processor state from the backing database.
 #[derive(Debug, Error)]
@@ -158,12 +161,8 @@ where
     }
 
     let account_keys = accounts.iter().copied().collect::<Vec<_>>();
-    let account_results = futures::future::try_join_all(
-        account_keys
-            .iter()
-            .map(|address| async move { batch.get(address).await }),
-    )
-    .await?;
+    let account_results =
+        try_join_all(account_keys.iter().map(|address| batch.get(address))).await?;
 
     let mut base_accounts = HashMap::with_capacity(accounts.len());
     for (address, result) in account_keys.iter().zip(account_results) {
@@ -208,7 +207,7 @@ where
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-pub struct Application<H: Hasher, C, S, P, I, St> {
+pub struct Application<H, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
@@ -216,9 +215,11 @@ pub struct Application<H: Hasher, C, S, P, I, St> {
     _marker: PhantomData<(H, C, S, I)>,
 }
 
-impl<H: Hasher, C, S, P, I, St: Clone> Clone for Application<H, C, S, P, I, St>
+impl<H, C, S, P, I, St> Clone for Application<H, C, S, P, I, St>
 where
+    H: Hasher,
     P: Clone,
+    St: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -228,12 +229,6 @@ where
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
-    }
-}
-
-impl<H: Hasher, C, S, P, I, St> fmt::Debug for Application<H, C, S, P, I, St> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Application").finish_non_exhaustive()
     }
 }
 
@@ -264,16 +259,6 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
             _marker: PhantomData,
         }
     }
-
-    /// Returns the configured execution strategy.
-    pub const fn strategy(&self) -> &St {
-        &self.strategy
-    }
-
-    /// Returns the transaction signing namespace.
-    pub const fn transaction_namespace(&self) -> &'static [u8] {
-        self.transaction_namespace
-    }
 }
 
 impl<H, C, S, P, I, St> Application<H, C, S, P, I, St>
@@ -290,11 +275,9 @@ where
         Txs::IntoIter: Send,
         WireTransaction<H, P>: Send,
     {
-        let namespace = self.transaction_namespace();
-
         self.strategy
             .map_collect_vec(transactions, |transaction: WireTransaction<H, P>| {
-                transaction.into_verified(namespace).ok()
+                transaction.into_verified(self.transaction_namespace).ok()
             })
             .into_iter()
             .collect()

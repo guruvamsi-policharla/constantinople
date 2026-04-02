@@ -25,15 +25,3 @@ target "constantinople-validator" {
     OUTPUT_NAME = "validator"
   }
 }
-
-target "constantinople-spammer" {
-  context = "."
-  dockerfile = "docker/Dockerfile"
-  platforms = split(",", PLATFORMS)
-  tags = ["constantinople-spammer-builder:${DEFAULT_TAG}"]
-  args = {
-    PACKAGE_NAME = "constantinople-spammer"
-    BINARY_NAME = "constantinople-spammer"
-    OUTPUT_NAME = "spammer"
-  }
-}

@@ -29,29 +29,16 @@ This writes:
 * `deploy/validator`
 * `deploy/validator-debug`
 
-#### Build Spammer Binary
-
-```sh
-just spammer-binary
-```
-
-This writes:
-
-* `deploy/spammer`
-* `deploy/spammer-debug`
-
-#### Build Both Deployable Binaries
+#### Build Deployable Binary
 
 ```sh
 just deploy-binaries
 ```
 
-This writes both:
+This writes:
 
 * `deploy/validator`
 * `deploy/validator-debug`
-* `deploy/spammer`
-* `deploy/spammer-debug`
 
 #### Troubleshooting
 

@@ -16,23 +16,15 @@ build *args='':
 docker-validator-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl constantinople-validator
 
-# Build the spammer Docker builder image
-docker-spammer-image:
-  docker buildx bake --progress plain -f docker/docker-bake.hcl constantinople-spammer
-
-# Build both Docker builder images
-docker-images: docker-validator-image docker-spammer-image
+# Build the Docker builder image
+docker-images: docker-validator-image
 
 # Build the ARM64 validator binary into deploy/
 validator-binary: docker-validator-image
   docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
 
-# Build the ARM64 spammer binary into deploy/
-spammer-binary: docker-spammer-image
-  docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
-
-# Build both ARM64 deployable binaries into deploy/
-deploy-binaries: validator-binary spammer-binary
+# Build the ARM64 deployable binary into deploy/
+deploy-binaries: validator-binary
 
 # Fixes the formatting of the workspace
 fmt-fix:

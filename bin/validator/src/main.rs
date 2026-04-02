@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod run;
+mod tx_gen;
 
 use clap::Parser;
 

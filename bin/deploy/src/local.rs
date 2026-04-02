@@ -1,8 +1,8 @@
 use crate::{
     ClusterMaterial, GenerateArgs, LocalArgs, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    SPAMMER_CONFIG_FILE, ValidatorConfig, absolute_path, build_spammer_config,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
+    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -29,25 +29,14 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
             .map(|validator| validator.peer.clone())
             .collect(),
     };
-    let spammer = build_spammer_config(
-        args,
-        validators
-            .iter()
-            .map(|validator| validator.peer.name.clone())
-            .collect(),
-        local.base_http_port,
-    );
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
         write_yaml_config(&validator.config_file, &validator.config);
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
-    if let Some(spammer) = spammer.as_ref() {
-        write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), spammer);
-    }
 
-    print_local_run_commands(&output_dir, args.validators, spammer.is_some());
+    print_local_run_commands(&output_dir, args.validators);
 }
 
 fn build_validators(
@@ -114,21 +103,21 @@ fn build_validators(
     validators
 }
 
-fn print_local_run_commands(output_dir: &std::path::Path, validators: u32, spammer: bool) {
-    let commands = local_run_commands(output_dir, validators, spammer);
+fn print_local_run_commands(output_dir: &std::path::Path, validators: u32) {
+    let commands = local_run_commands(output_dir, validators);
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
         .collect::<Vec<_>>()
         .join(" ");
 
-    info!(output_dir = %output_dir.display(), validators, spammer, "generated local deployment bundle");
+    info!(output_dir = %output_dir.display(), validators, "generated local deployment bundle");
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
 }
 
-fn local_run_commands(output_dir: &std::path::Path, validators: u32, spammer: bool) -> Vec<String> {
+fn local_run_commands(output_dir: &std::path::Path, validators: u32) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
-    let mut commands = (0..validators)
+    (0..validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
@@ -137,17 +126,7 @@ fn local_run_commands(output_dir: &std::path::Path, validators: u32, spammer: bo
                 peers_path.display()
             )
         })
-        .collect::<Vec<_>>();
-
-    if spammer {
-        commands.push(format!(
-            "cargo run --bin constantinople-spammer -- --config {} --peers {}",
-            output_dir.join(SPAMMER_CONFIG_FILE).display(),
-            peers_path.display()
-        ));
-    }
-
-    commands
+        .collect()
 }
 
 #[cfg(test)]
@@ -157,34 +136,11 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn local_run_commands_include_spammer_when_enabled() {
-        let commands = local_run_commands(Path::new("/tmp/configs"), 2, true);
-
-        assert_eq!(commands.len(), 3);
-        assert_eq!(
-            commands[0],
-            "cargo run --bin constantinople -- --config /tmp/configs/validator-0.yaml --peers /tmp/configs/peers.yaml"
-        );
-        assert_eq!(
-            commands[1],
-            "cargo run --bin constantinople -- --config /tmp/configs/validator-1.yaml --peers /tmp/configs/peers.yaml"
-        );
-        assert_eq!(
-            commands[2],
-            "cargo run --bin constantinople-spammer -- --config /tmp/configs/spammer.yaml --peers /tmp/configs/peers.yaml"
-        );
-    }
-
-    #[test]
-    fn local_run_commands_skip_spammer_when_disabled() {
-        let commands = local_run_commands(Path::new("/tmp/configs"), 2, false);
+    fn local_run_commands_only_start_validators() {
+        let commands = local_run_commands(Path::new("/tmp/configs"), 2);
 
         assert_eq!(commands.len(), 2);
-        assert!(
-            commands
-                .iter()
-                .all(|command| !command.contains("constantinople-spammer"))
-        );
+        assert!(commands.iter().all(|command| !command.contains("spammer")));
     }
 
     #[test]
