@@ -14,6 +14,10 @@ use std::{
 };
 use tokio::{task::JoinSet, time};
 
+const MAX_IN_FLIGHT_REQUESTS_PER_ENDPOINT: usize = 256;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct Args {
     count: NonZeroUsize,
@@ -97,6 +101,7 @@ struct EndpointState {
     endpoint: String,
     ready: VecDeque<usize>,
     dispatched: u64,
+    in_flight: usize,
     completed: usize,
     failed: usize,
 }
@@ -107,10 +112,20 @@ impl EndpointState {
             endpoint,
             ready: VecDeque::new(),
             dispatched: 0,
+            in_flight: 0,
             completed: 0,
             failed: 0,
         }
     }
+}
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .pool_max_idle_per_host(MAX_IN_FLIGHT_REQUESTS_PER_ENDPOINT)
+        .build()
+        .expect("spammer HTTP client should build")
 }
 
 fn build_ring_accounts(
@@ -199,6 +214,10 @@ fn handle_submission_result(
     nonce: u64,
 ) {
     let endpoint = &mut endpoints[endpoint_index];
+    endpoint.in_flight = endpoint
+        .in_flight
+        .checked_sub(1)
+        .expect("endpoint in-flight counter underflowed");
     endpoint.completed += 1;
     endpoint.ready.push_back(sender_index);
 
@@ -256,7 +275,7 @@ where
     let mut accounts = build_ring_accounts(args.count, args.seed_start, args.nonce, endpoint_count);
     let mut endpoints = build_endpoint_states(args.endpoints);
     assign_accounts_to_endpoints(&accounts, &mut endpoints);
-    let client = reqwest::Client::new();
+    let client = build_http_client();
     let mut tasks = JoinSet::new();
     let started = time::Instant::now();
     let tps = u64::from(args.tps.get());
@@ -298,6 +317,10 @@ where
                 / 1_000_000_000) as u64;
 
             while endpoints[endpoint_index].dispatched < target {
+                if endpoints[endpoint_index].in_flight >= MAX_IN_FLIGHT_REQUESTS_PER_ENDPOINT {
+                    break;
+                }
+
                 if should_stop.load(Ordering::Relaxed) {
                     stop_requested = true;
                     break;
@@ -311,6 +334,7 @@ where
 
                 submitted = true;
                 endpoints[endpoint_index].dispatched += 1;
+                endpoints[endpoint_index].in_flight += 1;
 
                 let client = client.clone();
                 let endpoint = endpoints[endpoint_index].endpoint.clone();
@@ -668,6 +692,52 @@ mod tests {
                 .len(),
             2,
             "spammer should use more than one endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_caps_in_flight_requests_per_endpoint() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stopper = start_stop_timer(Duration::from_millis(25), should_stop.clone());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let args = Args {
+            count: NonZeroUsize::new(1_024).expect("count should be non-zero"),
+            endpoints: vec!["http://127.0.0.1:8080".to_string()],
+            seed_start: 0,
+            nonce: 0,
+            tps: NonZeroU32::new(100_000).expect("tps should be non-zero"),
+        };
+
+        let current = in_flight.clone();
+        let max_seen = max_in_flight.clone();
+
+        let result = time::timeout(
+            Duration::from_millis(500),
+            run_until_stopped(
+                args,
+                should_stop,
+                move |_client, _endpoint, _tx_bytes| {
+                    let current = current.clone();
+                    let max_seen = max_seen.clone();
+                    async move {
+                        let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = max_seen.fetch_max(now, Ordering::SeqCst);
+                        time::sleep(Duration::from_millis(50)).await;
+                        current.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            ),
+        )
+        .await;
+
+        stopper.await.expect("shutdown task should finish");
+
+        assert!(result.is_ok(), "spammer should finish before the timeout");
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 256,
+            "spammer should cap per-endpoint in-flight requests"
         );
     }
 }
