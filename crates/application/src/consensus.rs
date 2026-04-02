@@ -212,10 +212,10 @@ where
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-/// Type-erased callback for transaction proposal outcomes.
+/// Type-erased callback for mempool-visible transaction outcomes.
 ///
 /// The callback receives the block height, the transaction hashes, and whether
-/// the transactions were included in the block.
+/// the transactions were rejected during proposal or included in a certified block.
 pub type TransactionCallback<D> = Arc<dyn Fn(u64, Vec<D>, bool) + Send + Sync>;
 
 #[derive(Debug)]
@@ -316,7 +316,7 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
         }
     }
 
-    /// Sets a callback that receives proposal and verification transaction outcomes.
+    /// Sets a callback that receives proposal rejections and certified inclusions.
     pub fn with_transaction_callback(mut self, callback: TransactionCallback<H::Digest>) -> Self {
         self.transaction_callback = Some(callback);
         self
@@ -508,13 +508,6 @@ where
 
         let transaction_batch = record_transactions(transaction_batch, &valid);
         let state_batch = apply_changeset(state_batch, &changeset);
-        if let Some(ref callback) = self.transaction_callback {
-            let included = valid
-                .iter()
-                .map(|transaction| *transaction.message_digest())
-                .collect();
-            callback(parent.header.height + 1, included, true);
-        }
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
             .await
@@ -657,14 +650,6 @@ where
             );
             return None;
         }
-        if let Some(ref callback) = self.transaction_callback {
-            let included = body
-                .iter()
-                .map(|transaction| *transaction.message_digest())
-                .collect();
-            callback(block.header.height, included, true);
-        }
-
         info!(
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
@@ -708,9 +693,21 @@ where
             .expect("certified block contained a statically invalid transaction");
         let transaction_batch = record_transactions(transaction_batch, &verified_block.body);
         let state_batch = apply_changeset(state_batch, &changeset);
-        self.finalize_execution(state_batch, transaction_batch)
+        let merkleized = self
+            .finalize_execution(state_batch, transaction_batch)
             .await
-            .expect("database merkleization must succeed")
+            .expect("database merkleization must succeed");
+
+        if let Some(ref callback) = self.transaction_callback {
+            let included = verified_block
+                .body
+                .iter()
+                .map(|transaction| *transaction.message_digest())
+                .collect();
+            callback(block.header.height, included, true);
+        }
+
+        merkleized
     }
 }
 

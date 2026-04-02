@@ -59,7 +59,7 @@ This writes:
 
 - `validator-0.yaml`, `validator-1.yaml`, ...
 - `peers.yaml`
-- optionally `spammer.yaml` if `--spammer-count` and `--spammer-tps` are supplied
+- optionally `spammer.yaml` if `--spammer-count` is supplied
 
 It also prints an `mprocs` command that starts the whole local cluster.
 
@@ -89,7 +89,6 @@ cargo run --bin constantinople-deploy -- generate \
   --worker-threads 2 \
   --rayon-threads 2 \
   --spammer-count 128 \
-  --spammer-tps 1024 \
   local
 ```
 
@@ -116,7 +115,6 @@ cargo run --bin constantinople-deploy -- generate \
   --worker-threads 4 \
   --rayon-threads 4 \
   --spammer-count 4096 \
-  --spammer-tps 32768 \
   remote \
   --http-cidr 0.0.0.0/0 \
   --regions us-east-1,us-west-2 \

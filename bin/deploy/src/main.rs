@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -70,10 +70,8 @@ pub(crate) struct GenerateArgs {
     rayon_threads: usize,
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
-    #[arg(long, requires = "spammer_tps")]
+    #[arg(long)]
     spammer_count: Option<NonZeroUsize>,
-    #[arg(long, requires = "spammer_count")]
-    spammer_tps: Option<NonZeroU32>,
     #[arg(long, default_value_t = 0)]
     spammer_seed_start: u64,
     #[arg(long, default_value_t = 0)]
@@ -173,7 +171,6 @@ pub(crate) struct SpammerConfig {
     http_port: u16,
     seed_start: u64,
     nonce: u64,
-    tps: u32,
 }
 
 pub(crate) struct ClusterMaterial {
@@ -280,7 +277,7 @@ pub(crate) fn default_bootstrappers(
 }
 
 pub(crate) fn spammer_enabled(args: &GenerateArgs) -> bool {
-    args.spammer_count.is_some() || args.spammer_tps.is_some()
+    args.spammer_count.is_some()
 }
 
 pub(crate) fn build_spammer_config(
@@ -295,9 +292,6 @@ pub(crate) fn build_spammer_config(
     let count = args
         .spammer_count
         .expect("spammer_count is required when enabling the spammer");
-    let tps = args
-        .spammer_tps
-        .expect("spammer_tps is required when enabling the spammer");
 
     Some(SpammerConfig {
         count: count.get(),
@@ -305,7 +299,6 @@ pub(crate) fn build_spammer_config(
         http_port,
         seed_start: args.spammer_seed_start,
         nonce: args.spammer_nonce,
-        tps: tps.get(),
     })
 }
 
@@ -332,7 +325,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn generate_requires_matching_spammer_flags() {
+    fn generate_accepts_spammer_count_without_tps() {
         let result = Cli::try_parse_from([
             "constantinople-deploy",
             "generate",
@@ -345,7 +338,7 @@ mod tests {
             "local",
         ]);
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]

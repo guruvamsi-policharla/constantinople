@@ -1,7 +1,8 @@
-use commonware_codec::Encode;
+use commonware_codec::{Encode, ReadExt};
 use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
 use commonware_utils::hex;
-use constantinople_primitives::{Address, Signable, Transaction};
+use constantinople_primitives::{Address, Signable, Signed, Transaction};
+use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, num::NonZeroU64};
 
 pub const TX_NAMESPACE: &[u8] = b"constantinople-tx";
@@ -43,11 +44,55 @@ pub fn accept_tx_url(endpoint: &str) -> String {
     format!("{}/tx/accept", endpoint.trim_end_matches('/'))
 }
 
+pub fn tx_status_url(endpoint: &str) -> String {
+    format!("{}/tx/status", endpoint.trim_end_matches('/'))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmissionReceipt {
+    tx_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionState {
+    Pending,
+    Included,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TransactionStatus {
+    pub tx_hash: String,
+    pub state: TransactionState,
+    pub height: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionStatusRequest<'a> {
+    tx_hashes: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct TransactionStatusResponse {
+    statuses: Vec<TransactionStatus>,
+}
+
+pub fn transaction_hash_hex(tx_bytes: &[u8]) -> Result<String, String> {
+    let signed =
+        Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::read(
+            &mut &tx_bytes[..],
+        )
+        .map_err(|err| format!("bad signed transaction bytes: {err}"))?;
+    Ok(hex(signed.message_digest().as_ref()))
+}
+
 pub async fn accept_transaction(
     client: &reqwest::Client,
     endpoint: &str,
     tx_bytes: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let resp = client
         .post(accept_tx_url(endpoint))
         .body(hex(&tx_bytes))
@@ -56,15 +101,49 @@ pub async fn accept_transaction(
         .map_err(|err| format!("request failed: {err}"))?;
     let status = resp.status();
     let body = resp
-        .text()
+        .bytes()
         .await
         .map_err(|err| format!("response body failed: {err}"))?;
 
-    if status.is_success() {
-        return Ok(());
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&body);
+        return Err(format!("error ({status}): {body}"));
     }
 
-    Err(format!("error ({status}): {body}"))
+    let receipt: SubmissionReceipt =
+        serde_json::from_slice(&body).map_err(|err| format!("bad submission receipt: {err}"))?;
+    if receipt.tx_hash.is_empty() {
+        return Err("submission receipt omitted tx_hash".to_string());
+    }
+
+    Ok(receipt.tx_hash)
+}
+
+pub async fn fetch_transaction_statuses(
+    client: &reqwest::Client,
+    endpoint: &str,
+    tx_hashes: &[String],
+) -> Result<Vec<TransactionStatus>, String> {
+    let resp = client
+        .post(tx_status_url(endpoint))
+        .json(&TransactionStatusRequest { tx_hashes })
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|err| format!("response body failed: {err}"))?;
+
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&body);
+        return Err(format!("error ({status}): {body}"));
+    }
+
+    let response: TransactionStatusResponse =
+        serde_json::from_slice(&body).map_err(|err| format!("bad status response: {err}"))?;
+    Ok(response.statuses)
 }
 
 #[cfg(test)]

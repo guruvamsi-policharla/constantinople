@@ -176,6 +176,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             MempoolConfig {
                 max_propose_bytes,
                 max_pool_bytes,
+                proposal_lease_duration: Duration::from_secs(5),
             },
         );
 

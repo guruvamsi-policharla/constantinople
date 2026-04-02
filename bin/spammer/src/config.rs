@@ -32,7 +32,6 @@ struct SpammerConfig {
     seed_start: u64,
     #[serde(default)]
     nonce: u64,
-    tps: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,13 +75,7 @@ pub fn load_local_args(peers_path: &Path, config_path: &Path) -> Result<spam::Ar
         endpoints.push(format!("http://{http}"));
     }
 
-    spam::Args::new(
-        config.count,
-        endpoints,
-        config.seed_start,
-        config.nonce,
-        config.tps,
-    )
+    spam::Args::new(config.count, endpoints, config.seed_start, config.nonce)
 }
 
 pub fn load_remote_args(hosts_path: &Path, config_path: &Path) -> Result<spam::Args, String> {
@@ -105,13 +98,7 @@ pub fn load_remote_args(hosts_path: &Path, config_path: &Path) -> Result<spam::A
         endpoints.push(format!("http://{ip}:{}", config.http_port));
     }
 
-    spam::Args::new(
-        config.count,
-        endpoints,
-        config.seed_start,
-        config.nonce,
-        config.tps,
-    )
+    spam::Args::new(config.count, endpoints, config.seed_start, config.nonce)
 }
 
 #[cfg(test)]
@@ -188,7 +175,6 @@ validator_names: ["validator-a", "validator-b"]
 http_port: 8080
 seed_start: 3
 nonce: 9
-tps: 100
 "#,
         )
         .expect("failed to write config");
@@ -200,7 +186,6 @@ tps: 100
             &["http://127.0.0.1:8080", "http://127.0.0.1:8081"]
         );
         assert_eq!(args.count().get(), 8);
-        assert_eq!(args.tps().get(), 100);
         assert_eq!(args.seed_start(), 3);
         assert_eq!(args.nonce(), 9);
 
@@ -233,7 +218,6 @@ validator_names: ["validator-a", "validator-b"]
 http_port: 8080
 seed_start: 3
 nonce: 9
-tps: 100
 "#,
         )
         .expect("failed to write config");
@@ -245,7 +229,6 @@ tps: 100
             &["http://203.0.113.1:8080", "http://203.0.113.2:8080"]
         );
         assert_eq!(args.count().get(), 8);
-        assert_eq!(args.tps().get(), 100);
         assert_eq!(args.seed_start(), 3);
         assert_eq!(args.nonce(), 9);
 

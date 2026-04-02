@@ -1,8 +1,8 @@
 use crate::{
     ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
     SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS, VALIDATOR_BINARY_FILE,
-    ValidatorConfig, absolute_path, build_spammer_config, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing,
+    ValidatorConfig, absolute_path, build_spammer_config, default_bootstrappers,
+    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
     generate_deployer_tag, generate_remote_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -235,10 +235,7 @@ mod tests {
         StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
         default_max_propose_bytes,
     };
-    use std::{
-        num::{NonZeroU32, NonZeroUsize},
-        path::PathBuf,
-    };
+    use std::{num::NonZeroUsize, path::PathBuf};
 
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
@@ -249,7 +246,6 @@ mod tests {
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
             spammer_count: Some(NonZeroUsize::new(64).unwrap()),
-            spammer_tps: Some(NonZeroU32::new(10_000).unwrap()),
             spammer_seed_start: 7,
             spammer_nonce: 11,
             target: GenerateTarget::Local(LocalArgs {
