@@ -16,7 +16,7 @@ use commonware_cryptography::{
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, TryCollect, hex};
 use rand_core::OsRng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
@@ -33,6 +33,14 @@ const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const SPAMMER_INSTANCE_NAME: &str = "spammer";
 const VALIDATOR_BINARY_FILE: &str = "validator";
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StartupModeConfig {
+    #[default]
+    MarshalSync,
+    StateSync,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
@@ -58,6 +66,8 @@ pub(crate) struct GenerateArgs {
     worker_threads: usize,
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
+    startup: StartupModeConfig,
     #[arg(long, requires = "spammer_tps")]
     spammer_count: Option<NonZeroUsize>,
     #[arg(long, requires = "spammer_count")]
@@ -131,6 +141,7 @@ pub(crate) struct ValidatorConfig {
     private_key: String,
     dkg_output: String,
     dkg_share: String,
+    startup: StartupModeConfig,
     listen_port: u16,
     genesis_leader: String,
     partition_prefix: String,

@@ -84,6 +84,7 @@ fn build_validators(
             private_key: hex(&material.signers[validator_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: args.startup,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
@@ -149,6 +150,7 @@ fn local_run_commands(output_dir: &std::path::Path, validators: u32, spammer: bo
 #[cfg(test)]
 mod tests {
     use super::local_run_commands;
+    use crate::StartupModeConfig;
     use std::path::Path;
 
     #[test]
@@ -180,5 +182,10 @@ mod tests {
                 .iter()
                 .all(|command| !command.contains("constantinople-spammer"))
         );
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_marshal_sync() {
+        assert_eq!(StartupModeConfig::default(), StartupModeConfig::MarshalSync);
     }
 }

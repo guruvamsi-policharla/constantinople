@@ -100,6 +100,7 @@ fn build_validators(
             private_key: hex(&material.signers[validator_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: args.startup,
             listen_port: remote.listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
@@ -243,7 +244,8 @@ mod tests {
     use super::{build_deployer_config, build_spammer_deployment, port_configs};
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs, SPAMMER_INSTANCE_NAME, STORAGE_CLASS,
-        VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
+        default_max_propose_bytes,
     };
     use std::{
         num::{NonZeroU32, NonZeroUsize},
@@ -257,6 +259,7 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            startup: StartupModeConfig::MarshalSync,
             spammer_count: Some(NonZeroUsize::new(64).unwrap()),
             spammer_tps: Some(NonZeroU32::new(10_000).unwrap()),
             spammer_seed_start: 7,
@@ -298,6 +301,7 @@ mod tests {
                 private_key: "private".to_string(),
                 dkg_output: "output".to_string(),
                 dkg_share: "share".to_string(),
+                startup: StartupModeConfig::MarshalSync,
                 listen_port: 9000,
                 genesis_leader: "leader".to_string(),
                 partition_prefix: format!("validator-{index}"),

@@ -1,6 +1,6 @@
 //! Starts a validator from a YAML config.
 
-use crate::config::{LoadedConfig, load_deployer_config, load_local_config};
+use crate::config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config};
 use commonware_codec::Encode;
 use commonware_consensus::{
     Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
@@ -21,7 +21,7 @@ use constantinople_engine::{
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::server::{Mempool, MempoolConfig, router};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -55,6 +55,7 @@ pub fn run_deployer(hosts_path: PathBuf, config_path: PathBuf) {
 fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let LoadedConfig {
         decoded,
+        startup,
         log_level,
         worker_threads,
         rayon_threads,
@@ -201,6 +202,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 .expect("HTTP server failed");
         });
 
+        let startup =
+            resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;
+        let startup_mode = match &startup {
+            StartupMode::MarshalSync => "marshal_sync",
+            StartupMode::StateSync { .. } => "state_sync",
+        };
+        info!(startup_mode, "selected validator startup mode");
+
         info!("initializing engine");
         let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _>::new(
             context.with_label("engine"),
@@ -215,7 +224,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 partition_prefix: decoded.partition_prefix,
                 freezer_table_initial_size: 1024,
                 strategy,
-                startup: StartupMode::MarshalSync,
+                startup,
                 sync_config: SyncEngineConfig {
                     fetch_batch_size: NZU64!(16),
                     apply_batch_size: 64,
@@ -242,4 +251,52 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             _ = http_handle => tracing::warn!("http server exited"),
         }
     });
+}
+
+async fn resolve_startup_mode<T, F, Fut>(
+    requested: StartupModeConfig,
+    fetch_initial_target: F,
+) -> StartupMode<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    match requested {
+        StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
+        StartupModeConfig::StateSync => {
+            let block = fetch_initial_target()
+                .await
+                .expect("bootstrapper actor exited before selecting a state-sync target");
+            StartupMode::StateSync { block }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_startup_mode;
+    use crate::config::StartupModeConfig;
+    use commonware_glue::stateful::StartupMode;
+
+    #[tokio::test]
+    async fn state_sync_requests_bootstrap_target() {
+        let startup =
+            resolve_startup_mode(StartupModeConfig::StateSync, || async { Some(42_u64) }).await;
+
+        match startup {
+            StartupMode::StateSync { block } => assert_eq!(block, 42),
+            StartupMode::MarshalSync => panic!("expected state sync startup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn marshal_sync_skips_bootstrap_target() {
+        let startup: StartupMode<u64> =
+            resolve_startup_mode(StartupModeConfig::MarshalSync, || async {
+                panic!("marshal sync should not fetch a bootstrap target")
+            })
+            .await;
+
+        assert!(matches!(startup, StartupMode::MarshalSync));
+    }
 }

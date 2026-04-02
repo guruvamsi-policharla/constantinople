@@ -31,11 +31,21 @@ pub(crate) const fn default_metrics_port() -> u16 {
     9090
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupModeConfig {
+    #[default]
+    MarshalSync,
+    StateSync,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorConfig {
     pub private_key: String,
     pub dkg_output: String,
     pub dkg_share: String,
+    #[serde(default)]
+    pub startup: StartupModeConfig,
     pub listen_port: u16,
     pub genesis_leader: String,
     pub partition_prefix: String,
@@ -90,6 +100,7 @@ pub struct DecodedConfig {
 
 pub struct LoadedConfig {
     pub decoded: DecodedConfig,
+    pub startup: StartupModeConfig,
     pub log_level: String,
     pub worker_threads: usize,
     pub rayon_threads: usize,
@@ -183,6 +194,7 @@ fn decode_with_network(
             bootstrappers,
             partition_prefix: config.partition_prefix,
         },
+        startup: config.startup,
         log_level: config.log_level,
         worker_threads: config.worker_threads,
         rayon_threads: config.rayon_threads,
@@ -277,7 +289,10 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 
 #[cfg(test)]
 mod tests {
-    use super::{NamedBootstrapperEntry, ValidatorConfig, load_deployer_config, load_local_config};
+    use super::{
+        NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig, load_deployer_config,
+        load_local_config,
+    };
     use commonware_codec::Encode;
     use commonware_cryptography::{
         Signer,
@@ -331,6 +346,7 @@ mod tests {
             private_key: hex(&signer.encode()),
             dkg_output: hex(&dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: StartupModeConfig::MarshalSync,
             listen_port: 9000,
             genesis_leader: hex(&public_key.encode()),
             partition_prefix: "validator-0".to_string(),
@@ -372,6 +388,7 @@ mod tests {
 
         assert!(!loaded.json_logs);
         assert!(!loaded.deployer_managed);
+        assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
@@ -420,6 +437,7 @@ mod tests {
             private_key: hex(&signer.encode()),
             dkg_output: hex(&dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: StartupModeConfig::MarshalSync,
             listen_port: 9000,
             genesis_leader: hex(&public_key.encode()),
             partition_prefix: "validator-0".to_string(),
@@ -461,6 +479,7 @@ hosts:
 
         assert!(loaded.json_logs);
         assert!(loaded.deployer_managed);
+        assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
@@ -510,6 +529,7 @@ hosts:
             private_key: hex(&signer.encode()),
             dkg_output: hex(&dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: StartupModeConfig::MarshalSync,
             listen_port: 9000,
             genesis_leader: hex(&public_key.encode()),
             partition_prefix: "validator-0".to_string(),
@@ -591,6 +611,7 @@ hosts:
             private_key: hex(&signer.encode()),
             dkg_output: hex(&dkg_output.encode()),
             dkg_share: hex(&share.encode()),
+            startup: StartupModeConfig::MarshalSync,
             listen_port: 9000,
             genesis_leader: hex(&public_key.encode()),
             partition_prefix: "validator-0".to_string(),
@@ -639,5 +660,79 @@ hosts:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn local_config_honors_state_sync_startup() {
+        let validators = (0_u64..2)
+            .map(ed25519::PrivateKey::from_seed)
+            .collect::<Vec<_>>();
+        let public_keys = validators
+            .iter()
+            .map(Signer::public_key)
+            .collect::<Vec<_>>();
+        let participants = public_keys.clone().into_iter().try_collect().unwrap();
+        let mut rng = commonware_utils::test_rng();
+        let (dkg_output, raw_shares) =
+            dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+                .expect("DKG deal failed");
+        let shares = raw_shares
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, Share>>();
+        let signer = &validators[0];
+        let public_key = signer.public_key();
+        let share = shares.get(&public_key).expect("missing share");
+        let peer_name = hex(&public_keys[1].encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("validator-peers", ".yaml");
+
+        let config = ValidatorConfig {
+            private_key: hex(&signer.encode()),
+            dkg_output: hex(&dkg_output.encode()),
+            dkg_share: hex(&share.encode()),
+            startup: StartupModeConfig::StateSync,
+            listen_port: 9000,
+            genesis_leader: hex(&public_key.encode()),
+            partition_prefix: "validator-0".to_string(),
+            num_validators: 2,
+            log_level: "info".to_string(),
+            worker_threads: 2,
+            rayon_threads: 2,
+            http_port: 8080,
+            metrics_port: 9090,
+            max_propose_bytes: super::default_max_propose_bytes(),
+            max_pool_bytes: super::default_max_pool_bytes(),
+            bootstrappers: vec![NamedBootstrapperEntry {
+                public_key: peer_name.clone(),
+                name: peer_name.clone(),
+            }],
+        };
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &peers_path,
+            format!(
+                r#"validators:
+  - name: "{self_name}"
+    p2p: "127.0.0.1:9000"
+    http: "127.0.0.1:8080"
+  - name: "{peer_name}"
+    p2p: "127.0.0.1:9001"
+    http: "127.0.0.1:8081"
+"#,
+                self_name = hex(&public_key.encode()),
+            ),
+        )
+        .expect("peers should write");
+
+        let loaded = load_local_config(&peers_path, &config_path);
+
+        assert_eq!(loaded.startup, StartupModeConfig::StateSync);
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(peers_path);
     }
 }
