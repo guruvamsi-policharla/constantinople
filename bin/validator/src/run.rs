@@ -24,6 +24,8 @@ use constantinople_mempool::server::{Mempool, MempoolConfig, router};
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
 
+const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct NoopReporter;
 
@@ -225,13 +227,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 freezer_table_initial_size: 1024,
                 strategy,
                 startup,
-                sync_config: SyncEngineConfig {
-                    fetch_batch_size: NZU64!(16),
-                    apply_batch_size: 64,
-                    max_outstanding_requests: 8,
-                    update_channel_size: NZUsize!(256),
-                    max_retained_roots: 32,
-                },
+                sync_config: production_sync_config(),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: b"constantinople-tx",
                 block_codec: Default::default(),
@@ -251,6 +247,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             _ = http_handle => tracing::warn!("http server exited"),
         }
     });
+}
+
+fn production_sync_config() -> SyncEngineConfig {
+    SyncEngineConfig {
+        fetch_batch_size: NZU64!(1024),
+        apply_batch_size: STATE_SYNC_APPLY_BATCH_SIZE,
+        max_outstanding_requests: 8,
+        update_channel_size: NZUsize!(256),
+        max_retained_roots: 32,
+    }
 }
 
 async fn resolve_startup_mode<T, F, Fut>(
@@ -274,7 +280,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_startup_mode;
+    use super::{STATE_SYNC_APPLY_BATCH_SIZE, production_sync_config, resolve_startup_mode};
     use crate::config::StartupModeConfig;
     use commonware_glue::stateful::StartupMode;
 
@@ -298,5 +304,16 @@ mod tests {
             .await;
 
         assert!(matches!(startup, StartupMode::MarshalSync));
+    }
+
+    #[test]
+    fn production_sync_config_uses_large_rebuild_batches() {
+        let config = production_sync_config();
+
+        assert_eq!(config.apply_batch_size, STATE_SYNC_APPLY_BATCH_SIZE);
+        assert!(
+            config.apply_batch_size >= 1024,
+            "production rebuild batches should stay large enough to avoid prolonged post-sync replay",
+        );
     }
 }

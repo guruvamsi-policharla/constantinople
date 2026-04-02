@@ -10,29 +10,18 @@ ARM64 binaries for AWS Graviton.
 
 ## Building Locally
 
-To build a compiler image locally, use `docker buildx bake`:
+The `justfile` wraps the Docker build flow:
 
 ```sh
-export TARGET="<target_name>"
-
-docker buildx bake \
-  --progress plain \
-  -f docker/docker-bake.hcl \
-  $TARGET
+just docker-images
 ```
-
-Available targets:
-
-* `constantinople-validator`
-* `constantinople-spammer`
 
 By default, these build ARM64 images for AWS Graviton (`linux/arm64`).
 
 #### Build Validator Binary
 
 ```sh
-docker buildx bake -f docker/docker-bake.hcl constantinople-validator
-docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
+just validator-binary
 ```
 
 This writes:
@@ -43,12 +32,24 @@ This writes:
 #### Build Spammer Binary
 
 ```sh
-docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
-docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
+just spammer-binary
 ```
 
 This writes:
 
+* `deploy/spammer`
+* `deploy/spammer-debug`
+
+#### Build Both Deployable Binaries
+
+```sh
+just deploy-binaries
+```
+
+This writes both:
+
+* `deploy/validator`
+* `deploy/validator-debug`
 * `deploy/spammer`
 * `deploy/spammer-debug`
 

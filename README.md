@@ -137,11 +137,7 @@ The generate step writes:
 Then build the deployable ARM64 binaries into that directory:
 
 ```sh
-docker buildx bake -f docker/docker-bake.hcl constantinople-validator
-docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
-
-docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
-docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
+just deploy-binaries
 ```
 
 The Docker build step then writes:

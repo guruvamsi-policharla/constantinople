@@ -82,7 +82,7 @@ const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: usize = 1024;
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
-const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(1024);
+const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8_192);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
@@ -639,10 +639,20 @@ fn transaction_db_config(
 
 #[cfg(test)]
 mod tests {
-    use super::PAGE_CACHE_CAPACITY;
+    use super::{DB_WRITE_BUFFER, PAGE_CACHE_CAPACITY, PAGE_CACHE_PAGE_SIZE};
 
     #[test]
     fn production_page_cache_capacity_stays_small() {
         assert_eq!(PAGE_CACHE_CAPACITY.get(), 8_192);
+    }
+
+    #[test]
+    fn production_db_write_buffer_avoids_runtime_floor() {
+        let required_floor = PAGE_CACHE_PAGE_SIZE.get() as usize * 2;
+
+        assert!(
+            DB_WRITE_BUFFER.get() >= required_floor,
+            "production db write buffer should stay above the runtime append floor to avoid warning storms during rebuild",
+        );
     }
 }
