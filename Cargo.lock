@@ -892,6 +892,7 @@ dependencies = [
  "divan",
  "futures",
  "hashbrown 0.16.1",
+ "prometheus-client",
  "rand 0.8.5",
  "rstest",
  "thiserror 2.0.18",

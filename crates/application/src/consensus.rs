@@ -56,11 +56,15 @@ use constantinople_primitives::{
 };
 use core::fmt;
 use futures::StreamExt;
+use prometheus_client::metrics::gauge::Gauge;
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc, Once,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -105,6 +109,7 @@ type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Me
 /// Different platforms have different `SystemTime` limits, so we use a fixed
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
+const UNSET_APPLIED_TIMESTAMP_MS: u64 = u64::MAX;
 
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
@@ -213,11 +218,62 @@ where
 /// the transactions were included in the block.
 pub type TransactionCallback<D> = Arc<dyn Fn(u64, Vec<D>, bool) + Send + Sync>;
 
+#[derive(Debug)]
+struct ApplicationMetrics {
+    register_once: Once,
+    transactions_per_second: Gauge<f64, AtomicU64>,
+    last_applied_timestamp_ms: AtomicU64,
+}
+
+impl ApplicationMetrics {
+    fn new() -> Self {
+        Self {
+            register_once: Once::new(),
+            transactions_per_second: Gauge::default(),
+            last_applied_timestamp_ms: AtomicU64::new(UNSET_APPLIED_TIMESTAMP_MS),
+        }
+    }
+
+    fn register(&self, context: &impl Metrics) {
+        self.register_once.call_once(|| {
+            context.register(
+                "transactions_per_second",
+                "Transactions per second across consecutive applied certified blocks",
+                self.transactions_per_second.clone(),
+            );
+        });
+    }
+
+    fn record_applied_block_tps(
+        &self,
+        context: &impl Metrics,
+        block_timestamp_ms: u64,
+        transactions: usize,
+    ) {
+        self.register(context);
+        let previous_timestamp_ms = self
+            .last_applied_timestamp_ms
+            .swap(block_timestamp_ms, Ordering::SeqCst);
+
+        let tps = if previous_timestamp_ms == UNSET_APPLIED_TIMESTAMP_MS
+            || block_timestamp_ms <= previous_timestamp_ms
+        {
+            0.0
+        } else {
+            let elapsed_seconds = (block_timestamp_ms - previous_timestamp_ms) as f64 / 1_000.0;
+            transactions as f64 / elapsed_seconds
+        };
+
+        self.transactions_per_second.set(tps);
+    }
+}
+
 pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     transaction_callback: Option<TransactionCallback<H::Digest>>,
+    metrics: Arc<ApplicationMetrics>,
     _marker: PhantomData<(C, S, I)>,
 }
 
@@ -231,6 +287,7 @@ where
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             transaction_callback: self.transaction_callback.clone(),
+            metrics: self.metrics.clone(),
             _marker: PhantomData,
         }
     }
@@ -248,16 +305,13 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     /// The application keeps the execution strategy, genesis leader, and
     /// transaction signing namespace for all later block proposal,
     /// verification, and application.
-    pub const fn new(
-        strategy: St,
-        genesis_leader: P,
-        transaction_namespace: &'static [u8],
-    ) -> Self {
+    pub fn new(strategy: St, genesis_leader: P, transaction_namespace: &'static [u8]) -> Self {
         Self {
             strategy,
             genesis_leader,
             transaction_namespace,
             transaction_callback: None,
+            metrics: Arc::new(ApplicationMetrics::new()),
             _marker: PhantomData,
         }
     }
@@ -276,6 +330,14 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     /// Returns the transaction signing namespace.
     pub const fn transaction_namespace(&self) -> &'static [u8] {
         self.transaction_namespace
+    }
+
+    fn record_applied_block_tps<E>(&self, runtime: &E, block_timestamp_ms: u64, transactions: usize)
+    where
+        E: Metrics,
+    {
+        self.metrics
+            .record_applied_block_tps(runtime, block_timestamp_ms, transactions);
     }
 }
 
@@ -635,6 +697,8 @@ where
         let verified_block = self
             .verify_block(block)
             .expect("certified block contained an invalid signature");
+        let transaction_count = verified_block.body.len();
+        self.record_applied_block_tps(&_context.0, block.header.timestamp, transaction_count);
 
         let (state_batch, transaction_batch) = batches;
         let state = load_state(&state_batch, &verified_block.body)
@@ -693,7 +757,7 @@ mod tests {
     use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
     use commonware_glue::stateful::db::ManagedDb;
     use commonware_parallel::{Sequential, Strategy};
-    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
+    use commonware_runtime::{Metrics as _, Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
         mmr,
@@ -1022,6 +1086,24 @@ mod tests {
             .expect("tampered block should still decode");
 
         assert!(application.verify_block(&decoded).is_none());
+    }
+
+    #[test]
+    fn applied_block_tps_metric_uses_consecutive_block_timestamps() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let runtime = context.with_label("application");
+            let application = verify_test_application();
+
+            application.record_applied_block_tps(&runtime, 1_000, 4);
+            application.record_applied_block_tps(&runtime, 3_000, 10);
+
+            let metrics = runtime.encode();
+            assert!(
+                metrics.contains("application_transactions_per_second 5.0"),
+                "expected encoded metrics to include 5 TPS, got: {metrics}"
+            );
+        });
     }
 
     #[test]
