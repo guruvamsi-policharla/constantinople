@@ -1,8 +1,8 @@
 use crate::{
     ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
     SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS, VALIDATOR_BINARY_FILE,
-    ValidatorConfig, absolute_path, build_spammer_config, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
+    ValidatorConfig, absolute_path, build_spammer_config, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing,
     generate_deployer_tag, generate_remote_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -35,7 +35,6 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
 
-    let validator_binary = absolute_path(&remote.validator_binary);
     let dashboard = absolute_path(&remote.dashboard);
     let material = generate_remote_cluster_material(args.validators);
     let validators = build_validators(args, remote, &output_dir, &material);
@@ -49,9 +48,6 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     );
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
-    let copied_validator_binary = output_dir.join(VALIDATOR_BINARY_FILE);
-    fs::copy(&validator_binary, &copied_validator_binary).expect("failed to copy validator binary");
-    let copied_spammer_binary = copy_spammer_binary(args, remote, &output_dir);
     for validator in &validators {
         write_yaml_config(&validator.config_file, &validator.config);
     }
@@ -61,7 +57,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
 
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
     fs::copy(&dashboard, &copied_dashboard).expect("failed to copy dashboard");
-    let spammer = build_spammer_deployment(args, remote, copied_spammer_binary.as_deref());
+    let spammer = build_spammer_deployment(args, remote);
 
     let deployer_config = build_deployer_config(
         remote,
@@ -128,31 +124,7 @@ fn build_validators(
     validators
 }
 
-fn copy_spammer_binary(
-    args: &GenerateArgs,
-    remote: &RemoteArgs,
-    output_dir: &Path,
-) -> Option<PathBuf> {
-    if !crate::spammer_enabled(args) {
-        return None;
-    }
-
-    let binary = absolute_path(
-        remote
-            .spammer_binary
-            .as_ref()
-            .expect("spammer_binary is required when enabling the spammer"),
-    );
-    let copied_binary = output_dir.join(SPAMMER_INSTANCE_NAME);
-    fs::copy(&binary, &copied_binary).expect("failed to copy spammer binary");
-    Some(copied_binary)
-}
-
-fn build_spammer_deployment(
-    args: &GenerateArgs,
-    remote: &RemoteArgs,
-    spammer_binary: Option<&Path>,
-) -> Option<SpammerDeployment> {
+fn build_spammer_deployment(args: &GenerateArgs, remote: &RemoteArgs) -> Option<SpammerDeployment> {
     if !crate::spammer_enabled(args) {
         return None;
     }
@@ -170,12 +142,7 @@ fn build_spammer_deployment(
                 .unwrap_or_else(|| remote.instance_type.clone()),
             storage_size: remote.spammer_storage_size.unwrap_or(remote.storage_size),
             storage_class: STORAGE_CLASS.to_string(),
-            binary: spammer_binary
-                .expect("spammer binary should be copied when enabling the spammer")
-                .file_name()
-                .expect("spammer binary should have a file name")
-                .to_string_lossy()
-                .into_owned(),
+            binary: SPAMMER_INSTANCE_NAME.to_string(),
             config: SPAMMER_CONFIG_FILE.to_string(),
             profiling: false,
         },
@@ -274,7 +241,6 @@ mod tests {
 
     fn remote_args() -> RemoteArgs {
         RemoteArgs {
-            validator_binary: PathBuf::from("validator"),
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
@@ -285,7 +251,6 @@ mod tests {
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             profiling: true,
-            spammer_binary: Some(PathBuf::from("constantinople-spammer")),
             spammer_region: Some("us-west-2".to_string()),
             spammer_instance_type: Some("c8g.xlarge".to_string()),
             spammer_storage_size: Some(50),
@@ -322,14 +287,10 @@ mod tests {
     fn remote_spammer_defaults_to_validator_shape() {
         let args = generate_args();
         let remote = remote_args();
-        let spammer = build_spammer_deployment(
-            &args,
-            &remote,
-            Some(PathBuf::from("/tmp/spammer").as_path()),
-        )
-        .unwrap();
+        let spammer = build_spammer_deployment(&args, &remote).unwrap();
 
         assert_eq!(spammer.instance.name, SPAMMER_INSTANCE_NAME);
+        assert_eq!(spammer.instance.binary, SPAMMER_INSTANCE_NAME);
         assert_eq!(spammer.instance.region, "us-west-2");
         assert_eq!(spammer.instance.instance_type, "c8g.xlarge");
         assert_eq!(spammer.instance.storage_size, 50);
@@ -340,11 +301,7 @@ mod tests {
         let args = generate_args();
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
-        let spammer = build_spammer_deployment(
-            &args,
-            &remote,
-            Some(PathBuf::from("/tmp/spammer").as_path()),
-        );
+        let spammer = build_spammer_deployment(&args, &remote);
 
         let config = build_deployer_config(
             &remote,

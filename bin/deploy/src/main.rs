@@ -98,8 +98,6 @@ pub(crate) struct LocalArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RemoteArgs {
-    #[arg(long)]
-    validator_binary: PathBuf,
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
     #[arg(long)]
@@ -120,8 +118,6 @@ pub(crate) struct RemoteArgs {
     http_cidrs: Vec<String>,
     #[arg(long, default_value_t = false)]
     profiling: bool,
-    #[arg(long)]
-    spammer_binary: Option<PathBuf>,
     #[arg(long)]
     spammer_region: Option<String>,
     #[arg(long)]
@@ -322,7 +318,6 @@ pub(crate) fn generate_deployer_tag() -> String {
 mod tests {
     use super::{Cli, Command, GenerateTarget};
     use clap::Parser;
-    use std::path::PathBuf;
 
     #[test]
     fn generate_requires_matching_spammer_flags() {
@@ -351,8 +346,6 @@ mod tests {
             "--output-dir",
             "out",
             "remote",
-            "--validator-binary",
-            "validator",
             "--regions",
             "us-east-1,us-west-2",
             "--instance-type",
@@ -375,7 +368,6 @@ mod tests {
             panic!("expected remote target");
         };
 
-        assert_eq!(remote.validator_binary, PathBuf::from("validator"));
         assert_eq!(
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
