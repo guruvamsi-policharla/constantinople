@@ -1,9 +1,5 @@
 /target
-/test
-/config
 mprocs.log
 
-docker/validator
-docker/validator-debug
-docker/spammer
-docker/spammer-debug
+local/
+deploy/
