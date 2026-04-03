@@ -109,28 +109,6 @@ where
     signer: Address,
 }
 
-type VerifiedSignedTransaction<D, P, H> =
-    Verified<Transaction<D, P>, H, <P as Verifier>::Signature>;
-
-impl<D, P, H> Signed<Transaction<D, P>, H, <P as Verifier>::Signature>
-where
-    D: Digest,
-    P: PublicKey,
-    H: Hasher,
-{
-    /// Consumes the signed transaction and returns an owned verified wrapper.
-    pub fn into_verified(
-        self,
-        namespace: &[u8],
-    ) -> Result<VerifiedSignedTransaction<D, P, H>, Self> {
-        if !self.verify(namespace, &self.value().sender) {
-            return Err(self);
-        }
-
-        Ok(self.into())
-    }
-}
-
 impl<D, P> Transaction<D, P>
 where
     D: Digest,

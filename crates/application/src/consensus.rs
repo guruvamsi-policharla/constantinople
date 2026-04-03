@@ -23,7 +23,9 @@ use commonware_consensus::{
     simplex::types::Context,
     types::{Round, View},
 };
-use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
+use commonware_cryptography::{
+    BatchVerifier, Digest, Digestible, Hasher, PublicKey, certificate::Scheme,
+};
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
     db::{
@@ -56,6 +58,7 @@ use constantinople_primitives::{
 use futures::{StreamExt, future::try_join_all};
 use prometheus_client::metrics::counter::Counter;
 use rand::Rng;
+use rand_core::CryptoRngCore;
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
@@ -70,9 +73,6 @@ use tracing::{info, warn};
 /// Different platforms have different `SystemTime` limits, so we use a fixed
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
-
-/// Signed transaction carried by the wire block format.
-type WireTransaction<H, P> = SignedTransaction<P, H>;
 
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
@@ -199,15 +199,15 @@ where
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-pub struct Application<H, C, S, P, I, St> {
+pub struct Application<H, C, S, P, I, B, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     proposed_transactions: Counter,
-    _marker: PhantomData<(H, C, S, I)>,
+    _marker: PhantomData<(H, C, S, I, B)>,
 }
 
-impl<H, C, S, P, I, St> Clone for Application<H, C, S, P, I, St>
+impl<H, C, S, P, I, B, St> Clone for Application<H, C, S, P, I, B, St>
 where
     H: Hasher,
     P: Clone,
@@ -224,7 +224,7 @@ where
     }
 }
 
-impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
+impl<H: Hasher, C, S, P, I, B, St> Application<H, C, S, P, I, B, St> {
     /// Creates an application.
     ///
     /// The application keeps the execution strategy, genesis leader, and
@@ -253,24 +253,32 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     }
 }
 
-impl<H, C, S, P, I, St> Application<H, C, S, P, I, St>
+impl<H, C, S, P, I, B, St> Application<H, C, S, P, I, B, St>
 where
     C: Digest,
     H: Hasher,
     P: PublicKey,
+    B: BatchVerifier<PublicKey = P>,
     St: Strategy,
 {
     /// Verifies signed wire transactions and returns verified execution transactions.
     fn verify_transactions(
         &self,
+        rng: &mut impl CryptoRngCore,
         transactions: Vec<SignedTransaction<P, H>>,
     ) -> Option<Vec<VerifiedTransaction<P, H>>> {
-        self.strategy
-            .map_collect_vec(transactions, |transaction: WireTransaction<H, P>| {
-                transaction.into_verified(self.transaction_namespace).ok()
-            })
-            .into_iter()
-            .collect()
+        let mut batch_verifier = B::new();
+        for tx in &transactions {
+            batch_verifier.add(
+                self.transaction_namespace,
+                &tx.message_digest(),
+                &tx.value().sender,
+                &tx.signature(),
+            );
+        }
+        batch_verifier
+            .verify(rng)
+            .then(|| transactions.into_iter().map(Into::into).collect())
     }
 
     /// Returns the current Unix timestamp in milliseconds.
@@ -324,15 +332,16 @@ where
     }
 }
 
-impl<E, H, C, S, P, I, St> CApplication<E> for Application<H, C, S, P, I, St>
+impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<H, C, S, P, I, B, St>
 where
-    E: Rng + Spawner + Storage + Metrics + Clock,
+    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
     H: Hasher,
     C: Digest,
     S: Scheme<PublicKey = P>,
     P: PublicKey,
-    St: Strategy + Clone + Send + Sync + 'static,
     I: TransactionSource<C, P, H> + Sync,
+    B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+    St: Strategy + Clone + Send + Sync + 'static,
 {
     type SigningScheme = S;
     type Context = Context<C, P>;
@@ -445,14 +454,14 @@ where
     /// and compares all derived roots and ranges.
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
-        (runtime, _context): (E, Self::Context),
+        (mut runtime, _context): (E, Self::Context),
         mut ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let Block { header, body } = ancestry.next().await?.into_inner();
         let parent = ancestry.next().await?;
 
-        let Some(verified_body) = self.verify_transactions(body) else {
+        let Some(verified_body) = self.verify_transactions(&mut runtime, body) else {
             warn!(height = header.height, "verify rejected: invalid signature");
             return None;
         };
@@ -552,12 +561,12 @@ where
     /// execution or database finalization fails.
     async fn apply(
         &mut self,
-        _context: (E, Self::Context),
+        (mut runtime, _): (E, Self::Context),
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         let verified_body = self
-            .verify_transactions(block.body.clone())
+            .verify_transactions(&mut runtime, block.body.clone())
             .expect("certified block contained an invalid signature");
 
         let (state_batch, transaction_batch) = batches;

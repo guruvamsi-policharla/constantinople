@@ -66,23 +66,24 @@ pub(crate) type TransactionResolverMailbox<E, H> = commonware_glue::stateful::db
     <TransactionSyncDb<E, H> as SyncResolver>::Digest,
 >;
 
-pub(crate) type App<H, P, V, I, T> = Application<H, Commitment, ThresholdScheme<P, V>, P, I, T>;
+pub(crate) type App<H, P, V, I, B, T> =
+    Application<H, Commitment, ThresholdScheme<P, V>, P, I, B, T>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, T> =
-    commonware_glue::stateful::Mailbox<E, App<H, P, V, I, T>>;
+pub(crate) type AppMailbox<E, H, P, V, I, B, T> =
+    commonware_glue::stateful::Mailbox<E, App<H, P, V, I, B, T>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, T> = Stateful<
+pub(crate) type StatefulApp<E, H, P, V, I, B, T> = Stateful<
     E,
-    App<H, P, V, I, T>,
+    App<H, P, V, I, B, T>,
     EngineMarshalMailbox<H, P, V>,
     (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, T> = Marshaled<
+pub(crate) type MarshaledApp<E, H, P, V, I, B, T> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, T>,
+    AppMailbox<E, H, P, V, I, B, T>,
     EngineBlock<H, P>,
     ReedSolomon<H>,
     H,
@@ -96,14 +97,14 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I> = simplex::Engine<
+pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I, BV> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
     B,
     Commitment,
-    MarshaledApp<E, H, P, V, I, T>,
-    MarshaledApp<E, H, P, V, I, T>,
+    MarshaledApp<E, H, P, V, I, BV, T>,
+    MarshaledApp<E, H, P, V, I, BV, T>,
     EngineMarshalMailbox<H, P, V>,
     T,
 >;

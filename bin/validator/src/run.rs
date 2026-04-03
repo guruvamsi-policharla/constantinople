@@ -6,7 +6,11 @@ use crate::{
 };
 use commonware_codec::Encode;
 use commonware_consensus::simplex::elector::RoundRobin;
-use commonware_cryptography::{Sha256, bls12381::primitives::variant::MinSig, ed25519};
+use commonware_cryptography::{
+    Sha256,
+    bls12381::primitives::variant::MinSig,
+    ed25519::{self, Batch},
+};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
 use commonware_parallel::Rayon;
@@ -169,28 +173,29 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!(startup_mode, "selected validator startup mode");
 
         info!("initializing engine");
-        let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _>::new(
-            context.with_label("engine"),
-            EngineConfig {
-                signer: decoded.signer,
-                manager: oracle.clone(),
-                blocker: oracle,
-                namespace: b"constantinople".to_vec(),
-                output: decoded.dkg_output,
-                share: Some(decoded.share),
-                input: tx_gen_mailbox.clone(),
-                partition_prefix: decoded.partition_prefix,
-                freezer_table_initial_size: 1024,
-                strategy,
-                startup,
-                sync_config: production_sync_config(),
-                genesis_leader: decoded.genesis_leader,
-                transaction_namespace: b"constantinople-tx",
-                block_codec: Default::default(),
-                bootstrapper: bootstrapper_mailbox.clone(),
-            },
-        )
-        .await;
+        let engine =
+            Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _, Batch>::new(
+                context.with_label("engine"),
+                EngineConfig {
+                    signer: decoded.signer,
+                    manager: oracle.clone(),
+                    blocker: oracle,
+                    namespace: b"constantinople".to_vec(),
+                    output: decoded.dkg_output,
+                    share: Some(decoded.share),
+                    input: tx_gen_mailbox.clone(),
+                    partition_prefix: decoded.partition_prefix,
+                    freezer_table_initial_size: 1024,
+                    strategy,
+                    startup,
+                    sync_config: production_sync_config(),
+                    genesis_leader: decoded.genesis_leader,
+                    transaction_namespace: b"constantinople-tx",
+                    block_codec: Default::default(),
+                    bootstrapper: bootstrapper_mailbox.clone(),
+                },
+            )
+            .await;
 
         info!("starting engine");
         let engine_handle = engine.start(channels, Some(tx_gen_mailbox));

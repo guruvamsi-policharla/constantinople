@@ -25,7 +25,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
-    Hasher, PublicKey, Signer,
+    BatchVerifier, Hasher, PublicKey, Signer,
     bls12381::{
         dkg::Output,
         primitives::{group, variant::Variant},
@@ -162,7 +162,7 @@ where
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, T, I>
+pub struct Engine<E, C, M, B, H, V, L, T, I, BV>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -173,6 +173,7 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
 {
     context: ContextCell<E>,
     signer: C,
@@ -180,8 +181,8 @@ where
     blocker: B,
     state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, StateDb<E, H>>,
     transaction_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, TransactionDb<E, H>>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, T>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, T>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     #[expect(
@@ -203,10 +204,10 @@ where
     >,
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I, BV>,
 }
 
-impl<E, C, M, B, H, V, L, T, I> Engine<E, C, M, B, H, V, L, T, I>
+impl<E, C, M, B, H, V, L, T, I, BV> Engine<E, C, M, B, H, V, L, T, I, BV>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -217,6 +218,7 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
 {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {

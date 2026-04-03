@@ -24,6 +24,7 @@ commonware-cryptography.workspace = true
 commonware-parallel.workspace = true
 
 rand.workspace = true
+rand_core.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["std", "executor"] }
 tracing.workspace = true
