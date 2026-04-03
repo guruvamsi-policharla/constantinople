@@ -22,7 +22,7 @@ use commonware_utils::{NZU64, NZUsize, TryCollect, hex, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
+    VOTE_CHANNEL, bootstrapper,
 };
 use std::{future::Future, path::PathBuf, time::Duration};
 use tracing::info;
@@ -132,7 +132,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             marshal: network.register(MARSHAL_CHANNEL, quota, backlog),
             marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
-            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
         let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
 

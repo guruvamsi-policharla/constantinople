@@ -14,7 +14,7 @@ use commonware_consensus::{
     simplex::{self, types::Finalization},
     types::{Epoch, FixedEpocher, coding::Commitment},
 };
-use commonware_cryptography::{Hasher, certificate::ConstantProvider};
+use commonware_cryptography::certificate::ConstantProvider;
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{
     mmr,
@@ -42,28 +42,12 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 
 pub(crate) type StateDb<E, H> = fixed::Db<mmr::Family, E, Address, Account, H, EightCap>;
 
-pub(crate) type TransactionDb<E, H> = commonware_storage::qmdb::immutable::fixed::Db<
-    mmr::Family,
-    E,
-    <H as Hasher>::Digest,
-    (),
-    H,
-    EightCap,
->;
-
 pub(crate) type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
-pub(crate) type TransactionSyncDb<E, H> = Arc<AsyncRwLock<TransactionDb<E, H>>>;
 
 pub(crate) type StateResolverMailbox<E, H> = commonware_glue::stateful::db::p2p::Mailbox<
     StateDb<E, H>,
     <StateSyncDb<E, H> as SyncResolver>::Op,
     <StateSyncDb<E, H> as SyncResolver>::Digest,
->;
-
-pub(crate) type TransactionResolverMailbox<E, H> = commonware_glue::stateful::db::p2p::Mailbox<
-    TransactionDb<E, H>,
-    <TransactionSyncDb<E, H> as SyncResolver>::Op,
-    <TransactionSyncDb<E, H> as SyncResolver>::Digest,
 >;
 
 pub(crate) type App<H, P, V, I, B, T> =
@@ -74,12 +58,8 @@ pub(crate) type AppMailbox<E, H, P, V, I, B, T> =
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, B, T> = Stateful<
-    E,
-    App<H, P, V, I, B, T>,
-    EngineMarshalMailbox<H, P, V>,
-    (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
->;
+pub(crate) type StatefulApp<E, H, P, V, I, B, T> =
+    Stateful<E, App<H, P, V, I, B, T>, EngineMarshalMailbox<H, P, V>, StateResolverMailbox<E, H>>;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, T> = Marshaled<
     E,

@@ -43,11 +43,8 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
-    archive::immutable,
-    journal::contiguous::fixed::Config as FixedJournalConfig,
-    mmr::journaled::Config as MmrConfig,
-    qmdb::{any::FixedConfig, immutable::fixed as immutable_fixed},
-    translator::EightCap,
+    archive::immutable, journal::contiguous::fixed::Config as FixedJournalConfig,
+    mmr::journaled::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
 use constantinople_application::consensus::Application;
@@ -99,20 +96,17 @@ pub const MARSHAL_CHANNEL: u64 = 3;
 pub const MARSHAL_RESOLVER_CHANNEL: u64 = 4;
 /// State database sync resolver channel id.
 pub const STATE_RESOLVER_CHANNEL: u64 = 5;
-/// Transaction database sync resolver channel id.
-pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
 /// Bootstrapper channel id.
-pub const BOOTSTRAPPER_CHANNEL: u64 = 7;
+pub const BOOTSTRAPPER_CHANNEL: u64 = 6;
 
 /// All channel ids used by the engine, including the bootstrapper.
-pub const CHANNELS: [u64; 8] = [
+pub const CHANNELS: [u64; 7] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
     RESOLVER_CHANNEL,
     MARSHAL_CHANNEL,
     MARSHAL_RESOLVER_CHANNEL,
     STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL,
     BOOTSTRAPPER_CHANNEL,
 ];
 
@@ -130,7 +124,6 @@ where
     pub marshal: (S, R),
     pub marshal_resolver: (S, R),
     pub state_resolver: (S, R),
-    pub transaction_resolver: (S, R),
 }
 
 /// Engine initialization parameters.
@@ -180,7 +173,6 @@ where
     manager: M,
     blocker: B,
     state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, StateDb<E, H>>,
-    transaction_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, TransactionDb<E, H>>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
@@ -225,9 +217,9 @@ where
         self.marshal_mailbox.clone()
     }
 
-    /// Returns the state and transaction databases once the stateful actor has
-    /// initialized them. Blocks until the databases are ready.
-    pub async fn subscribe_databases(&self) -> (StateSyncDb<E, H>, TransactionSyncDb<E, H>) {
+    /// Returns the state database once the stateful actor has initialized it.
+    /// Blocks until the database is ready.
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H> {
         self.stateful_mailbox.subscribe_databases().await
     }
 
@@ -245,22 +237,6 @@ where
         let (state_resolver, state_sync_resolver) =
             qmdb_resolver::Actor::<_, C::PublicKey, _, _, StateDb<E, H>>::new(
                 context.with_label("state_resolver"),
-                qmdb_resolver::Config {
-                    peer_provider: config.manager.clone(),
-                    blocker: config.blocker.clone(),
-                    database: None,
-                    mailbox_size: MAILBOX_SIZE,
-                    me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
-                    priority_requests: false,
-                    priority_responses: false,
-                },
-            );
-        let (transaction_resolver, transaction_sync_resolver) =
-            qmdb_resolver::Actor::<_, C::PublicKey, _, _, TransactionDb<E, H>>::new(
-                context.with_label("transaction_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
@@ -342,24 +318,17 @@ where
             context.with_label("stateful"),
             StatefulConfig {
                 app: application,
-                db_config: (
-                    state_db_config(
-                        &config.partition_prefix,
-                        &page_cache,
-                        merkle_thread_pool.as_ref(),
-                    ),
-                    transaction_db_config(
-                        &config.partition_prefix,
-                        &page_cache,
-                        merkle_thread_pool.as_ref(),
-                    ),
+                db_config: state_db_config(
+                    &config.partition_prefix,
+                    &page_cache,
+                    merkle_thread_pool.as_ref(),
                 ),
                 input_provider: config.input,
                 marshal: marshal_mailbox.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 partition_prefix: format!("{}_stateful", config.partition_prefix),
                 startup: config.startup,
-                resolvers: (state_sync_resolver, transaction_sync_resolver),
+                resolvers: state_sync_resolver,
                 sync_config: config.sync_config,
             },
         );
@@ -413,7 +382,6 @@ where
             manager: config.manager,
             blocker: config.blocker,
             state_resolver,
-            transaction_resolver,
             stateful,
             stateful_mailbox,
             shards,
@@ -462,9 +430,6 @@ where
         );
 
         let state_resolver_handle = self.state_resolver.start(channels.state_resolver);
-        let transaction_resolver_handle = self
-            .transaction_resolver
-            .start(channels.transaction_resolver);
         let shard_handle = self.shards.start(channels.marshal);
         let stateful_handle = self.stateful.start();
 
@@ -479,7 +444,6 @@ where
 
         if let Err(error) = try_join_all(vec![
             state_resolver_handle,
-            transaction_resolver_handle,
             shard_handle,
             stateful_handle,
             marshal_handle,
@@ -638,30 +602,6 @@ fn state_db_config(
             partition: format!("{partition_prefix}-state-log"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache: page_cache.clone(),
-            write_buffer: DB_WRITE_BUFFER,
-        },
-        translator: EightCap,
-    }
-}
-
-fn transaction_db_config(
-    partition_prefix: &str,
-    page_cache: &CacheRef,
-    thread_pool: Option<&ThreadPool>,
-) -> immutable_fixed::Config<EightCap> {
-    immutable_fixed::Config {
-        merkle_config: MmrConfig {
-            journal_partition: format!("{partition_prefix}-transactions-journal"),
-            metadata_partition: format!("{partition_prefix}-transactions-metadata"),
-            items_per_blob: ITEMS_PER_BLOB,
-            write_buffer: DB_WRITE_BUFFER,
-            thread_pool: thread_pool.cloned(),
-            page_cache: page_cache.clone(),
-        },
-        log: FixedJournalConfig {
-            partition: format!("{partition_prefix}-transactions-log"),
-            page_cache: page_cache.clone(),
-            items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,

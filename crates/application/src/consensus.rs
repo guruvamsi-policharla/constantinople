@@ -7,7 +7,7 @@
 //! - filtering or rejecting invalid signatures before execution
 //! - loading processor state from speculative database batches
 //! - executing transaction slices against that loaded state
-//! - finalizing state roots and transaction roots
+//! - finalizing state roots while carrying placeholder transaction history
 //! - verifying and applying certified blocks
 //!
 //! The execution boundary is intentionally narrow: the [`Application`] owns
@@ -28,10 +28,7 @@ use commonware_cryptography::{
 };
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
-    db::{
-        DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized,
-        immutable::ImmutableUnmerkleized,
-    },
+    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
@@ -79,22 +76,8 @@ const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
-/// Shared immutable transaction database handle.
-type TransactionDatabase<E, H> = Arc<
-    AsyncRwLock<
-        commonware_storage::qmdb::immutable::fixed::Db<
-            mmr::Family,
-            E,
-            <H as Hasher>::Digest,
-            (),
-            H,
-            EightCap,
-        >,
-    >,
->;
-
-/// The pair of backing databases owned by the application.
-type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
+/// The backing database owned by the application.
+type Databases<E, H, T> = StateDatabase<E, H, T>;
 
 /// Unmerkleized application state batch used for processor read-through.
 type StateBatch<E, H, T> = AnyUnmerkleized<
@@ -105,26 +88,8 @@ type StateBatch<E, H, T> = AnyUnmerkleized<
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
 
-type TransactionJournal<E, H> = FixedJournal<
-    E,
-    commonware_storage::qmdb::immutable::fixed::Operation<<H as Hasher>::Digest, ()>,
->;
-
-/// Unmerkleized transaction batch used for append-only transaction storage.
-type TransactionBatch<E, H> = ImmutableUnmerkleized<
-    E,
-    <H as Hasher>::Digest,
-    FixedEncoding<()>,
-    TransactionJournal<E, H>,
-    H,
-    EightCap,
->;
-
 /// Merkleized state database produced after finalization.
 type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
-
-/// Merkleized transaction database produced after finalization.
-type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
 
 /// Errors raised while preparing processor state from the backing database.
 #[derive(Debug, Error)]
@@ -212,21 +177,6 @@ where
 {
     changeset.iter().fold(batch, |batch, (address, account)| {
         batch.write(*address, Some(*account))
-    })
-}
-
-/// Records verified transaction digests in the transaction batch.
-fn record_transactions<E, H, PK>(
-    batch: TransactionBatch<E, H>,
-    transactions: &[VerifiedTransaction<PK, H>],
-) -> TransactionBatch<E, H>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    PK: PublicKey,
-{
-    transactions.iter().fold(batch, |batch, transaction| {
-        batch.set(*transaction.message_digest(), ())
     })
 }
 
@@ -449,18 +399,11 @@ where
     async fn finalize_execution<E>(
         &self,
         state_batch: StateBatch<E, H, EightCap>,
-        transaction_batch: TransactionBatch<E, H>,
-    ) -> Result<
-        (
-            StateMerkleized<E, H, EightCap>,
-            TransactionsMerkleized<E, H>,
-        ),
-        StorageError<mmr::Family>,
-    >
+    ) -> Result<StateMerkleized<E, H, EightCap>, StorageError<mmr::Family>>
     where
         E: Storage + Clock + Metrics,
     {
-        futures::try_join!(state_batch.merkleize(), transaction_batch.merkleize(),)
+        state_batch.merkleize().await
     }
 }
 
@@ -483,22 +426,13 @@ where
 
     /// Returns the sync targets required to fetch the block's state.
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        let state_target = Target {
+        Target {
             root: block.header.state_root,
             range: non_empty_range!(
                 mmr::Location::new(block.header.state_range.start()),
                 mmr::Location::new(block.header.state_range.end())
             ),
-        };
-        let transactions_target = Target {
-            root: block.header.transactions_root,
-            range: non_empty_range!(
-                mmr::Location::new(block.header.transactions_range.start()),
-                mmr::Location::new(block.header.transactions_range.end())
-            ),
-        };
-
-        (state_target, transactions_target)
+        }
     }
 
     /// Builds the genesis block.
@@ -529,10 +463,8 @@ where
         let body = input.propose(&parent.header, &context).await;
         let input_ms = elapsed_ms(input_started_at);
 
-        let (state_batch, transaction_batch) = batches;
-
         let load_state_started_at = Instant::now();
-        let state = load_state(&state_batch, &body, self.strategy.parallelism_hint())
+        let state = load_state(&batches, &body, self.strategy.parallelism_hint())
             .await
             .expect("proposal state loading must succeed");
         let load_state_ms = elapsed_ms(load_state_started_at);
@@ -547,18 +479,15 @@ where
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
-        let transaction_batch = record_transactions(transaction_batch, &valid);
-        let state_batch = apply_changeset(state_batch, &changeset);
+        let state_batch = apply_changeset(batches, &changeset);
 
         let finalize_started_at = Instant::now();
-        let (state_merkleized, transaction_merkleized) = self
-            .finalize_execution(state_batch, transaction_batch)
+        let state_merkleized = self
+            .finalize_execution(state_batch)
             .await
             .expect("database merkleization must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
         let state_diff_len = state_merkleized.diff_len();
-        let transaction_diff_len = transaction_merkleized.diff_len();
-        let transactions_end = parent.header.transactions_range.end() + valid.len() as u64 + 1;
 
         let header = Header {
             context,
@@ -570,8 +499,8 @@ where
                 *state_merkleized.inactivity_floor(),
                 *state_merkleized.size()
             ),
-            transactions_root: transaction_merkleized.root(),
-            transactions_range: non_empty_range!(0, transactions_end),
+            transactions_root: H::Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 1),
         };
         let body = valid
             .into_iter()
@@ -590,14 +519,13 @@ where
             execute_ms,
             finalize_ms,
             state_diff_len,
-            transaction_diff_len,
             total_ms = elapsed_ms(propose_started_at),
             "proposed block"
         );
 
         Some(Proposed {
             block,
-            merkleized: (state_merkleized, transaction_merkleized),
+            merkleized: state_merkleized,
         })
     }
 
@@ -641,19 +569,11 @@ where
         runtime.sleep_until(deadline).await;
         let sleep_ms = elapsed_ms(sleep_started_at);
 
-        let (state_batch, transaction_batch) = batches;
-
         let load_state_started_at = Instant::now();
-        let state = load_state(
-            &state_batch,
-            &verified_body,
-            self.strategy.parallelism_hint(),
-        )
-        .await
-        .expect("block state loading during verification must succeed");
+        let state = load_state(&batches, &verified_body, self.strategy.parallelism_hint())
+            .await
+            .expect("block state loading during verification must succeed");
         let load_state_ms = elapsed_ms(load_state_started_at);
-
-        let body_len = verified_body.len();
 
         let execute_started_at = Instant::now();
         let Some(changeset) = executor::execute(state, &verified_body) else {
@@ -665,24 +585,20 @@ where
         };
         let execute_ms = elapsed_ms(execute_started_at);
 
-        let transaction_batch = record_transactions(transaction_batch, &verified_body);
-        let state_batch = apply_changeset(state_batch, &changeset);
+        let state_batch = apply_changeset(batches, &changeset);
 
         let finalize_started_at = Instant::now();
-        let (state_merkleized, transaction_merkleized) = self
-            .finalize_execution(state_batch, transaction_batch)
+        let state_merkleized = self
+            .finalize_execution(state_batch)
             .await
             .expect("database merkleization during verification must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
         let state_diff_len = state_merkleized.diff_len();
-        let transaction_diff_len = transaction_merkleized.diff_len();
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
             *state_merkleized.size()
         );
-        let transactions_end = parent.header.transactions_range.end() + body_len as u64 + 1;
-        let transactions_range = non_empty_range!(0, transactions_end);
 
         if state_merkleized.root() != header.state_root {
             warn!(
@@ -698,17 +614,17 @@ where
             );
             return None;
         }
-        if transaction_merkleized.root() != header.transactions_root {
+        if header.transactions_root != H::Digest::EMPTY {
             warn!(
                 height = header.height,
-                "verify rejected: transactions root mismatch"
+                "verify rejected: unexpected transactions root"
             );
             return None;
         }
-        if transactions_range != header.transactions_range {
+        if header.transactions_range != non_empty_range!(0, 1) {
             warn!(
                 height = header.height,
-                "verify rejected: transactions range mismatch"
+                "verify rejected: unexpected transactions range"
             );
             return None;
         }
@@ -725,11 +641,10 @@ where
             execute_ms,
             finalize_ms,
             state_diff_len,
-            transaction_diff_len,
             total_ms = elapsed_ms(verify_started_at),
             "verified block"
         );
-        Some((state_merkleized, transaction_merkleized))
+        Some(state_merkleized)
     }
 
     /// Applies a certified block to speculative batches and returns merkleized state.
@@ -737,7 +652,7 @@ where
     /// Unlike verification, application assumes consensus has already
     /// certified the block. It reconstitutes verified execution transactions
     /// from the signed wire block and deterministically replays them to
-    /// derive the merkleized database pair.
+    /// derive the merkleized state batch.
     ///
     /// # Panics
     ///
@@ -753,19 +668,13 @@ where
             .verify_transactions(&mut runtime, block.body.clone())
             .expect("certified block contained an invalid signature");
 
-        let (state_batch, transaction_batch) = batches;
-        let state = load_state(
-            &state_batch,
-            &verified_body,
-            self.strategy.parallelism_hint(),
-        )
-        .await
-        .expect("state loading must succeed for certified apply");
+        let state = load_state(&batches, &verified_body, self.strategy.parallelism_hint())
+            .await
+            .expect("state loading must succeed for certified apply");
         let changeset = executor::execute(state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
-        let transaction_batch = record_transactions(transaction_batch, &verified_body);
-        let state_batch = apply_changeset(state_batch, &changeset);
-        self.finalize_execution(state_batch, transaction_batch)
+        let state_batch = apply_changeset(batches, &changeset);
+        self.finalize_execution(state_batch)
             .await
             .expect("database merkleization must succeed")
     }
@@ -773,8 +682,8 @@ where
 
 /// Creates the genesis block.
 ///
-/// The genesis block starts with empty state, empty transactions, and the
-/// provided leader and timestamp.
+/// The genesis block starts with empty state, empty transaction-history
+/// placeholders, and the provided leader and timestamp.
 pub fn genesis_block<C, P, H>(hasher: &mut H, leader: P, timestamp: u64) -> SealedBlock<C, P, H>
 where
     C: Digest,
@@ -803,8 +712,9 @@ where
 mod tests {
     use super::{load_state_chunk_size, verify_transaction_chunks};
     use commonware_codec::{DecodeExt, Encode, FixedSize};
-    use commonware_cryptography::{Signer as _, blake3, ed25519};
+    use commonware_cryptography::{Digest, Signer as _, blake3, ed25519};
     use commonware_parallel::Rayon;
+    use commonware_utils::non_empty_range;
     use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
     use core::num::{NonZeroU64, NonZeroUsize};
     use rand::{SeedableRng, rngs::StdRng};
@@ -960,5 +870,18 @@ mod tests {
         assert_eq!(load_state_chunk_size(16, 4), 2);
         assert_eq!(load_state_chunk_size(17, 4), 3);
         assert_eq!(load_state_chunk_size(32, 0), 16);
+    }
+
+    #[test]
+    fn genesis_block_uses_empty_transaction_history() {
+        let leader = TestSigner::from_seed(41);
+        let block = super::genesis_block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>(
+            &mut blake3::Blake3::default(),
+            leader.key.public_key(),
+            0,
+        );
+
+        assert_eq!(block.header.transactions_root, blake3::Digest::EMPTY);
+        assert_eq!(block.header.transactions_range, non_empty_range!(0, 1));
     }
 }
