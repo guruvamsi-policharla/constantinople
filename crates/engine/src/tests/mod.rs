@@ -19,6 +19,7 @@ use commonware_cryptography::{
         dkg::Output,
         primitives::{group::Share, variant::MinSig},
     },
+    ed25519::Batch as Ed25519Batch,
 };
 use commonware_glue::{
     simulate::{
@@ -218,35 +219,45 @@ impl EngineDefinition for TestEngineDefinition {
                 );
                 let reporter =
                     HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
-                let engine =
-                    Engine::<_, _, _, _, TestHasher, MinSig, RoundRobin<TestHasher>, _, _>::new(
-                        context.with_label("engine"),
-                        Config {
-                            signer,
-                            manager,
-                            blocker,
-                            namespace: ENGINE_NAMESPACE.to_vec(),
-                            output,
-                            share,
-                            input,
-                            partition_prefix,
-                            freezer_table_initial_size: 1024,
-                            strategy: Sequential,
-                            startup,
-                            sync_config: SyncEngineConfig {
-                                fetch_batch_size: NZU64!(16),
-                                apply_batch_size: 64,
-                                max_outstanding_requests: 8,
-                                update_channel_size: NZUsize!(256),
-                                max_retained_roots: 32,
-                            },
-                            genesis_leader,
-                            transaction_namespace: TRANSACTION_NAMESPACE,
-                            block_codec: Default::default(),
-                            bootstrapper: bootstrapper_mailbox.clone(),
+                let engine = Engine::<
+                    _,
+                    _,
+                    _,
+                    _,
+                    TestHasher,
+                    MinSig,
+                    RoundRobin<TestHasher>,
+                    _,
+                    _,
+                    Ed25519Batch,
+                >::new(
+                    context.with_label("engine"),
+                    Config {
+                        signer,
+                        manager,
+                        blocker,
+                        namespace: ENGINE_NAMESPACE.to_vec(),
+                        output,
+                        share,
+                        input,
+                        partition_prefix,
+                        freezer_table_initial_size: 1024,
+                        strategy: Sequential,
+                        startup,
+                        sync_config: SyncEngineConfig {
+                            fetch_batch_size: NZU64!(16),
+                            apply_batch_size: 64,
+                            max_outstanding_requests: 8,
+                            update_channel_size: NZUsize!(256),
+                            max_retained_roots: 32,
                         },
-                    )
-                    .await;
+                        genesis_leader,
+                        transaction_namespace: TRANSACTION_NAMESPACE,
+                        block_codec: Default::default(),
+                        bootstrapper: bootstrapper_mailbox.clone(),
+                    },
+                )
+                .await;
 
                 let marshal = engine.marshal_mailbox();
                 if state_sender

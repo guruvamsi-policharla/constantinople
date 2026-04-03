@@ -37,9 +37,9 @@ use commonware_glue::stateful::{
     db::{SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
-use commonware_parallel::Strategy;
+use commonware_parallel::{Strategy, ThreadPool};
 use commonware_runtime::{
-    BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
+    BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage, ThreadPooler,
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
@@ -164,7 +164,7 @@ where
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, T, I, BV>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -209,7 +209,7 @@ where
 
 impl<E, C, M, B, H, V, L, T, I, BV> Engine<E, C, M, B, H, V, L, T, I, BV>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -234,6 +234,7 @@ where
     /// Initializes the full engine stack.
     pub async fn new(context: E, config: Config<C, M, B, V, T, I, H>) -> Self {
         let page_cache = CacheRef::from_pooler(&context, PAGE_CACHE_PAGE_SIZE, PAGE_CACHE_CAPACITY);
+        let merkle_thread_pool = qmdb_merkle_thread_pool(&context, &config.strategy);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
         let scheme =
@@ -342,8 +343,16 @@ where
             StatefulConfig {
                 app: application,
                 db_config: (
-                    state_db_config(&config.partition_prefix, &page_cache),
-                    transaction_db_config(&config.partition_prefix, &page_cache),
+                    state_db_config(
+                        &config.partition_prefix,
+                        &page_cache,
+                        merkle_thread_pool.as_ref(),
+                    ),
+                    transaction_db_config(
+                        &config.partition_prefix,
+                        &page_cache,
+                        merkle_thread_pool.as_ref(),
+                    ),
                 ),
                 input_provider: config.input,
                 marshal: marshal_mailbox.clone(),
@@ -592,14 +601,37 @@ where
     archive
 }
 
-fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig<EightCap> {
+fn qmdb_merkle_thread_pool<E, T>(context: &E, strategy: &T) -> Option<ThreadPool>
+where
+    E: ThreadPooler,
+    T: Strategy,
+{
+    let parallelism = strategy.parallelism_hint();
+    if parallelism <= 1 {
+        return None;
+    }
+
+    let concurrency = NonZero::new(parallelism).expect("parallelism hint must be non-zero");
+    Some(
+        context
+            .with_label("qmdb_merkle")
+            .create_thread_pool(concurrency)
+            .expect("failed to create QMDB merkleization thread pool"),
+    )
+}
+
+fn state_db_config(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    thread_pool: Option<&ThreadPool>,
+) -> FixedConfig<EightCap> {
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
-            thread_pool: None,
+            thread_pool: thread_pool.cloned(),
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -615,6 +647,7 @@ fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig
 fn transaction_db_config(
     partition_prefix: &str,
     page_cache: &CacheRef,
+    thread_pool: Option<&ThreadPool>,
 ) -> immutable_fixed::Config<EightCap> {
     immutable_fixed::Config {
         merkle_config: MmrConfig {
@@ -622,7 +655,7 @@ fn transaction_db_config(
             metadata_partition: format!("{partition_prefix}-transactions-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
-            thread_pool: None,
+            thread_pool: thread_pool.cloned(),
             page_cache: page_cache.clone(),
         },
         log: FixedJournalConfig {
