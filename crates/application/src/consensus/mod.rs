@@ -266,7 +266,7 @@ where
         let input_ms = input_started_at.elapsed().as_millis();
 
         let load_state_started_at = Instant::now();
-        let state = load_state(&batches, &body, self.strategy.parallelism_hint())
+        let state = load_state(&batches, &body)
             .await
             .expect("proposal state loading must succeed");
         let load_state_ms = load_state_started_at.elapsed().as_millis();
@@ -370,7 +370,7 @@ where
         let sleep_ms = sleep_started_at.elapsed().as_millis();
 
         let load_state_started_at = Instant::now();
-        let state = load_state(&batches, &verified_body, self.strategy.parallelism_hint())
+        let state = load_state(&batches, &verified_body)
             .await
             .expect("block state loading during verification must succeed");
         let load_state_ms = load_state_started_at.elapsed().as_millis();
@@ -466,7 +466,7 @@ where
             .verify_transactions(&mut runtime, block.body.clone())
             .expect("certified block contained an invalid signature");
 
-        let state = load_state(&batches, &verified_body, self.strategy.parallelism_hint())
+        let state = load_state(&batches, &verified_body)
             .await
             .expect("state loading must succeed for certified apply");
         let changeset = executor::execute(state, &verified_body)

@@ -9,15 +9,12 @@ use commonware_storage::{
     qmdb::Error as StorageError,
     translator::Translator,
 };
-use constantinople_primitives::{SignedTransaction, VerifiedTransaction};
+use constantinople_primitives::{Account, SignedTransaction, VerifiedTransaction};
 use futures::{StreamExt, stream::FuturesUnordered};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 
 use super::StateBatch;
-
-/// Number of `load_state` tasks to schedule per available worker.
-const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
 
 /// Loads the accounts needed by `transactions` from `batch`.
 ///
@@ -27,7 +24,6 @@ const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
 pub async fn load_state<E, H, P, T>(
     batch: &StateBatch<E, H, T>,
     transactions: &[VerifiedTransaction<P, H>],
-    parallelism_hint: usize,
 ) -> Result<State, StorageError<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -51,40 +47,23 @@ where
     let db = batch.lock().await;
     let db = &*db;
     let state_batch = batch.inner();
-    let chunk_size = load_state_chunk_size(account_keys.len(), parallelism_hint);
     let pending_reads = account_keys
-        .chunks(chunk_size)
+        .iter()
         .enumerate()
-        .map(|(chunk_index, chunk)| async move {
-            let mut accounts = Vec::with_capacity(chunk.len());
-            for address in chunk {
-                let account = state_batch.get(address, db).await?;
-                accounts.push(account.unwrap_or_default());
-            }
-
-            Ok::<_, StorageError<mmr::Family>>((chunk_index, accounts))
+        .map(|(index, address)| async move {
+            let account = state_batch.get(address, db).await?;
+            Ok::<_, StorageError<mmr::Family>>((index, account.unwrap_or_default()))
         })
         .collect::<FuturesUnordered<_>>();
-    let mut chunked_accounts = pending_reads
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    chunked_accounts.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
 
-    let mut accounts = Vec::with_capacity(account_keys.len());
-    for (_, chunk_accounts) in chunked_accounts {
-        accounts.extend(chunk_accounts);
+    let mut accounts = vec![Account::default(); account_keys.len()];
+    let results: Vec<_> = pending_reads.collect().await;
+    for result in results {
+        let (index, account) = result?;
+        accounts[index] = account;
     }
 
     Ok(State::from_loaded_accounts(account_keys, accounts))
-}
-
-pub(super) fn load_state_chunk_size(address_count: usize, parallelism_hint: usize) -> usize {
-    let worker_count = parallelism_hint.max(1);
-    let chunk_count = address_count.min(worker_count * LOAD_STATE_TASKS_PER_WORKER);
-
-    address_count.div_ceil(chunk_count.max(1))
 }
 
 /// Verifies a batch of signed transactions.
@@ -168,7 +147,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{load_state_chunk_size, verify_transaction_chunks};
+    use super::verify_transaction_chunks;
     use commonware_codec::{DecodeExt, Encode, FixedSize};
     use commonware_cryptography::{Digest, Signer as _, blake3, ed25519};
     use commonware_parallel::Rayon;
@@ -320,12 +299,4 @@ mod tests {
         assert!(verified.is_none());
     }
 
-    #[test]
-    fn load_state_chunk_size_scales_with_parallelism() {
-        assert_eq!(load_state_chunk_size(1, 4), 1);
-        assert_eq!(load_state_chunk_size(8, 4), 1);
-        assert_eq!(load_state_chunk_size(16, 4), 2);
-        assert_eq!(load_state_chunk_size(17, 4), 3);
-        assert_eq!(load_state_chunk_size(32, 0), 16);
-    }
 }
