@@ -104,7 +104,6 @@ impl<D: Digest, P: PublicKey> Sealable for Transaction<D, P> {
 
     fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
         let seal = self.hash_slow(hasher);
-
         Sealed::new_unchecked(self, seal)
     }
 }

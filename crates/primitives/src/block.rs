@@ -47,7 +47,6 @@ where
 {
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
-        hasher.reset();
         hasher.update(self.encode().as_ref());
         hasher.finalize()
     }

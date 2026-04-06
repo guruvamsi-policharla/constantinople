@@ -36,7 +36,6 @@ impl Address {
         H: Hasher,
         P: PublicKey,
     {
-        hasher.reset();
         hasher.update(public_key.as_ref());
         let mut address = [0u8; Self::SIZE];
         address.copy_from_slice(&hasher.finalize().as_ref()[..Self::SIZE]);

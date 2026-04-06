@@ -10,7 +10,7 @@ use commonware_utils::{
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Address, Header, SealedBlock, Transaction, VerifiedTransaction};
 use rand_core::CryptoRngCore;
-use std::marker::PhantomData;
+use std::{marker::PhantomData, mem};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct TransactionGenerator<E, C, P, H, S>
@@ -39,7 +39,6 @@ where
     pub fn new(mut context: E, n_keys: usize, strategy: S) -> (Self, Mailbox<C, P::PublicKey, H>) {
         let mut hasher = H::default();
         let keys = (0..n_keys)
-            .into_iter()
             .map(|_| {
                 let signer = P::random(&mut context);
                 let address = Address::from_public_key(&mut hasher, &signer.public_key());
@@ -75,7 +74,7 @@ where
             self.context,
             on_stopped => {},
             Some(Message::GetTransactions { response }) = self.mailbox.recv() else break => {
-                response.send_lossy(cached_transactions.drain(..).collect());
+                response.send_lossy(mem::take(&mut cached_transactions));
                 self.generate_transactions(generation, &mut cached_transactions);
                 generation += 1;
             }
