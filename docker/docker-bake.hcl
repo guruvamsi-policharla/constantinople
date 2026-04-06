@@ -14,14 +14,9 @@ variable "PLATFORMS" {
   default = "linux/arm64"
 }
 
-target "constantinople-validator" {
+target "builder" {
   context = "."
   dockerfile = "docker/Dockerfile"
   platforms = split(",", PLATFORMS)
-  tags = ["constantinople-validator-builder:${DEFAULT_TAG}"]
-  args = {
-    PACKAGE_NAME = "constantinople-validator"
-    BINARY_NAME = "constantinople"
-    OUTPUT_NAME = "validator"
-  }
+  tags = ["constantinople-builder:${DEFAULT_TAG}"]
 }

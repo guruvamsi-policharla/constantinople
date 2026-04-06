@@ -120,7 +120,7 @@ The generate step writes:
 Then build the deployable ARM64 binaries into that directory:
 
 ```sh
-just deploy-binaries
+just build-deployer-binaries
 ```
 
 The Docker build step then writes:

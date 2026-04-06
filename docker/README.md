@@ -13,7 +13,7 @@ ARM64 binaries for AWS Graviton.
 The `justfile` wraps the Docker build flow:
 
 ```sh
-just docker-images
+just build-image
 ```
 
 By default, these build ARM64 images for AWS Graviton (`linux/arm64`).
@@ -32,7 +32,7 @@ This writes:
 #### Build Deployable Binary
 
 ```sh
-just deploy-binaries
+just build-deployer-binaries
 ```
 
 This writes:

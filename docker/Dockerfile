@@ -21,14 +21,6 @@ ENV CARGO_PROFILE_RELEASE_DEBUG=true
 RUN rustup default stable
 RUN rustup target add aarch64-unknown-linux-gnu
 
-ARG PACKAGE_NAME
-ARG BINARY_NAME
-ARG OUTPUT_NAME
-
-ENV PACKAGE_NAME="${PACKAGE_NAME}"
-ENV BINARY_NAME="${BINARY_NAME}"
-ENV OUTPUT_NAME="${OUTPUT_NAME}"
-
 WORKDIR /constantinople
 
 ENTRYPOINT ["/bin/bash", "-c"]

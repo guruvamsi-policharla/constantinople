@@ -1,0 +1,14 @@
+# Build the Docker builder image
+build-image:
+  docker buildx bake --progress plain -f docker/docker-bake.hcl builder
+
+# Build the ARM64 validator binary into deploy/
+validator-binary: build-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-validator \
+    -e BINARY_NAME=constantinople \
+    -e OUTPUT_NAME=validator \
+    constantinople-builder:local
+
+# Build the ARM64 deployable binaries into deploy/
+build-deployer-binaries: validator-binary
