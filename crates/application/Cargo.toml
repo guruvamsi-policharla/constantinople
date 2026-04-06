@@ -28,7 +28,6 @@ rand_core.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["std", "executor"] }
 tracing.workspace = true
-thiserror.workspace = true
 commonware-storage.workspace = true
 prometheus-client.workspace = true
 

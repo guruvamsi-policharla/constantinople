@@ -14,10 +14,7 @@
 //! the execution strategy and QMDB integration, while the processor owns the
 //! in-memory state transition logic.
 
-use crate::processor::{
-    executor::{self, Changeset, ProposalOutput},
-    state::State,
-};
+use crate::processor::executor::{self, Changeset, ProposalOutput};
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -37,7 +34,6 @@ use commonware_storage::{
     journal::contiguous::fixed::Journal as FixedJournal,
     mmr,
     qmdb::{
-        Error as StorageError,
         any::{
             operation::Operation as AnyOperation,
             unordered::{Update as UnorderedUpdate, fixed},
@@ -45,33 +41,33 @@ use commonware_storage::{
         },
         sync::Target,
     },
-    translator::{EightCap, Translator},
+    translator::EightCap,
 };
 use commonware_utils::{non_empty_range, sync::AsyncRwLock};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
     Account, Address, Block, Header, Sealable, SealedBlock, SignedTransaction, VerifiedTransaction,
 };
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::StreamExt;
 use prometheus_client::metrics::counter::Counter;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::Rng;
 use rand_core::CryptoRngCore;
 use std::{
     marker::PhantomData,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use thiserror::Error;
 use tracing::{info, warn};
+
+mod utils;
+pub use utils::load_state;
+use utils::{verify_transaction_batch, verify_transaction_chunks};
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
 ///
 /// Different platforms have different `SystemTime` limits, so we use a fixed
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
-
-/// Number of `load_state` tasks to schedule per available worker.
-const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
 
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
@@ -85,81 +81,6 @@ type StateBatch<E, H, T> = AnyUnmerkleized<
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
 
-/// Errors raised while preparing processor state from the backing database.
-#[derive(Debug, Error)]
-pub enum ProcessorError {
-    #[error("state database access failed")]
-    Database(#[from] StorageError<mmr::Family>),
-}
-
-/// Loads the accounts needed by `transactions` from `batch`.
-///
-/// The loader gathers every unique sender and recipient across the block body,
-/// reads each account at most once, and builds an in-memory [`State`] snapshot
-/// for verification.
-pub async fn load_state<E, H, P, T>(
-    batch: &StateBatch<E, H, T>,
-    transactions: &[VerifiedTransaction<P, H>],
-    parallelism_hint: usize,
-) -> Result<State, ProcessorError>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-    T: Translator,
-{
-    let mut account_keys = Vec::with_capacity(transactions.len().saturating_mul(2));
-    for transaction in transactions {
-        account_keys.push(transaction.signer());
-        account_keys.push(transaction.value().to);
-    }
-
-    account_keys.sort_unstable();
-    account_keys.dedup();
-
-    if account_keys.is_empty() {
-        return Ok(State::from_loaded_accounts(account_keys, Vec::new()));
-    }
-
-    let db = batch.lock().await;
-    let db = &*db;
-    let state_batch = batch.inner();
-    let chunk_size = load_state_chunk_size(account_keys.len(), parallelism_hint);
-    let pending_reads = account_keys
-        .chunks(chunk_size)
-        .enumerate()
-        .map(|(chunk_index, chunk)| async move {
-            let mut accounts = Vec::with_capacity(chunk.len());
-            for address in chunk {
-                let account = state_batch.get(address, db).await?;
-                accounts.push(account.unwrap_or_default());
-            }
-
-            Ok::<_, ProcessorError>((chunk_index, accounts))
-        })
-        .collect::<FuturesUnordered<_>>();
-    let mut chunked_accounts = pending_reads
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    chunked_accounts.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
-
-    let mut accounts = Vec::with_capacity(account_keys.len());
-    for (_, chunk_accounts) in chunked_accounts {
-        accounts.extend(chunk_accounts);
-    }
-
-    Ok(State::from_loaded_accounts(account_keys, accounts))
-}
-
-fn load_state_chunk_size(address_count: usize, parallelism_hint: usize) -> usize {
-    let worker_count = parallelism_hint.max(1);
-    let chunk_count = address_count.min(worker_count * LOAD_STATE_TASKS_PER_WORKER);
-
-    address_count.div_ceil(chunk_count.max(1))
-}
-
 /// Writes a changeset of account updates to a state batch.
 fn apply_changeset<E, H>(
     batch: StateBatch<E, H, EightCap>,
@@ -172,85 +93,6 @@ where
     changeset.iter().fold(batch, |batch, (address, account)| {
         batch.write(*address, Some(*account))
     })
-}
-
-/// Verifies a batch of signed transactions.
-fn verify_transaction_batch<P, H, B>(
-    namespace: &[u8],
-    rng: &mut impl CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
-) -> bool
-where
-    P: PublicKey,
-    H: Hasher,
-    B: BatchVerifier<PublicKey = P>,
-{
-    let mut batch_verifier = B::new();
-    for transaction in transactions {
-        // Decode the sender and signature inside the worker so decompression
-        // happens on the rayon pool instead of the runtime thread.
-        let Some(sender) = transaction.value().sender() else {
-            return false;
-        };
-        let Some(signature) = transaction.signature() else {
-            return false;
-        };
-
-        if !batch_verifier.add(
-            namespace,
-            transaction.message_digest().as_ref(),
-            sender,
-            signature,
-        ) {
-            return false;
-        }
-    }
-
-    batch_verifier.verify(rng)
-}
-
-/// Verifies transactions across strategy partitions and preserves block order.
-fn verify_transaction_chunks<P, H, B, St>(
-    strategy: &St,
-    namespace: &'static [u8],
-    rng: &mut impl CryptoRngCore,
-    transactions: Vec<SignedTransaction<P, H>>,
-) -> Option<Vec<VerifiedTransaction<P, H>>>
-where
-    P: PublicKey,
-    H: Hasher,
-    B: BatchVerifier<PublicKey = P>,
-    St: Strategy,
-{
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let chunk_count = strategy.parallelism_hint().min(transactions.len());
-    let chunk_size = transactions.len().div_ceil(chunk_count);
-
-    let mut remaining = transactions;
-    let mut chunks = Vec::with_capacity(chunk_count);
-    while !remaining.is_empty() {
-        let split_at = chunk_size.min(remaining.len());
-        let rest = remaining.split_off(split_at);
-        let mut rng_seed = [0; 32];
-        rng.fill_bytes(&mut rng_seed);
-        chunks.push((rng_seed, remaining));
-        remaining = rest;
-    }
-
-    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
-        let mut chunk_rng = StdRng::from_seed(rng_seed);
-        verify_transaction_batch::<P, H, B>(namespace, &mut chunk_rng, &chunk)
-            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
-    });
-
-    let mut verified = Vec::new();
-    for chunk in verified_chunks {
-        verified.extend(chunk?);
-    }
-    Some(verified)
 }
 
 /// Core constantinople application.
