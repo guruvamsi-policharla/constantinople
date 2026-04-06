@@ -417,7 +417,7 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
         })
         .crash(Crash::Random {
             frequency: Duration::from_secs(3),
-            downtime: Duration::from_secs(1),
+            downtime: Duration::from_millis(500),
             count: 1,
         })
         .exit_condition(StateSyncReadyAtHeight::new(200))
@@ -490,8 +490,8 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
         .link(default_link())
         .seeds(0..2)
         .crash(Crash::Random {
-            frequency: Duration::from_secs(4),
-            downtime: Duration::from_secs(1),
+            frequency: Duration::from_secs(3),
+            downtime: Duration::from_millis(300),
             count,
         })
         .exit_condition(FinalizedHeightAtLeast::new(80))

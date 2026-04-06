@@ -156,7 +156,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _, _>::new(
             context.with_label("tx_gen"),
-            8192,
+            8192 * 4,
             strategy.clone(),
         );
         let tx_gen_handle = tx_gen.start();
