@@ -2,10 +2,10 @@
 
 use super::executor::Changeset;
 use constantinople_primitives::{Account, Address};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Fully loaded account state for one execution batch.
-pub type State = BTreeMap<Address, Account>;
+pub type State = HashMap<Address, Account>;
 
 /// Mutable overlay on top of a base [`State`] snapshot.
 ///
@@ -14,7 +14,7 @@ pub type State = BTreeMap<Address, Account>;
 #[derive(Debug)]
 pub(crate) struct Overlay<'a> {
     base: &'a State,
-    overlay: BTreeMap<Address, Account>,
+    overlay: HashMap<Address, Account>,
 }
 
 impl<'a> Overlay<'a> {
@@ -22,7 +22,7 @@ impl<'a> Overlay<'a> {
     pub(crate) fn new(base: &'a State) -> Self {
         Self {
             base,
-            overlay: BTreeMap::new(),
+            overlay: HashMap::new(),
         }
     }
 
@@ -42,8 +42,10 @@ impl<'a> Overlay<'a> {
         self.overlay.get_mut(address)
     }
 
-    /// Returns the overlay as the changeset.
+    /// Returns the overlay as a deterministically ordered changeset.
     pub(crate) fn into_changeset(self) -> Changeset {
-        self.overlay.into_iter().collect()
+        let mut changeset: Changeset = self.overlay.into_iter().collect();
+        changeset.sort_unstable_by_key(|(address, _)| *address);
+        changeset
     }
 }

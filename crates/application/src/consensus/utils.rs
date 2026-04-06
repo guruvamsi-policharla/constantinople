@@ -4,18 +4,17 @@ use crate::processor::state::State;
 use commonware_cryptography::{BatchVerifier, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
-use commonware_storage::{
-    mmr,
-    qmdb::Error as StorageError,
-    translator::Translator,
-};
+use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
 use constantinople_primitives::{SignedTransaction, VerifiedTransaction};
 use futures::{StreamExt, stream::FuturesUnordered};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 
 use super::StateBatch;
+
+/// Maximum number of concurrent read tasks for state loading.
+const MAX_READ_TASKS: usize = 8;
 
 /// Loads the accounts needed by `transactions` from `batch`.
 ///
@@ -32,35 +31,41 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let mut addresses = Vec::with_capacity(transactions.len().saturating_mul(2));
-    for transaction in transactions {
-        addresses.push(transaction.signer());
-        addresses.push(transaction.value().to);
-    }
-
-    addresses.sort_unstable();
-    addresses.dedup();
-
+    let addresses = transactions.iter().fold(
+        HashSet::with_capacity(transactions.len().saturating_mul(2)),
+        |mut acc, tx| {
+            acc.insert(tx.signer());
+            acc.insert(tx.value().to);
+            acc
+        },
+    );
     if addresses.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(HashMap::new());
     }
 
-    let db = batch.lock().await;
-    let db = &*db;
+    let addresses: Vec<_> = addresses.into_iter().collect();
+    let db = &*batch.lock().await;
     let state_batch = batch.inner();
-    let pending_reads: FuturesUnordered<_> = addresses
-        .into_iter()
-        .map(|address| async move {
-            let account = state_batch.get(&address, db).await?;
-            Ok::<_, StorageError<mmr::Family>>((address, account.unwrap_or_default()))
+    let chunk_count = addresses.len().min(MAX_READ_TASKS);
+    let chunk_size = addresses.len().div_ceil(chunk_count);
+    let mut pending_reads = addresses
+        .chunks(chunk_size)
+        .map(|chunk| async move {
+            let mut results = Vec::with_capacity(chunk.len());
+            for address in chunk {
+                let account = state_batch.get(address, db).await?;
+                results.push((*address, account.unwrap_or_default()));
+            }
+            Ok::<_, StorageError<mmr::Family>>(results)
         })
-        .collect();
+        .collect::<FuturesUnordered<_>>();
 
-    let accounts = pending_reads
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut accounts = HashMap::with_capacity(addresses.len());
+    while let Some(result) = pending_reads.next().await {
+        for (address, account) in result? {
+            accounts.insert(address, account);
+        }
+    }
 
     Ok(accounts)
 }
@@ -297,5 +302,4 @@ mod tests {
 
         assert!(verified.is_none());
     }
-
 }

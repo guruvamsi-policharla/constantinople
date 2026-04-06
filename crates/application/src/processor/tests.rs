@@ -6,7 +6,7 @@ use commonware_math::algebra::Random;
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use rand::rngs::OsRng;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 const NAMESPACE: &[u8] = b"processor-test";
 
@@ -52,7 +52,7 @@ fn changeset_account(changeset: &[(Address, Account)], address: Address) -> Opti
 fn validate_tracks_pending_nonce_and_balance() {
     let signer = TestSigner::new();
     let recipient = TestSigner::new();
-    let mut accounts = BTreeMap::new();
+    let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(10, 0));
     accounts.insert(recipient.address, Account::default());
 
@@ -78,7 +78,7 @@ fn propose_and_verify_match_for_transfer_batch() {
     let sender_b = TestSigner::new();
     let recipient = TestSigner::new();
 
-    let mut accounts = BTreeMap::new();
+    let mut accounts = HashMap::new();
     accounts.insert(sender_a.address, account(11, 0));
     accounts.insert(sender_b.address, account(13, 0));
     accounts.insert(recipient.address, account(5, 0));
@@ -110,7 +110,7 @@ fn propose_and_verify_match_for_transfer_batch() {
 #[test]
 fn self_transfer_only_bumps_nonce() {
     let signer = TestSigner::new();
-    let mut accounts = BTreeMap::new();
+    let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 3));
 
     let proposal = propose(
@@ -128,7 +128,7 @@ fn self_transfer_only_bumps_nonce() {
 #[test]
 fn self_transfer_is_included_and_preserves_balance() {
     let signer = TestSigner::new();
-    let mut accounts = BTreeMap::new();
+    let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(12, 5));
 
     let transaction = signer.sign(signer.address, 7, 5);
@@ -154,7 +154,7 @@ fn self_transfer_is_included_and_preserves_balance() {
 fn missing_recipient_starts_with_default_balance() {
     let signer = TestSigner::new();
     let recipient = TestSigner::new();
-    let mut accounts = BTreeMap::new();
+    let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 0));
     accounts.insert(recipient.address, Account::default());
 
