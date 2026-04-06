@@ -42,21 +42,21 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-engine = { path = "crates/engine" }
 
 # commonware
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
 
 # external
 rand = { version = "0.8.5", default-features = false }

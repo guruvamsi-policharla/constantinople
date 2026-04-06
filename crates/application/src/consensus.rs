@@ -129,7 +129,7 @@ where
 
     let db = batch.lock().await;
     let db = &*db;
-    let state_batch = batch.batch();
+    let state_batch = batch.inner();
     let chunk_size = load_state_chunk_size(account_keys.len(), parallelism_hint);
     let pending_reads = account_keys
         .chunks(chunk_size)
@@ -487,7 +487,6 @@ where
             .await
             .expect("database merkleization must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
-        let state_diff_len = state_merkleized.diff_len();
 
         let header = Header {
             context,
@@ -518,7 +517,6 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
-            state_diff_len,
             total_ms = elapsed_ms(propose_started_at),
             "proposed block"
         );
@@ -593,7 +591,6 @@ where
             .await
             .expect("database merkleization during verification must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
-        let state_diff_len = state_merkleized.diff_len();
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
@@ -640,7 +637,6 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
-            state_diff_len,
             total_ms = elapsed_ms(verify_started_at),
             "verified block"
         );

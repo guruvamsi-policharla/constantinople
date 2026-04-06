@@ -59,12 +59,7 @@ impl<D: Digest, P: PublicKey> Transaction<D, P> {
     ///
     /// [`Digest`]: Digest
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
-        // Ensure the hasher is reset before use.
-        hasher.reset();
-
-        let encoded = self.encode();
-        hasher.update(&encoded);
-
+        hasher.update(&self.encode());
         hasher.finalize()
     }
 }
@@ -87,8 +82,7 @@ impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
 impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
-        let _ = cfg;
+    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
         let sender = Lazy::<P>::read(buf)?;
         let to = Address::read(buf)?;
         let value = u64::read(buf)?;
