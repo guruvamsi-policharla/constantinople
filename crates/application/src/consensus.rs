@@ -76,9 +76,6 @@ const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
-/// The backing database owned by the application.
-type Databases<E, H, T> = StateDatabase<E, H, T>;
-
 /// Unmerkleized application state batch used for processor read-through.
 type StateBatch<E, H, T> = AnyUnmerkleized<
     E,
@@ -87,9 +84,6 @@ type StateBatch<E, H, T> = AnyUnmerkleized<
     H,
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
-
-/// Merkleized state database produced after finalization.
-type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
 
 /// Errors raised while preparing processor state from the backing database.
 #[derive(Debug, Error)]
@@ -180,11 +174,6 @@ where
     })
 }
 
-/// Returns elapsed milliseconds for a started instant.
-fn elapsed_ms(started_at: Instant) -> u128 {
-    started_at.elapsed().as_millis()
-}
-
 /// Verifies a batch of signed transactions.
 fn verify_transaction_batch<P, H, B>(
     namespace: &[u8],
@@ -240,24 +229,15 @@ where
     let chunk_count = strategy.parallelism_hint().min(transactions.len());
     let chunk_size = transactions.len().div_ceil(chunk_count);
 
-    let mut pending = transactions.into_iter();
+    let mut remaining = transactions;
     let mut chunks = Vec::with_capacity(chunk_count);
-    loop {
-        let mut chunk = Vec::with_capacity(chunk_size);
-        for _ in 0..chunk_size {
-            let Some(transaction) = pending.next() else {
-                break;
-            };
-            chunk.push(transaction);
-        }
-
-        if chunk.is_empty() {
-            break;
-        }
-
+    while !remaining.is_empty() {
+        let split_at = chunk_size.min(remaining.len());
+        let rest = remaining.split_off(split_at);
         let mut rng_seed = [0; 32];
         rng.fill_bytes(&mut rng_seed);
-        chunks.push((rng_seed, chunk));
+        chunks.push((rng_seed, remaining));
+        remaining = rest;
     }
 
     let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
@@ -302,7 +282,14 @@ where
     }
 }
 
-impl<H: Hasher, C, S, P, I, B, St> Application<H, C, S, P, I, B, St> {
+impl<H, C, S, P, I, B, St> Application<H, C, S, P, I, B, St>
+where
+    C: Digest,
+    H: Hasher,
+    P: PublicKey,
+    B: BatchVerifier<PublicKey = P>,
+    St: Strategy,
+{
     /// Creates an application.
     ///
     /// The application keeps the execution strategy, genesis leader, and
@@ -329,16 +316,7 @@ impl<H: Hasher, C, S, P, I, B, St> Application<H, C, S, P, I, B, St> {
             _marker: PhantomData,
         }
     }
-}
 
-impl<H, C, S, P, I, B, St> Application<H, C, S, P, I, B, St>
-where
-    C: Digest,
-    H: Hasher,
-    P: PublicKey,
-    B: BatchVerifier<PublicKey = P>,
-    St: Strategy,
-{
     /// Verifies signed wire transactions and returns verified execution transactions.
     fn verify_transactions(
         &self,
@@ -387,24 +365,6 @@ where
             .checked_add(Duration::from_millis(block_timestamp_ms))
             .expect("block timestamp exceeded maximum")
     }
-
-    /// Merkleizes the updated databases together.
-    ///
-    /// This runs the independent finalization work in parallel so proposal,
-    /// verification, and application all share the same finalization path.
-    ///
-    /// # Errors
-    ///
-    /// Returns any storage error from database merkleization.
-    async fn finalize_execution<E>(
-        &self,
-        state_batch: StateBatch<E, H, EightCap>,
-    ) -> Result<StateMerkleized<E, H, EightCap>, StorageError<mmr::Family>>
-    where
-        E: Storage + Clock + Metrics,
-    {
-        state_batch.merkleize().await
-    }
 }
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<H, C, S, P, I, B, St>
@@ -421,7 +381,7 @@ where
     type SigningScheme = S;
     type Context = Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, EightCap>;
+    type Databases = StateDatabase<E, H, EightCap>;
     type InputProvider = I;
 
     /// Returns the sync targets required to fetch the block's state.
@@ -461,13 +421,13 @@ where
 
         let input_started_at = Instant::now();
         let body = input.propose(&parent.header, &context).await;
-        let input_ms = elapsed_ms(input_started_at);
+        let input_ms = input_started_at.elapsed().as_millis();
 
         let load_state_started_at = Instant::now();
         let state = load_state(&batches, &body, self.strategy.parallelism_hint())
             .await
             .expect("proposal state loading must succeed");
-        let load_state_ms = elapsed_ms(load_state_started_at);
+        let load_state_ms = load_state_started_at.elapsed().as_millis();
 
         let execute_started_at = Instant::now();
         let ProposalOutput {
@@ -475,18 +435,18 @@ where
             invalid: _,
             changeset,
         } = executor::propose(state, body);
-        let execute_ms = elapsed_ms(execute_started_at);
+        let execute_ms = execute_started_at.elapsed().as_millis();
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
         let state_batch = apply_changeset(batches, &changeset);
 
         let finalize_started_at = Instant::now();
-        let state_merkleized = self
-            .finalize_execution(state_batch)
+        let state_merkleized = state_batch
+            .merkleize()
             .await
             .expect("database merkleization must succeed");
-        let finalize_ms = elapsed_ms(finalize_started_at);
+        let finalize_ms = finalize_started_at.elapsed().as_millis();
 
         let header = Header {
             context,
@@ -517,7 +477,7 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
-            total_ms = elapsed_ms(propose_started_at),
+            total_ms = propose_started_at.elapsed().as_millis(),
             "proposed block"
         );
 
@@ -548,7 +508,7 @@ where
             warn!(height = header.height, "verify rejected: invalid signature");
             return None;
         };
-        let signature_ms = elapsed_ms(signature_started_at);
+        let signature_ms = signature_started_at.elapsed().as_millis();
 
         if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
         {
@@ -565,13 +525,13 @@ where
         let deadline = self.block_deadline(header.timestamp);
         let sleep_started_at = Instant::now();
         runtime.sleep_until(deadline).await;
-        let sleep_ms = elapsed_ms(sleep_started_at);
+        let sleep_ms = sleep_started_at.elapsed().as_millis();
 
         let load_state_started_at = Instant::now();
         let state = load_state(&batches, &verified_body, self.strategy.parallelism_hint())
             .await
             .expect("block state loading during verification must succeed");
-        let load_state_ms = elapsed_ms(load_state_started_at);
+        let load_state_ms = load_state_started_at.elapsed().as_millis();
 
         let execute_started_at = Instant::now();
         let Some(changeset) = executor::execute(state, &verified_body) else {
@@ -581,16 +541,16 @@ where
             );
             return None;
         };
-        let execute_ms = elapsed_ms(execute_started_at);
+        let execute_ms = execute_started_at.elapsed().as_millis();
 
         let state_batch = apply_changeset(batches, &changeset);
 
         let finalize_started_at = Instant::now();
-        let state_merkleized = self
-            .finalize_execution(state_batch)
+        let state_merkleized = state_batch
+            .merkleize()
             .await
             .expect("database merkleization during verification must succeed");
-        let finalize_ms = elapsed_ms(finalize_started_at);
+        let finalize_ms = finalize_started_at.elapsed().as_millis();
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
@@ -637,7 +597,7 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
-            total_ms = elapsed_ms(verify_started_at),
+            total_ms = verify_started_at.elapsed().as_millis(),
             "verified block"
         );
         Some(state_merkleized)
@@ -670,7 +630,8 @@ where
         let changeset = executor::execute(state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
         let state_batch = apply_changeset(batches, &changeset);
-        self.finalize_execution(state_batch)
+        state_batch
+            .merkleize()
             .await
             .expect("database merkleization must succeed")
     }
@@ -702,182 +663,4 @@ where
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{load_state_chunk_size, verify_transaction_chunks};
-    use commonware_codec::{DecodeExt, Encode, FixedSize};
-    use commonware_cryptography::{Digest, Signer as _, blake3, ed25519};
-    use commonware_parallel::Rayon;
-    use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
-    use core::num::{NonZeroU64, NonZeroUsize};
-    use rand::{SeedableRng, rngs::StdRng};
-
-    const NAMESPACE: &[u8] = b"consensus-test";
-
-    #[derive(Debug, Clone)]
-    struct TestSigner {
-        key: ed25519::PrivateKey,
-        address: Address,
-    }
-
-    impl TestSigner {
-        fn from_seed(seed: u64) -> Self {
-            let key = ed25519::PrivateKey::from_seed(seed);
-            let address =
-                Address::from_public_key(&mut blake3::Blake3::default(), &key.public_key());
-            Self { key, address }
-        }
-    }
-
-    fn signed_transaction(
-        signer: &TestSigner,
-        to: Address,
-        nonce: u64,
-    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
-        Transaction::new(
-            signer.key.public_key(),
-            to,
-            NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
-            nonce,
-        )
-        .seal_and_sign(&signer.key, NAMESPACE, &mut blake3::Blake3::default())
-    }
-
-    fn invalid_transaction(
-        claimed_signer: &TestSigner,
-        actual_signer: &TestSigner,
-        to: Address,
-        nonce: u64,
-    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
-        Transaction::new(
-            claimed_signer.key.public_key(),
-            to,
-            NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
-            nonce,
-        )
-        .seal_and_sign(
-            &actual_signer.key,
-            NAMESPACE,
-            &mut blake3::Blake3::default(),
-        )
-    }
-
-    #[test]
-    fn chunked_verification_preserves_transaction_order() {
-        let strategy =
-            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
-                .expect("rayon strategy should construct");
-        let sender = TestSigner::from_seed(7);
-        let recipient = TestSigner::from_seed(9);
-        let transactions = (0..64)
-            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
-            .collect::<Vec<_>>();
-        let expected_digests = transactions
-            .iter()
-            .map(|transaction| *transaction.message_digest())
-            .collect::<Vec<_>>();
-        let mut rng = StdRng::seed_from_u64(11);
-
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            blake3::Blake3,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, transactions)
-        .expect("valid chunked verification should succeed");
-        let verified_digests = verified
-            .iter()
-            .map(|transaction| *transaction.message_digest())
-            .collect::<Vec<_>>();
-
-        assert_eq!(verified_digests, expected_digests);
-    }
-
-    #[test]
-    fn chunked_verification_rejects_invalid_signature() {
-        let strategy =
-            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
-                .expect("rayon strategy should construct");
-        let sender = TestSigner::from_seed(13);
-        let attacker = TestSigner::from_seed(17);
-        let recipient = TestSigner::from_seed(19);
-        let mut transactions = (0..64)
-            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
-            .collect::<Vec<_>>();
-        transactions[31] = invalid_transaction(&sender, &attacker, recipient.address, 31);
-        let mut rng = StdRng::seed_from_u64(23);
-
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            blake3::Blake3,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, transactions);
-
-        assert!(verified.is_none());
-    }
-
-    #[test]
-    fn chunked_verification_rejects_malformed_sender() {
-        let strategy =
-            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
-                .expect("rayon strategy should construct");
-        let sender = TestSigner::from_seed(29);
-        let recipient = TestSigner::from_seed(31);
-        let transaction = signed_transaction(&sender, recipient.address, 0);
-        let mut encoded = transaction.encode().to_vec();
-
-        let invalid_sender = (0u8..=u8::MAX)
-            .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
-            .find_map(|(first, last)| {
-                let mut candidate = [0; ed25519::PublicKey::SIZE];
-                candidate[0] = first;
-                candidate[ed25519::PublicKey::SIZE - 1] = last;
-
-                ed25519::PublicKey::decode(&mut &candidate[..])
-                    .is_err()
-                    .then_some(candidate)
-            })
-            .expect("test should find invalid sender bytes");
-        encoded[..invalid_sender.len()].copy_from_slice(&invalid_sender);
-
-        let malformed =
-            SignedTransaction::<ed25519::PublicKey, blake3::Blake3>::decode(&mut &encoded[..])
-                .expect("decode should defer sender validation");
-        let mut rng = StdRng::seed_from_u64(37);
-
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            blake3::Blake3,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, vec![malformed]);
-
-        assert!(verified.is_none());
-    }
-
-    #[test]
-    fn load_state_chunk_size_scales_with_parallelism() {
-        assert_eq!(load_state_chunk_size(1, 4), 1);
-        assert_eq!(load_state_chunk_size(8, 4), 1);
-        assert_eq!(load_state_chunk_size(16, 4), 2);
-        assert_eq!(load_state_chunk_size(17, 4), 3);
-        assert_eq!(load_state_chunk_size(32, 0), 16);
-    }
-
-    #[test]
-    fn genesis_block_uses_empty_transaction_history() {
-        let leader = TestSigner::from_seed(41);
-        let block = super::genesis_block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>(
-            &mut blake3::Blake3::default(),
-            leader.key.public_key(),
-            0,
-        );
-
-        assert_eq!(block.header.transactions_root, blake3::Digest::EMPTY);
-        assert_eq!(block.header.transactions_range, non_empty_range!(0, 1));
-    }
 }

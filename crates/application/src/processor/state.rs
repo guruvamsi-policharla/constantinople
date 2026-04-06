@@ -61,11 +61,6 @@ impl State {
         Self::from_loaded_accounts(loaded_addresses, accounts)
     }
 
-    /// Returns the base account at `index`.
-    pub(crate) fn account_at(&self, index: usize) -> Account {
-        self.accounts[index]
-    }
-
     /// Returns the dense account index for `address`, if loaded.
     pub(crate) fn index(&self, address: Address) -> Option<usize> {
         self.indices.get(&address).copied()
@@ -113,15 +108,10 @@ impl WorkingState {
         &self.accounts
     }
 
-    /// Sets the current account at `index`.
-    pub(crate) fn set_account(&mut self, index: usize, account: Account) {
-        self.accounts[index] = account;
-        self.changed[index] = account != self.base.account_at(index);
-    }
-
     /// Applies one account update effect.
     pub(crate) fn apply_effect(&mut self, effect: AccountEffect) {
-        self.set_account(effect.index, effect.account);
+        self.accounts[effect.index] = effect.account;
+        self.changed[effect.index] = effect.account != self.base.accounts[effect.index];
     }
 
     /// Applies a transfer effect.
@@ -135,18 +125,12 @@ impl WorkingState {
 
     /// Exports the deterministic account changeset.
     pub(crate) fn changeset(&self) -> Changeset {
-        let changed_accounts = self.changed.iter().filter(|changed| **changed).count();
-        let mut changeset = Vec::with_capacity(changed_accounts);
-
-        for (index, changed) in self.changed.iter().copied().enumerate() {
-            if !changed {
-                continue;
-            }
-
-            changeset.push((self.base.address_at(index), self.accounts[index]));
-        }
-
-        changeset
+        self.changed
+            .iter()
+            .enumerate()
+            .filter(|(_, changed)| **changed)
+            .map(|(index, _)| (self.base.address_at(index), self.accounts[index]))
+            .collect()
     }
 }
 
