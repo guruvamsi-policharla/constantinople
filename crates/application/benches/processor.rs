@@ -1,5 +1,5 @@
 use commonware_codec::{DecodeExt, FixedSize};
-use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
+use commonware_cryptography::{Signer, blake3, ed25519};
 use commonware_math::algebra::Random;
 use constantinople_application::processor::{executor, state::State};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
@@ -9,7 +9,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use std::{collections::HashMap, hint::black_box, sync::OnceLock};
 
 type TestHasher = blake3::Blake3;
-type TestPublicKey = recoverable::PublicKey;
+type TestPublicKey = ed25519::PublicKey;
 type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
 
 const NAMESPACE: &[u8] = b"processor-bench";
@@ -184,9 +184,9 @@ fn seed(index: usize, tag: u8) -> [u8; 32] {
     seed
 }
 
-fn private_key(seed: [u8; 32]) -> recoverable::PrivateKey {
+fn private_key(seed: [u8; 32]) -> ed25519::PrivateKey {
     let mut rng = StdRng::from_seed(seed);
-    recoverable::PrivateKey::random(&mut rng)
+    ed25519::PrivateKey::random(&mut rng)
 }
 
 #[derive(Clone, Copy, Debug)]
