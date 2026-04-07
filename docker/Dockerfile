@@ -1,27 +1,51 @@
-# Use the same Ubuntu version as `commonware-deployer`.
-FROM arm64v8/ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
 
-RUN apt-get update && apt-get install -y \
+ARG RUST_TOOLCHAIN=stable
+ARG TARGET_TRIPLE
+ARG TARGET_CARGO_NAME
+ARG TARGET_CC_NAME
+ARG TARGET_CPU
+ARG TARGET_LINKER
+ARG TARGET_AR
+ARG TARGET_STRIP
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     binutils \
+    binutils-aarch64-linux-gnu \
+    binutils-x86-64-linux-gnu \
     build-essential \
     ca-certificates \
+    cmake \
     curl \
+    gcc-aarch64-linux-gnu \
+    gcc-x86-64-linux-gnu \
     git \
+    libc6-dev-arm64-cross \
+    libc6-dev-amd64-cross \
     libssl-dev \
     pkg-config \
-    protobuf-compiler
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN} --profile minimal
 
-ENV PATH="/root/.cargo/bin:${PATH}"
-ENV PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig"
-ENV RUSTFLAGS="-C target-cpu=neoverse-v2"
-ENV CARGO_PROFILE_RELEASE_DEBUG=true
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    PACKAGE_NAME="constantinople-validator" \
+    BINARY_NAME="constantinople" \
+    OUTPUT_NAME="validator" \
+    TARGET_TRIPLE="${TARGET_TRIPLE}" \
+    TARGET_CARGO_NAME="${TARGET_CARGO_NAME}" \
+    TARGET_CC_NAME="${TARGET_CC_NAME}" \
+    TARGET_CPU="${TARGET_CPU}" \
+    TARGET_LINKER="${TARGET_LINKER}" \
+    TARGET_AR="${TARGET_AR}" \
+    TARGET_STRIP="${TARGET_STRIP}" \
+    CARGO_PROFILE_RELEASE_DEBUG=true
 
-RUN rustup default stable
-RUN rustup target add aarch64-unknown-linux-gnu
+RUN rustup target add ${TARGET_TRIPLE}
 
 WORKDIR /constantinople
 
 ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target aarch64-unknown-linux-gnu && cp target/aarch64-unknown-linux-gnu/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && strip -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]
+CMD ["set -euo pipefail && export CARGO_TARGET_${TARGET_CARGO_NAME}_LINKER=${TARGET_LINKER} && export CARGO_TARGET_${TARGET_CARGO_NAME}_RUSTFLAGS=\"-C target-cpu=${TARGET_CPU}\" && export CC_${TARGET_CC_NAME}=${TARGET_LINKER} && export AR_${TARGET_CC_NAME}=${TARGET_AR} && mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target ${TARGET_TRIPLE} && cp target/${TARGET_TRIPLE}/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && ${TARGET_STRIP} -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]

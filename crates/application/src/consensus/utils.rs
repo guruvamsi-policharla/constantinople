@@ -44,16 +44,15 @@ where
     }
 
     let addresses: Vec<_> = addresses.into_iter().collect();
-    let db = &*batch.lock().await;
-    let state_batch = batch.inner();
     let chunk_count = addresses.len().min(MAX_READ_TASKS);
     let chunk_size = addresses.len().div_ceil(chunk_count);
     let mut pending_reads = addresses
         .chunks(chunk_size)
         .map(|chunk| async move {
+            let db = batch.lock().await;
             let mut results = Vec::with_capacity(chunk.len());
             for address in chunk {
-                let account = state_batch.get(address, db).await?;
+                let account = batch.batch().get(address, &*db).await?;
                 results.push((*address, account.unwrap_or_default()));
             }
             Ok::<_, StorageError<mmr::Family>>(results)

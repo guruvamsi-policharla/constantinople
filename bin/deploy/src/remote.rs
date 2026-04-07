@@ -55,7 +55,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     );
     info!(
         validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-        "build the validator ARM64 binary into the deployment directory before creating the remote deployment"
+        "build the validator binary into the deployment directory before creating the remote deployment"
     );
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),

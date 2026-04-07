@@ -1,14 +1,23 @@
-# Build the Docker builder image
-build-image:
-  docker buildx bake --progress plain -f docker/docker-bake.hcl builder
+# Build the Graviton Docker builder image
+build-graviton-image:
+  docker buildx bake --progress plain -f docker/docker-bake.hcl graviton
 
 # Build the ARM64 validator binary into deploy/
-validator-binary: build-image
+validator-graviton-binary: build-graviton-image
   docker run --rm -v ${PWD}:/constantinople \
     -e PACKAGE_NAME=constantinople-validator \
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
-    constantinople-builder:local
+    constantinople-builder:graviton-local
 
-# Build the ARM64 deployable binaries into deploy/
-build-deployer-binaries: validator-binary
+# Build the Intel/C8i Docker builder image
+build-intel-image:
+  docker buildx bake --progress plain -f docker/docker-bake.hcl intel
+
+# Build the Intel validator binary into deploy/
+validator-intel-binary: build-intel-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-validator \
+    -e BINARY_NAME=constantinople \
+    -e OUTPUT_NAME=validator \
+    constantinople-builder:intel-local

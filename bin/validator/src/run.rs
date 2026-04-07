@@ -18,7 +18,7 @@ use commonware_runtime::{
     Metrics as _, Quota, Runner as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
-use commonware_utils::{NZU64, NZUsize, TryCollect, hex, union};
+use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
@@ -115,7 +115,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     .participants
                     .clone()
                     .into_iter()
-                    .try_collect()
+                    .try_collect::<Set<ed25519::PublicKey>>()
                     .unwrap(),
             )
             .await;
@@ -156,7 +156,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _, _>::new(
             context.with_label("tx_gen"),
-            8192 * 4,
+            8192,
             strategy.clone(),
         );
         let tx_gen_handle = tx_gen.start();

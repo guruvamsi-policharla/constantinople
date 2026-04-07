@@ -591,6 +591,7 @@ where
             return Vec::new();
         };
         peers
+            .primary
             .into_iter()
             .filter(|peer| *peer != self.public_key)
             .collect()

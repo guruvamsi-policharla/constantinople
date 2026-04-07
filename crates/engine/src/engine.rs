@@ -72,10 +72,10 @@ const FREEZER_VALUE_TARGET_SIZE: u64 = 1024 * 1024 * 1024;
 const FREEZER_VALUE_COMPRESSION: Option<u8> = Some(3);
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
-const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096); // 4 KiB
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(131072); // 512 MiB
-const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576);
-const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
+const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
+const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
+const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
+const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: usize = 1024;
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
@@ -225,7 +225,16 @@ where
 
     /// Initializes the full engine stack.
     pub async fn new(context: E, config: Config<C, M, B, V, T, I, H>) -> Self {
-        let page_cache = CacheRef::from_pooler(&context, PAGE_CACHE_PAGE_SIZE, PAGE_CACHE_CAPACITY);
+        let page_cache = CacheRef::from_pooler(
+            &context.with_label("other"),
+            PAGE_CACHE_PAGE_SIZE,
+            PAGE_CACHE_CAPACITY,
+        );
+        let storage_page_cache = CacheRef::from_pooler(
+            &context.with_label("state"),
+            PAGE_CACHE_PAGE_SIZE,
+            PAGE_CACHE_CAPACITY,
+        );
         let merkle_thread_pool = qmdb_merkle_thread_pool(&context, &config.strategy);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
@@ -320,7 +329,7 @@ where
                 app: application,
                 db_config: state_db_config(
                     &config.partition_prefix,
-                    &page_cache,
+                    &storage_page_cache,
                     merkle_thread_pool.as_ref(),
                 ),
                 input_provider: config.input,

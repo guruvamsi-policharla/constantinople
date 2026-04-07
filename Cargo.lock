@@ -411,7 +411,7 @@ checksum = "5417da527aa9bf6a1e10a781231effd1edd3ee82f27d5f8529ac9b279babce96"
 [[package]]
 name = "commonware-broadcast"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "commonware-codec",
  "commonware-cryptography",
@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -443,7 +443,7 @@ dependencies = [
 [[package]]
 name = "commonware-coding"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "commonware-conformance-macros",
  "commonware-macros",
@@ -478,7 +478,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance-macros"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -488,7 +488,7 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -519,7 +519,7 @@ dependencies = [
 [[package]]
 name = "commonware-cryptography"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -554,7 +554,7 @@ dependencies = [
 [[package]]
 name = "commonware-deployer"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -564,7 +564,7 @@ dependencies = [
 [[package]]
 name = "commonware-glue"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -587,7 +587,7 @@ dependencies = [
 [[package]]
 name = "commonware-invariants"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "commonware-macros",
@@ -600,7 +600,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -621,7 +621,7 @@ dependencies = [
 [[package]]
 name = "commonware-math"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -636,7 +636,7 @@ dependencies = [
 [[package]]
 name = "commonware-p2p"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "commonware-codec",
@@ -663,7 +663,7 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -673,7 +673,7 @@ dependencies = [
 [[package]]
 name = "commonware-resolver"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "axum",
@@ -731,7 +731,7 @@ dependencies = [
 [[package]]
 name = "commonware-storage"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -756,7 +756,7 @@ dependencies = [
 [[package]]
 name = "commonware-stream"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "chacha20poly1305",
  "commonware-codec",
@@ -775,7 +775,7 @@ dependencies = [
 [[package]]
 name = "commonware-utils"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Ftemp-glue-batch-parent#b70a1c8f58bea7d24c48b1ea87c2f058c3c5adad"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue-temp#ee1cf4d12bb3d6498b90bbc070a967df26e605c2"
 dependencies = [
  "arbitrary",
  "bytes",
