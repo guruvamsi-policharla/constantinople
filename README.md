@@ -1,160 +1,55 @@
-# Constantinople
+<h1 align="center">
+  <img src="./assets/banner.png" alt="Constantinople" width="100%" align="center">
+</h1>
 
-A high-throughput blockchain demo built on [`commonware`](https://github.com/commonwarexyz/monorepo) primitives.
-Constantinople wires together simplex consensus, erasure-coded broadcast, and QMDB storage into a
-simple blockchain that supports only account-to-account transfers.
+<h4 align="center">
+    A high-throughput blockchain built on <a href="https://commonware.xyz"><code>commonware</code></a> primitives.
+</h4>
 
-## Architecture
+<p align="center">
+  <a href="https://github.com/commonwarexyz/constantinople/actions/workflows/tests.yaml"><img src="https://img.shields.io/github/actions/workflow/status/commonwarexyz/constantinople/tests.yaml?style=flat&labelColor=1C2C2E&label=ci&color=BEC5C9&logo=GitHub%20Actions&logoColor=BEC5C9" alt="CI"></a>
+  <a href="https://app.codecov.io/gh/commonwarexyz/constantinople"><img src="https://img.shields.io/codecov/c/gh/commonwarexyz/constantinople?style=flat&labelColor=1C2C2E&logo=Codecov&color=BEC5C9&logoColor=BEC5C9" alt="Codecov"></a>
+  <a href="https://github.com/commonwarexyz/constantinople/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-MIT-d1d1f6.svg?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=googledocs&label=license&logoColor=BEC5C9" alt="License"></a>
+  <a href="https://commonware.xyz"><img src="https://img.shields.io/badge/Commonware-854a15?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=asterisk&logoColor=BEC5C9" alt="commonware"></a>
+</p>
 
-```
-bin/
-  validator/        CLI that assembles and runs a validator node
+<p align="center">
+  <a href="#overview">Overview</a> •
+  <a href="#demo">Demo</a> •
+  <a href="#deployment">Deployment</a> •
+  <a href="#contributing">Contributing</a> •
+  <a href="#license">License</a>
+</p>
 
-crates/
-  primitives/       Core types: blocks, transactions, and accounts
-  application/      Consensus integration and transaction processor
-  mempool/          HTTP mempool server and transaction source
-  engine/           Engine assembly: wires consensus, marshal, QMDB, and p2p together
-```
+## Overview
 
-### Commonware Primitives
+Constantinople is a high-throughput account-model blockchain example built on top of [`commonware`] primitives.
 
-| Primitive | Role |
-|---|---|
-| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Single-epoch BFT consensus with threshold BLS finality |
+| Primitive                                                                                                    | Role                                                     |
+|--------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|
+| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Single-epoch BFT consensus with BLS threshold signatures |
 | [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (marshal) | Erasure-coded broadcast and backfill of finalized blocks |
-| [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB) | Merkleized key-value database for state and transaction roots |
-| [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful) | State management, startup sync (marshal-sync and state-sync) |
-| [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p) | Authenticated peer-to-peer networking with discovery |
+| [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB)        | Merkleized key-value database for state and transactions |
+| [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
+| [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p)                       | Authenticated peer-to-peer networking with discovery     |
 
-### Transaction Processor
+## Demo
 
-The processor in `crates/application/src/processor` implements a transfer-only
-account model:
+> [!IMPORTANT]
+> TODO.
 
-- **Transactions**: every transaction contains only `sender`, `to`, `value`, and `nonce`.
-- **Execution**: the processor validates nonce and balance constraints, then applies direct
-  balance transfers and sender nonce increments.
-- **Execution model**: blocks execute as a simple sequential in-memory account update pass.
+## Deployment
 
-### Mempool
+See [`deploy/README.md`](./bin/deploy/README.md).
 
-- **Mempool core**: `crates/mempool` uses a FIFO queue with hash-indexed entries, lease batches,
-  direct in-flight retries, lazy tombstones, and recent terminal status caching so proposal and
-  finalize paths stay small and predictable under load.
-- **Hot-path HTTP**: validators keep compatibility routes for single hex transactions, and also
-  expose `POST /tx/accept_batch` plus `POST /tx/wait_batch` for binary batch ingestion and
-  long-poll batch status waits.
+## Contributing
 
-## Quick Start
-
-`constantinople-deploy` is the entrypoint for generating deployment artifacts.
-
-### Local Deployment
-
-```sh
-cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
-  --output-dir ./local \
-  --worker-threads 2 \
-  --rayon-threads 2 \
-  local \
-  --base-port 3000 \
-  --base-http-port 8080
-```
-
-This writes:
-
-- `validator-0.yaml`, `validator-1.yaml`, ...
-- `peers.yaml`
-
-It also prints an `mprocs` command that starts the whole local cluster.
-
-To run a single local validator directly:
-
-```sh
-cargo run --bin constantinople -- \
-  --config ./local/validator-0.yaml \
-  --peers ./local/peers.yaml
-```
-
-To run the whole local cluster, use the printed `mprocs` command, or run each validator in a separate terminal:
-
-```sh
-cargo run --bin constantinople -- --config ./local/validator-0.yaml --peers ./local/peers.yaml
-cargo run --bin constantinople -- --config ./local/validator-1.yaml --peers ./local/peers.yaml
-cargo run --bin constantinople -- --config ./local/validator-2.yaml --peers ./local/peers.yaml
-cargo run --bin constantinople -- --config ./local/validator-3.yaml --peers ./local/peers.yaml
-```
-
-### Remote Deployment
-
-Remote deployments use the same service YAML configs, but networking is resolved from the deployer
-hosts file at runtime. `generate remote` does not build binaries. It only writes the deployment
-bundle, and you build `validator` into that directory afterwards.
-
-Generate the remote deployment bundle first:
-
-```sh
-cargo run --bin constantinople-deploy -- generate \
-  --validators 20 \
-  --output-dir ./deploy \
-  --worker-threads 4 \
-  --rayon-threads 4 \
-  remote \
-  --http-cidr 0.0.0.0/0 \
-  --regions us-east-1,us-west-2 \
-  --instance-type c8g.2xlarge \
-  --storage-size 75 \
-  --monitoring-instance-type c8g.2xlarge \
-  --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
-```
-
-The generate step writes:
-
-- one validator YAML config per validator
-- `config.yaml` for `commonware-deployer`
-- a copied dashboard file for monitoring
-
-Then build the deployable ARM64 binaries into that directory:
-
-```sh
-just build-deployer-binaries
-```
-
-The Docker build step then writes:
-
-- `deploy/validator`
-- `deploy/validator-debug`
-
-The deploy command then prints the exact commands to run:
-
-```sh
-cd ./deploy
-deployer aws create --config config.yaml
-```
-
-`--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments.
-
-### Runtime Interfaces
-
-Validator:
-
-```sh
-constantinople --config ./validator.yaml --peers ./peers.yaml
-constantinople --config ./validator.yaml --hosts ./hosts.yaml
-```
-
-## Development
-
-```sh
-just build    # build the workspace
-just test     # run all tests (includes doc tests)
-just lint     # format check + doc check + clippy (denies warnings)
-just fmt-fix  # auto-fix formatting
-```
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE.md)
+See [`LICENSE.md`](./LICENSE.md).
+
+<!-- Links -->
+
+[`commonware`]: https://github.com/commonwarexyz/commonware

@@ -1,5 +1,10 @@
+# Rust target
 /target
-mprocs.log
 
-local/
-deploy/
+# Deployment artifacts
+/local
+/deploy
+
+# Dust
+mprocs.log
+.DS_Store
