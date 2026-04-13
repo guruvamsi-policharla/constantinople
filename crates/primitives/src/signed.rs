@@ -510,8 +510,8 @@ mod test {
     #[should_panic(expected = "transaction sender must match signer public key")]
     fn seal_and_sign_verified_rejects_mismatched_sender() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
-        let wrong_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::from_seed(0);
+        let wrong_key = ed25519::PrivateKey::from_seed(1);
 
         let _ = Transaction::new(
             wrong_key.public_key(),

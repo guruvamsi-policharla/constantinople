@@ -2,8 +2,6 @@
 
 use super::executor::{ProposalOutput, execute, propose};
 use commonware_cryptography::{Signer, blake3, ed25519};
-use commonware_math::algebra::Random;
-use commonware_utils::test_rng;
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use std::collections::HashMap;
@@ -21,8 +19,8 @@ struct TestSigner {
 }
 
 impl TestSigner {
-    fn new() -> Self {
-        let key = ed25519::PrivateKey::random(&mut test_rng());
+    fn from_seed(seed: u64) -> Self {
+        let key = ed25519::PrivateKey::from_seed(seed);
         let address = Address::from_public_key(&mut TestHasher::default(), &key.public_key());
         Self { key, address }
     }
@@ -50,8 +48,8 @@ fn changeset_account(changeset: &[(Address, Account)], address: Address) -> Opti
 
 #[test]
 fn validate_tracks_pending_nonce_and_balance() {
-    let signer = TestSigner::new();
-    let recipient = TestSigner::new();
+    let signer = TestSigner::from_seed(0);
+    let recipient = TestSigner::from_seed(1);
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(10, 0));
     accounts.insert(recipient.address, Account::default());
@@ -74,9 +72,9 @@ fn validate_tracks_pending_nonce_and_balance() {
 
 #[test]
 fn propose_and_verify_match_for_transfer_batch() {
-    let sender_a = TestSigner::new();
-    let sender_b = TestSigner::new();
-    let recipient = TestSigner::new();
+    let sender_a = TestSigner::from_seed(10);
+    let sender_b = TestSigner::from_seed(11);
+    let recipient = TestSigner::from_seed(12);
 
     let mut accounts = HashMap::new();
     accounts.insert(sender_a.address, account(11, 0));
@@ -109,7 +107,7 @@ fn propose_and_verify_match_for_transfer_batch() {
 
 #[test]
 fn self_transfer_only_bumps_nonce() {
-    let signer = TestSigner::new();
+    let signer = TestSigner::from_seed(0);
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 3));
 
@@ -124,7 +122,7 @@ fn self_transfer_only_bumps_nonce() {
 
 #[test]
 fn self_transfer_is_included_and_preserves_balance() {
-    let signer = TestSigner::new();
+    let signer = TestSigner::from_seed(0);
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(12, 5));
 
@@ -149,8 +147,8 @@ fn self_transfer_is_included_and_preserves_balance() {
 
 #[test]
 fn missing_recipient_starts_with_default_balance() {
-    let signer = TestSigner::new();
-    let recipient = TestSigner::new();
+    let signer = TestSigner::from_seed(20);
+    let recipient = TestSigner::from_seed(21);
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 0));
     accounts.insert(recipient.address, Account::default());

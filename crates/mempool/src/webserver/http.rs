@@ -60,11 +60,11 @@ where
         .with_state(state)
 }
 
-fn max_request_bytes(max_batch_bytes: usize) -> usize {
+const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
-fn min_signed_transaction_bytes<P>() -> usize
+const fn min_signed_transaction_bytes<P>() -> usize
 where
     P: PublicKey,
 {
