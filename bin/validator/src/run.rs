@@ -12,7 +12,7 @@ use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Metrics as _, Quota, Runner as _, ThreadPooler as _,
+    Metrics as _, Quota, Runner as _, Spawner as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
@@ -154,11 +154,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
-        let (mempool_actor, mempool_mailbox) = webserver::Actor::new(webserver::Config {
-            max_pool_bytes: MAX_POOL_BYTES,
-            max_propose_bytes: MAX_PROPOSE_BYTES,
-            mailbox_size: 65536,
-        });
+        let (mempool_actor, mempool_mailbox) = webserver::Actor::new(
+            context.with_label("mempool"),
+            webserver::Config {
+                max_pool_bytes: MAX_POOL_BYTES,
+                max_propose_bytes: MAX_PROPOSE_BYTES,
+                mailbox_size: 65536,
+            },
+        );
         let mempool_handle = mempool_actor.start();
 
         let app_state = Arc::new(webserver::AppState {
@@ -170,7 +173,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .await
             .expect("failed to bind mempool HTTP listener");
         info!(%http_listen, "mempool webserver listening");
-        let http_handle = tokio::spawn(axum::serve(listener, app).into_future());
+        let http_handle = context.with_label("mempool-http").spawn(|_| async {
+            let _ = axum::serve(listener, app).await;
+        });
 
         let startup =
             resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;

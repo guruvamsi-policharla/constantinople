@@ -898,6 +898,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-math",
+ "commonware-runtime",
  "commonware-utils",
  "constantinople-primitives",
  "futures",

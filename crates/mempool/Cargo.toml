@@ -17,6 +17,7 @@ constantinople-primitives.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
+commonware-runtime.workspace = true
 commonware-utils.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true

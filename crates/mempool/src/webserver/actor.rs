@@ -4,16 +4,15 @@
 //! submissions from HTTP handlers and serves batches to the consensus
 //! layer via the [`Mailbox`](super::Mailbox).
 
-use super::mailbox::Message;
+use super::{Mailbox, mailbox::Message};
 use commonware_consensus::marshal::Update;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::VerifiedTransaction;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tracing::warn;
-
-use super::Mailbox;
 
 /// Mempool actor configuration.
 pub struct Config {
@@ -28,13 +27,15 @@ pub struct Config {
 /// The mempool actor.
 ///
 /// Create via [`Actor::new`], which returns `(Actor, Mailbox)`. Call
-/// [`Actor::start`] to spawn the event loop as a tokio task.
-pub struct Actor<C, P, H>
+/// [`Actor::start`] to spawn the event loop on the runtime.
+pub struct Actor<E, C, P, H>
 where
+    E: Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
 {
+    context: ContextCell<E>,
     rx: mpsc::Receiver<Message<C, P, H>>,
     pool: VecDeque<(VerifiedTransaction<P, H>, usize)>,
     pool_bytes: usize,
@@ -42,18 +43,20 @@ where
     max_propose_bytes: usize,
 }
 
-impl<C, P, H> Actor<C, P, H>
+impl<E, C, P, H> Actor<E, C, P, H>
 where
+    E: Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
 {
     /// Creates a new mempool actor and its control [`Mailbox`].
-    pub fn new(config: Config) -> (Self, Mailbox<C, P, H>) {
+    pub fn new(context: E, config: Config) -> (Self, Mailbox<C, P, H>) {
         let (tx, rx) = mpsc::channel(config.mailbox_size);
         let mailbox = Mailbox::new(tx);
         (
             Self {
+                context: ContextCell::new(context),
                 rx,
                 pool: VecDeque::new(),
                 pool_bytes: 0,
@@ -64,14 +67,9 @@ where
         )
     }
 
-    /// Spawns the actor event loop on the tokio runtime.
-    pub fn start(self) -> tokio::task::JoinHandle<()>
-    where
-        C: Send + 'static,
-        P: Send + 'static,
-        H: Send + 'static,
-    {
-        tokio::spawn(self.run())
+    /// Spawns the actor event loop on the runtime.
+    pub fn start(mut self) -> Handle<()> {
+        spawn_cell!(self.context, self.run().await)
     }
 
     async fn run(mut self) {
