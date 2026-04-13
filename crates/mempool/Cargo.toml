@@ -23,6 +23,7 @@ commonware-cryptography.workspace = true
 
 # Other
 axum.workspace = true
+bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
