@@ -257,6 +257,7 @@ where
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
+                    max_serve_ops: NZU64!(4096),
                 },
             );
 
