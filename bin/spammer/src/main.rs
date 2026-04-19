@@ -33,12 +33,25 @@ fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (accounts_count, value, seed_offset, http_port) = if let Some(config_path) = &cli.config {
-        let cfg = config::load_config(config_path);
-        (cfg.accounts, cfg.value, cfg.seed_offset, cfg.http_port)
-    } else {
-        (cli.accounts, cli.value, cli.seed_offset, cli.http_port)
-    };
+    let (accounts_count, value, seed_offset, http_port, primary_validators) =
+        if let Some(config_path) = &cli.config {
+            let cfg = config::load_config(config_path);
+            (
+                cfg.accounts,
+                cfg.value,
+                cfg.seed_offset,
+                cfg.http_port,
+                cfg.primary_validators,
+            )
+        } else {
+            (
+                cli.accounts,
+                cli.value,
+                cli.seed_offset,
+                cli.http_port,
+                Vec::new(),
+            )
+        };
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -75,7 +88,9 @@ fn main() {
             config::clients_from_peers(peers_path)
         } else {
             let hosts_path = cli.hosts.as_ref().expect("clap ensures --peers or --hosts");
-            config::clients_from_hosts(hosts_path, http_port)
+            let allowed: std::collections::HashSet<String> =
+                primary_validators.iter().cloned().collect();
+            config::clients_from_hosts(hosts_path, http_port, &allowed)
         };
         let num_validators = clients.len();
         assert!(num_validators > 0, "no validator endpoints discovered");

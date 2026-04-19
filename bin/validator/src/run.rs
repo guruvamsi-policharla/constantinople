@@ -9,7 +9,7 @@ use commonware_cryptography::{
     sha256::Sha256,
 };
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
-use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
+use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     Metrics as _, Quota, Runner as _, ThreadPooler as _,
@@ -22,7 +22,7 @@ use constantinople_engine::{
     VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::webserver;
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 use tracing::info;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
@@ -108,17 +108,17 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let (mut network, mut oracle) =
             discovery::Network::new(context.with_label("p2p"), p2p_config);
 
-        oracle
-            .track(
-                0,
-                decoded
-                    .participants
-                    .clone()
-                    .into_iter()
-                    .try_collect::<Set<ed25519::PublicKey>>()
-                    .unwrap(),
-            )
-            .await;
+        let primary: Set<ed25519::PublicKey> = decoded
+            .primary_participants
+            .into_iter()
+            .try_collect()
+            .unwrap();
+        let secondary: Set<ed25519::PublicKey> = decoded
+            .secondary_participants
+            .into_iter()
+            .try_collect()
+            .unwrap();
+        oracle.track(0, TrackedPeers::new(primary, secondary)).await;
 
         // TODO: Add reasonable RL
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);
@@ -165,11 +165,21 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 strategy: strategy.clone(),
             },
         );
-        let listener = tokio::net::TcpListener::bind(http_listen)
-            .await
-            .expect("failed to bind mempool HTTP listener");
-        info!(%http_listen, "mempool webserver listening");
-        let mempool_handle = mempool_actor.start::<Batch>(listener);
+        let is_primary = decoded.share.is_some();
+        let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
+            let listener = tokio::net::TcpListener::bind(http_listen)
+                .await
+                .expect("failed to bind mempool HTTP listener");
+            info!(%http_listen, "mempool webserver listening");
+            let handle = mempool_actor.start::<Batch>(listener);
+            Box::pin(async move {
+                let _ = handle.await;
+            })
+        } else {
+            info!("secondary node: skipping mempool webserver");
+            drop(mempool_actor);
+            Box::pin(std::future::pending())
+        };
 
         let startup =
             resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;
@@ -189,7 +199,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     blocker: oracle,
                     namespace: b"constantinople".to_vec(),
                     output: decoded.dkg_output,
-                    share: Some(decoded.share),
+                    share: decoded.share,
                     input: mempool_mailbox.clone(),
                     partition_prefix: decoded.partition_prefix,
                     freezer_table_initial_size: 1024,
@@ -205,7 +215,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .await;
 
         info!("starting engine");
-        let engine_handle = engine.start(channels, Some(mempool_mailbox));
+        let reporter = is_primary.then(|| mempool_mailbox.clone());
+        let engine_handle = engine.start(channels, reporter);
 
         tokio::select! {
             _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),

@@ -33,12 +33,16 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     ensure_output_dir_missing(&output_dir);
 
     let dashboard = absolute_path(&remote.dashboard);
-    let material = generate_remote_cluster_material(args.validators);
+    let material = generate_remote_cluster_material(args.validators, args.secondaries);
     let validators = build_validators(args, remote, &output_dir, &material);
+    let secondaries = build_secondaries(args, remote, &output_dir, &material);
 
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
     for validator in &validators {
         write_yaml_config(&validator.config_file, &validator.config);
+    }
+    for secondary in &secondaries {
+        write_yaml_config(&secondary.config_file, &secondary.config);
     }
 
     if args.spammer {
@@ -47,6 +51,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
             value: args.spammer_value,
             seed_offset: args.spammer_seed_offset,
             http_port: remote.http_port,
+            primary_validators: material.primary_hex(),
         };
         write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
     }
@@ -59,6 +64,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         VALIDATOR_BINARY_FILE,
         DASHBOARD_FILE,
         &validators,
+        &secondaries,
     );
     let config_path = output_dir.join(DEPLOYER_CONFIG_FILE);
     let raw = serde_yaml::to_string(&deployer_config).expect("failed to serialize deployer config");
@@ -67,6 +73,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     info!(
         output_dir = %output_dir.display(),
         validators = args.validators,
+        secondaries = args.secondaries,
         "generated remote deployment bundle"
     );
     if args.spammer {
@@ -95,6 +102,8 @@ fn build_validators(
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
     let bootstrappers = default_bootstrappers(&material.public_keys);
+    let primary_validators = material.primary_hex();
+    let secondary_validators = material.secondary_hex();
 
     for index in 0..args.validators {
         let validator_index = index as usize;
@@ -114,6 +123,8 @@ fn build_validators(
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
             num_validators: args.validators,
+            primary_validators: primary_validators.clone(),
+            secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
@@ -137,19 +148,71 @@ fn build_validators(
     validators
 }
 
+fn build_secondaries(
+    args: &GenerateArgs,
+    remote: &RemoteArgs,
+    output_dir: &Path,
+    material: &ClusterMaterial,
+) -> Vec<GeneratedValidator> {
+    let mut secondaries = Vec::with_capacity(args.secondaries as usize);
+    let bootstrappers = default_bootstrappers(&material.public_keys);
+    let primary_validators = material.primary_hex();
+    let secondary_validators = material.secondary_hex();
+
+    for index in 0..args.secondaries {
+        let secondary_index = index as usize;
+        let public_key = &material.secondary_public_keys[secondary_index];
+        let public_key_hex = hex(&public_key.encode());
+
+        let config = ValidatorConfig {
+            private_key: hex(&material.secondary_signers[secondary_index].encode()),
+            dkg_output: hex(&material.dkg_output.encode()),
+            dkg_share: String::new(),
+            startup: args.startup,
+            listen_port: remote.listen_port,
+            genesis_leader: material.genesis_leader.clone(),
+            partition_prefix: format!("secondary-{index}"),
+            num_validators: args.validators,
+            primary_validators: primary_validators.clone(),
+            secondary_validators: secondary_validators.clone(),
+            log_level: args.log_level.clone(),
+            worker_threads: args.worker_threads,
+            rayon_threads: args.rayon_threads,
+            http_port: remote.http_port,
+            metrics_port: METRICS_PORT,
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
+            bootstrappers: bootstrappers.clone(),
+        };
+
+        let config_name = format!("{public_key_hex}.yaml");
+
+        secondaries.push(GeneratedValidator {
+            public_key_hex: public_key_hex.clone(),
+            config_name: config_name.clone(),
+            config_file: output_dir.join(config_name),
+            config,
+        });
+    }
+
+    secondaries
+}
+
 fn build_deployer_config(
     args: &GenerateArgs,
     remote: &RemoteArgs,
     validator_binary: &str,
     dashboard: &str,
     validators: &[GeneratedValidator],
+    secondaries: &[GeneratedValidator],
 ) -> aws::Config {
+    let regions = &remote.regions;
     let mut instances: Vec<aws::InstanceConfig> = validators
         .iter()
         .enumerate()
         .map(|(index, validator)| aws::InstanceConfig {
             name: validator.public_key_hex.clone(),
-            region: remote.regions[index % remote.regions.len()].clone(),
+            region: regions[index % regions.len()].clone(),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -159,10 +222,25 @@ fn build_deployer_config(
         })
         .collect();
 
+    // Spread secondary instances across regions independently of the primary
+    // rotation so they don't all land in the same AZ as primary 0.
+    for (index, secondary) in secondaries.iter().enumerate() {
+        instances.push(aws::InstanceConfig {
+            name: secondary.public_key_hex.clone(),
+            region: regions[index % regions.len()].clone(),
+            instance_type: remote.instance_type.clone(),
+            storage_size: remote.storage_size,
+            storage_class: STORAGE_CLASS.to_string(),
+            binary: validator_binary.to_string(),
+            config: secondary.config_name.clone(),
+            profiling: remote.profiling,
+        });
+    }
+
     if args.spammer {
         instances.push(aws::InstanceConfig {
             name: "spammer".to_string(),
-            region: remote.regions[0].clone(),
+            region: regions[0].clone(),
             instance_type: remote
                 .spammer_instance_type
                 .clone()
@@ -218,6 +296,7 @@ mod tests {
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
             validators: 3,
+            secondaries: 0,
             output_dir: PathBuf::from("artifacts"),
             log_level: "info".to_string(),
             worker_threads: 2,
@@ -266,6 +345,8 @@ mod tests {
                 genesis_leader: "leader".to_string(),
                 partition_prefix: format!("validator-{index}"),
                 num_validators: 3,
+                primary_validators: Vec::new(),
+                secondary_validators: Vec::new(),
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
@@ -289,6 +370,7 @@ mod tests {
             VALIDATOR_BINARY_FILE,
             "dashboard.json",
             &validators,
+            &[],
         );
 
         assert!(!config.tag.is_empty());
@@ -303,6 +385,43 @@ mod tests {
         assert_eq!(config.ports[0].port, 9000);
         assert_eq!(config.ports[1].port, 8080);
         assert_eq!(config.ports[1].cidr, "198.51.100.4/32");
+    }
+
+    #[test]
+    fn remote_deployer_config_includes_secondaries() {
+        let mut args = generate_args();
+        args.secondaries = 2;
+        let remote = remote_args();
+        let validators = vec![validator(0), validator(1), validator(2)];
+        let secondaries = vec![
+            super::GeneratedValidator {
+                public_key_hex: "secondary-0".to_string(),
+                config_name: "secondary-0.yaml".to_string(),
+                config_file: PathBuf::from("/tmp/secondary-0.yaml"),
+                config: validator(0).config,
+            },
+            super::GeneratedValidator {
+                public_key_hex: "secondary-1".to_string(),
+                config_name: "secondary-1.yaml".to_string(),
+                config_file: PathBuf::from("/tmp/secondary-1.yaml"),
+                config: validator(0).config,
+            },
+        ];
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        // 3 primaries + 2 secondaries, no spammer.
+        assert_eq!(config.instances.len(), 5);
+        assert_eq!(config.instances[3].name, "secondary-0");
+        assert_eq!(config.instances[3].binary, VALIDATOR_BINARY_FILE);
+        assert_eq!(config.instances[3].config, "secondary-0.yaml");
+        assert_eq!(config.instances[4].name, "secondary-1");
     }
 
     #[test]

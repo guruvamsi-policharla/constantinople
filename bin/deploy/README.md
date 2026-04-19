@@ -188,6 +188,59 @@ cargo run --bin constantinople-deploy -- generate \
   ...
 ```
 
+## Secondary Validators
+
+Secondary validators join the P2P network and observe consensus, but do **not** participate in
+consensus. They receive an ed25519 identity during setup but **no DKG share**, so they cannot sign
+consensus messages. They are registered through the `p2p::discovery` secondary peer set, which
+every node (primary and secondary) tracks identically.
+
+Secondaries do **not** run the mempool HTTP webserver — since they cannot propose blocks, they
+have no need to ingest transactions. Submit transactions to a primary validator instead.
+
+Use cases:
+
+- Passive observers / monitoring nodes
+- Block propagation redundancy
+
+Add `--secondaries N` to include `N` secondary nodes in either local or remote bundles:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --secondaries 2 \
+  --output-dir ./local \
+  local \
+  --base-port 3000 \
+  --base-http-port 8080
+```
+
+This additionally writes `secondary-0.yaml`, `secondary-1.yaml`, ... alongside the primary
+`validator-*.yaml` files. `peers.yaml` gains a `secondaries:` block that every node consumes to
+populate the secondary peer set; the spammer ignores it and only sends transactions to primary
+validators.
+
+Run a secondary manually (same binary, same flags as a primary):
+
+```sh
+cargo run --bin constantinople -- \
+  --config ./local/secondary-0.yaml \
+  --peers ./local/peers.yaml
+```
+
+Local secondaries listen on loopback P2P ports starting at `base_port + validators`, and metrics
+ports starting at `base_metrics_port + validators`. HTTP ports are allocated but unused (no
+mempool webserver is bound). Remote secondaries reuse `--instance-type` and `--storage-size` —
+there are no secondary-specific sizing flags.
+
+Notes:
+
+- Every node in the deployment (primary and secondary) must agree on the full primary+secondary
+  set. The deploy tool emits identical lists into every YAML to guarantee this. Editing one
+  config in isolation will break `discovery`.
+- The DKG polynomial is sized to the primary count only — adding secondaries does not change
+  consensus quorum thresholds.
+
 ## Runtime Interfaces
 
 Use `--peers` for local bundles:

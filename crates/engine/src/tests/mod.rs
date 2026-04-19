@@ -29,10 +29,12 @@ use commonware_glue::{
     stateful::{StartupMode, db::SyncEngineConfig},
 };
 use commonware_macros::{test_group, test_traced};
-use commonware_p2p::simulated::Link;
+use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Handle, Metrics, Quota, Spawner};
-use commonware_utils::{NZU64, NZUsize, channel::oneshot, sync::Mutex, union};
+use commonware_utils::{
+    NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
@@ -67,6 +69,12 @@ struct TestEngineDefinition {
     output: Output<MinSig, TestPublicKey>,
     shares: BTreeMap<TestPublicKey, Option<Share>>,
     enable_state_sync: bool,
+    /// When `true`, every node re-tracks peer set 0 during `init` as
+    /// `TrackedPeers::new(primary, secondary)` — primary = nodes with a DKG
+    /// share, secondary = nodes without. Exercises the p2p discovery secondary
+    /// mechanism. Default `false` leaves all nodes in the primary set as
+    /// configured by `PlanBuilder`.
+    use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
 }
 
@@ -79,8 +87,35 @@ impl TestEngineDefinition {
             output,
             shares,
             enable_state_sync: false,
+            use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Extend the node set with `count` secondary (non-voting) participants.
+    ///
+    /// Secondaries receive an ed25519 identity but no DKG share, so the engine
+    /// constructs their threshold scheme in verifier mode (`me() == None`).
+    /// Simplex then runs as a silent observer: no votes, no certificates — the
+    /// node only processes inbound messages and drives its local state machine.
+    fn with_secondaries(mut self, count: u32) -> Self {
+        const SECONDARY_SEED_OFFSET: u64 = 1_000_000;
+        for i in 0..count {
+            let signer = TestPrivateKey::from_seed(SECONDARY_SEED_OFFSET + u64::from(i));
+            self.shares.insert(signer.public_key(), None);
+            self.signers.push(signer);
+        }
+        self
+    }
+
+    /// Exercise the `p2p::discovery` secondary peer-set mechanism.
+    ///
+    /// With this enabled, each node re-tracks peer set 0 as
+    /// `TrackedPeers::new(primary, secondary)` during `init`. Primary = nodes
+    /// with a DKG share, secondary = the rest.
+    const fn with_discovery_split(mut self) -> Self {
+        self.use_discovery_split = true;
+        self
     }
 
     const fn with_state_sync(mut self) -> Self {
@@ -133,9 +168,24 @@ impl EngineDefinition for TestEngineDefinition {
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
         let genesis_leader = self.signers[0].public_key();
-        let manager = oracle.manager();
+        let mut manager = oracle.manager();
         let blocker = oracle.control(public_key.clone());
         let (state_sender, state_receiver) = oneshot::channel();
+
+        // Override PlanBuilder's default single-primary-set tracking with the
+        // discovery primary/secondary split when requested.
+        if self.use_discovery_split && index == 0 {
+            let (primary, secondary): (Vec<_>, Vec<_>) = self
+                .signers
+                .iter()
+                .map(TestPrivateKey::public_key)
+                .partition(|pk| self.shares.get(pk).is_some_and(|share| share.is_some()));
+            let primary: Set<TestPublicKey> = primary.into_iter().try_collect().unwrap();
+            let secondary: Set<TestPublicKey> = secondary.into_iter().try_collect().unwrap();
+            manager
+                .track(0, TrackedPeers::new(primary, secondary))
+                .await;
+        }
 
         let handle = context
             .with_label("validator")
@@ -580,6 +630,20 @@ fn run_network_partition(engine: TestEngineDefinition) {
         .unwrap();
 }
 
+fn run_secondaries_sync(engine: TestEngineDefinition) {
+    // Every node (primary and secondary) must reach height 40 and agree on the
+    // block at that height. `FinalizedHeightAtLeast` polls per-node state and
+    // requires `target_count == participants.len()` to have the block, so
+    // secondaries falling behind will cause the exit condition never to fire.
+    PlanBuilder::new(engine)
+        .link(default_link())
+        .seeds(0..2)
+        .exit_condition(FinalizedHeightAtLeast::new(40))
+        .property(BlockAgreementAtHeight::new(40))
+        .run()
+        .unwrap();
+}
+
 #[test_group("slow")]
 #[test_traced("DEBUG")]
 fn all_validators_finalize_and_commit() {
@@ -668,4 +732,20 @@ fn rapid_crashes() {
 #[test_traced("DEBUG")]
 fn network_partition_and_rejoin() {
     run_network_partition(TestEngineDefinition::new(NUM_VALIDATORS));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn secondaries_sync_with_primaries() {
+    run_secondaries_sync(TestEngineDefinition::new(NUM_VALIDATORS).with_secondaries(2));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn secondaries_sync_with_discovery_split() {
+    run_secondaries_sync(
+        TestEngineDefinition::new(NUM_VALIDATORS)
+            .with_secondaries(2)
+            .with_discovery_split(),
+    );
 }
