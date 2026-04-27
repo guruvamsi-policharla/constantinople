@@ -28,7 +28,10 @@ use commonware_glue::stateful::{
     db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{
+    Clock, Metrics, Spawner, Storage,
+    telemetry::metrics::{Counter, MetricsExt},
+};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
@@ -50,7 +53,6 @@ use constantinople_primitives::{
     Account, Address, Block, Header, Sealable, SealedBlock, SignedTransaction,
 };
 use futures::StreamExt;
-use prometheus_client::metrics::counter::Counter;
 use rand::Rng;
 use rand_core::CryptoRngCore;
 use std::{
@@ -257,11 +259,9 @@ where
         genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
         transaction_history_prune_cadence: Option<NonZeroU64>,
     ) -> Self {
-        let proposed_transactions = Counter::default();
-        context.register(
+        let proposed_transactions = context.counter(
             "proposed_transactions",
             "The number of transactions proposed into blocks",
-            proposed_transactions.clone(),
         );
 
         Self {
