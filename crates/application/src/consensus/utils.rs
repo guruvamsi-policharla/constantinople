@@ -5,7 +5,7 @@ use crate::processor::state::State;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
-use constantinople_primitives::VerifiedTransaction;
+use constantinople_primitives::{Address, SignedTransaction};
 use std::collections::{HashMap, HashSet};
 
 /// Loads the accounts needed by `transactions` from `batch`.
@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 /// for verification.
 pub async fn load_state<E, H, P, T>(
     batch: &StateBatch<E, H, T>,
-    transactions: &[VerifiedTransaction<P, H>],
+    transactions: &[SignedTransaction<P, H>],
+    signers: &[Address],
 ) -> Result<State, StorageError<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -23,10 +24,16 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let addresses = transactions.iter().fold(
+    assert_eq!(
+        transactions.len(),
+        signers.len(),
+        "transactions and cached signer addresses must have the same length",
+    );
+
+    let addresses = transactions.iter().zip(signers).fold(
         HashSet::with_capacity(transactions.len().saturating_mul(2)),
-        |mut acc, tx| {
-            acc.insert(tx.signer());
+        |mut acc, (tx, signer)| {
+            acc.insert(*signer);
             acc.insert(tx.value().to);
             acc
         },

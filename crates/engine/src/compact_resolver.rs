@@ -88,7 +88,7 @@ where
     F: Family,
     H: Hasher,
 {
-    fn new(sender: mpsc::Sender<Message<DB, F, Op, H>>) -> Self {
+    const fn new(sender: mpsc::Sender<Message<DB, F, Op, H>>) -> Self {
         Self { sender }
     }
 }
@@ -413,14 +413,14 @@ struct Request<F: Family, D: Digest> {
 }
 
 impl<F: Family, D: Digest> Request<F, D> {
-    fn from_target(target: compact::Target<F, D>) -> Self {
+    const fn from_target(target: compact::Target<F, D>) -> Self {
         Self {
             root: target.root,
             leaf_count: target.leaf_count,
         }
     }
 
-    fn to_target(&self) -> compact::Target<F, D> {
+    const fn to_target(&self) -> compact::Target<F, D> {
         compact::Target {
             root: self.root,
             leaf_count: self.leaf_count,
@@ -576,7 +576,7 @@ struct Handler<F: Family, D: Digest> {
 }
 
 impl<F: Family, D: Digest> Handler<F, D> {
-    fn new(sender: mpsc::Sender<EngineMessage<F, D>>) -> Self {
+    const fn new(sender: mpsc::Sender<EngineMessage<F, D>>) -> Self {
         Self { sender }
     }
 }

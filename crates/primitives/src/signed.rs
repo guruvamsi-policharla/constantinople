@@ -4,15 +4,12 @@
 //! signatures:
 //!
 //! - [`Signed`] — A [`Sealed`] value with an attached signature over its seal.
-//! - [`Verified`] — A [`Signed`] value whose signature has already been verified.
 //! - [`Signable`] — A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
-use crate::{Address, Sealable, Sealed, SignedTransaction, Transaction, VerifiedTransaction};
-use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
-use commonware_cryptography::{
-    BatchVerifier, Digest, Hasher, PublicKey, Signature, Signer, Verifier,
-};
+use crate::{Address, Sealable, Sealed, SignedTransaction};
+use commonware_codec::{Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
+use commonware_cryptography::{BatchVerifier, Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
@@ -118,112 +115,6 @@ where
     }
 }
 
-/// A [`Signed`] value whose signature has been verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verified<T, H, Sig>
-where
-    H: Hasher,
-    Sig: Signature,
-{
-    inner: Signed<T, H, Sig>,
-    signer: Address,
-}
-
-impl<D, P> Transaction<D, P>
-where
-    D: Digest,
-    P: PublicKey,
-{
-    /// Seals and signs a locally constructed transaction and returns it as verified.
-    ///
-    /// This is intended for trusted local construction paths. It asserts that the
-    /// embedded sender matches the provided signer's public key, signs the
-    /// transaction once, and caches the sender address without re-verifying the
-    /// signature that was just produced.
-    pub fn seal_and_sign_verified<H, S>(
-        self,
-        signer: &S,
-        namespace: &[u8],
-        hasher: &mut H,
-    ) -> Verified<Self, H, P::Signature>
-    where
-        H: Hasher<Digest = D>,
-        S: Signer<PublicKey = P, Signature = <P as Verifier>::Signature>,
-    {
-        let signer_public_key = signer.public_key();
-        let sender = self
-            .sender()
-            .expect("locally constructed transaction senders must decode");
-        assert!(
-            sender == &signer_public_key,
-            "transaction sender must match signer public key",
-        );
-
-        let signed = Signed::new(self.seal(hasher), namespace, signer);
-        signed.into()
-    }
-}
-
-impl<T, H, Sig> Verified<T, H, Sig>
-where
-    H: Hasher,
-    Sig: Signature,
-{
-    /// Returns the underlying signed value.
-    pub const fn inner(&self) -> &Signed<T, H, Sig> {
-        &self.inner
-    }
-
-    /// Consumes the wrapper and returns the signed value.
-    pub fn into_inner(self) -> Signed<T, H, Sig> {
-        self.inner
-    }
-
-    /// Returns the verified signer's cached address.
-    pub const fn signer(&self) -> Address {
-        self.signer
-    }
-
-    /// Returns a reference to the innermost value.
-    pub fn value(&self) -> &T {
-        self.inner.value()
-    }
-
-    /// Returns the message digest of the inner value.
-    pub const fn message_digest(&self) -> &H::Digest {
-        self.inner.message_digest()
-    }
-
-    /// Returns a reference to the signature.
-    pub fn signature(&self) -> &Sig {
-        self.inner
-            .signature()
-            .expect("verified signatures must decode")
-    }
-}
-
-impl<T, H, Sig> Write for Verified<T, H, Sig>
-where
-    T: Write,
-    H: Hasher,
-    Sig: Signature,
-{
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.inner.write(buf);
-    }
-}
-
-impl<T, H, Sig> EncodeSize for Verified<T, H, Sig>
-where
-    Signed<T, H, Sig>: EncodeSize,
-    H: Hasher,
-    Sig: Signature,
-{
-    fn encode_size(&self) -> usize {
-        self.inner.encode_size()
-    }
-}
-
 impl<T, H, Sig> Write for Signed<T, H, Sig>
 where
     T: Write,
@@ -296,25 +187,57 @@ pub trait Signable: Sealable {
 
 impl<T: Sealable> Signable for T {}
 
-impl<D, P, H> From<Signed<Transaction<D, P>, H, P::Signature>>
-    for Verified<Transaction<D, P>, H, P::Signature>
+/// Materializes lazily-encoded signed transactions in parallel.
+///
+/// Returns `None` if any transaction fails to decode.
+pub fn materialize_transaction_chunks<P, H, St>(
+    strategy: &St,
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+) -> Option<Vec<SignedTransaction<P, H>>>
 where
-    D: Digest,
     P: PublicKey,
     H: Hasher,
+    St: Strategy,
 {
-    fn from(signed: Signed<Transaction<D, P>, H, P::Signature>) -> Self {
-        let mut hasher = H::default();
-        let sender = signed
-            .value()
-            .sender()
-            .expect("verified transaction sender must decode");
-        let signer = Address::from_public_key(&mut hasher, sender);
-        Self {
-            inner: signed,
-            signer,
-        }
+    if transactions.is_empty() {
+        return Some(Vec::new());
     }
+
+    let parallelism = strategy.parallelism_hint();
+    if parallelism <= 1 || transactions.len() <= parallelism {
+        return transactions
+            .into_iter()
+            .map(|lazy| lazy.get().cloned())
+            .collect();
+    }
+
+    strategy
+        .map_collect_vec(transactions, |lazy| lazy.get().cloned())
+        .into_iter()
+        .collect()
+}
+
+/// Hashes transaction sender public keys into addresses in parallel.
+///
+/// Returns `None` if any sender public key fails to decode.
+pub fn transaction_senders<P, H, St>(
+    strategy: &St,
+    transactions: &[SignedTransaction<P, H>],
+) -> Option<Vec<Address>>
+where
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    strategy
+        .map_collect_vec(transactions, |transaction| {
+            transaction
+                .value()
+                .sender()
+                .map(|sender| Address::from_public_key(&mut H::default(), sender))
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Verifies a slice of lazily-encoded signed transactions using batch
@@ -365,7 +288,7 @@ where
 }
 
 /// Splits lazily-encoded transactions into chunks, verifies each chunk in
-/// parallel using batch signature verification, and returns the verified
+/// parallel using batch signature verification, and returns the decoded
 /// transactions in their original order.
 ///
 /// Forcing each [`Lazy`] happens inside the worker, so transaction decoding
@@ -376,7 +299,7 @@ pub fn verify_transaction_chunks<P, H, BV, St>(
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Vec<VerifiedTransaction<P, H>>>
+) -> Option<Vec<SignedTransaction<P, H>>>
 where
     P: PublicKey,
     H: Hasher,
@@ -407,12 +330,8 @@ where
             return None;
         }
         // Each lazy was forced during verification above, so unwrapping the
-        // materialized value and converting into a `VerifiedTransaction` is
-        // infallible here.
-        let verified: Option<Vec<_>> = chunk
-            .into_iter()
-            .map(|lazy| lazy.get().cloned().map(Into::into))
-            .collect();
+        // materialized value is infallible here.
+        let verified: Option<Vec<_>> = chunk.into_iter().map(|lazy| lazy.get().cloned()).collect();
         verified
     });
 
@@ -430,6 +349,7 @@ mod test {
         Digest, Hasher, Signer, Verifier, ed25519, secp256r1::recoverable, sha256,
     };
     use commonware_math::algebra::Random;
+    use commonware_parallel::Sequential;
     use commonware_utils::test_rng;
     use core::num::NonZeroU64;
 
@@ -500,44 +420,31 @@ mod test {
     }
 
     #[test]
-    fn verified_caches_signer_address() {
+    fn transaction_senders_hashes_signer_address() {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = private_key.public_key();
-        let verified = Transaction::new(
+        let signed = Transaction::new(
             public_key.clone(),
             Address::EMPTY,
             NonZeroU64::new(1).expect("test value should be non-zero"),
             0,
         )
-        .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
+        .seal_and_sign(&private_key, NAMESPACE, hasher);
 
         let expected = Address::from_public_key(&mut sha256::Sha256::default(), &public_key);
-        assert_eq!(verified.signer(), expected);
+        let senders = super::transaction_senders(&Sequential, std::slice::from_ref(&signed))
+            .expect("locally constructed sender should decode");
+
+        assert_eq!(senders, vec![expected]);
         assert!(
-            verified.inner().verify(
+            signed.verify(
                 NAMESPACE,
-                verified
+                signed
                     .value()
                     .sender()
-                    .expect("verified senders must decode"),
+                    .expect("signed sender should decode"),
             )
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "transaction sender must match signer public key")]
-    fn seal_and_sign_verified_rejects_mismatched_sender() {
-        let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::from_seed(0);
-        let wrong_key = ed25519::PrivateKey::from_seed(1);
-
-        let _ = Transaction::new(
-            wrong_key.public_key(),
-            Address::EMPTY,
-            NonZeroU64::new(1).expect("test value should be non-zero"),
-            0,
-        )
-        .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
     }
 }

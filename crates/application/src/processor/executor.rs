@@ -2,7 +2,7 @@
 
 use super::state::{Overlay, State};
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::{Account, Address, VerifiedTransaction};
+use constantinople_primitives::{Account, Address, SignedTransaction};
 
 /// Deterministic account writes produced by execution.
 pub type Changeset = Vec<(Address, Account)>;
@@ -11,9 +11,9 @@ pub type Changeset = Vec<(Address, Account)>;
 #[derive(Debug)]
 pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
     /// Transactions that passed static validation and were included.
-    pub valid: Vec<VerifiedTransaction<PK, H>>,
+    pub valid: Vec<SignedTransaction<PK, H>>,
     /// Transactions that failed static validation and were excluded.
-    pub invalid: Vec<VerifiedTransaction<PK, H>>,
+    pub invalid: Vec<SignedTransaction<PK, H>>,
     /// Persistent account writes produced by the included transactions.
     pub changeset: Changeset,
 }
@@ -21,18 +21,25 @@ pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
 /// Filters invalid proposal candidates and executes the valid transfers.
 pub fn propose<H, PK>(
     state: &State,
-    transactions: Vec<VerifiedTransaction<PK, H>>,
+    transactions: Vec<SignedTransaction<PK, H>>,
+    signers: Vec<Address>,
 ) -> ProposalOutput<PK, H>
 where
     H: Hasher,
     PK: PublicKey,
 {
+    assert_eq!(
+        transactions.len(),
+        signers.len(),
+        "transactions and cached signer addresses must have the same length",
+    );
+
     let mut overlay = Overlay::new(state);
     let mut valid = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
 
-    for transaction in transactions {
-        if execute_transfer(&mut overlay, &transaction) {
+    for (transaction, signer) in transactions.into_iter().zip(signers) {
+        if execute_transfer(&mut overlay, &transaction, signer) {
             valid.push(transaction);
         } else {
             invalid.push(transaction);
@@ -51,16 +58,23 @@ where
 /// Returns `None` if any transaction in the batch fails validation.
 pub fn execute<H, PK>(
     state: &State,
-    transactions: &[VerifiedTransaction<PK, H>],
+    transactions: &[SignedTransaction<PK, H>],
+    signers: &[Address],
 ) -> Option<Changeset>
 where
     H: Hasher,
     PK: PublicKey,
 {
+    assert_eq!(
+        transactions.len(),
+        signers.len(),
+        "transactions and cached signer addresses must have the same length",
+    );
+
     let mut overlay = Overlay::new(state);
 
-    for transaction in transactions {
-        if !execute_transfer(&mut overlay, transaction) {
+    for (transaction, signer) in transactions.iter().zip(signers) {
+        if !execute_transfer(&mut overlay, transaction, *signer) {
             return None;
         }
     }
@@ -74,13 +88,13 @@ where
 /// or if the recipient balance would overflow.
 fn execute_transfer<H, PK>(
     state: &mut Overlay<'_>,
-    transaction: &VerifiedTransaction<PK, H>,
+    transaction: &SignedTransaction<PK, H>,
+    sender_address: Address,
 ) -> bool
 where
     H: Hasher,
     PK: PublicKey,
 {
-    let sender_address = transaction.signer();
     let recipient_address = transaction.value().to;
     let value = transaction.value().value.get();
     let nonce = transaction.value().nonce;

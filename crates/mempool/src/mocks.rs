@@ -83,7 +83,7 @@ mod tests {
     };
     use commonware_cryptography::{Digest, Signer, ed25519, sha256};
     use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Address, Header, Transaction, VerifiedTransaction};
+    use constantinople_primitives::{Address, Header, Signable, Transaction, VerifiedTransaction};
     use core::num::NonZeroU64;
 
     const NAMESPACE: &[u8] = b"mempool-test";
@@ -99,7 +99,7 @@ mod tests {
             NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
         )
-        .seal_and_sign_verified(key, NAMESPACE, hasher)
+        .seal_and_sign(key, NAMESPACE, hasher)
     }
 
     fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {

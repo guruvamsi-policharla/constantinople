@@ -2,7 +2,10 @@
 
 use super::executor::{ProposalOutput, execute, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
-use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
+use commonware_parallel::Sequential;
+use constantinople_primitives::{
+    Account, Address, Signable, Transaction, VerifiedTransaction, transaction_senders,
+};
 use core::num::NonZeroU64;
 use std::collections::HashMap;
 
@@ -32,8 +35,12 @@ impl TestSigner {
             NonZeroU64::new(value).expect("test values must be non-zero"),
             nonce,
         )
-        .seal_and_sign_verified(&self.key, NAMESPACE, &mut TestHasher::default())
+        .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
+}
+
+fn signers(transactions: &[TestTransaction]) -> Vec<Address> {
+    transaction_senders(&Sequential, transactions).expect("test senders should decode")
 }
 
 fn account(balance: u64, nonce: u64) -> Account {
@@ -54,14 +61,12 @@ fn validate_tracks_pending_nonce_and_balance() {
     accounts.insert(signer.address, account(10, 0));
     accounts.insert(recipient.address, Account::default());
 
-    let proposal: TestProposal = propose(
-        &accounts,
-        vec![
-            signer.sign(recipient.address, 4, 0),
-            signer.sign(recipient.address, 7, 1),
-            signer.sign(recipient.address, 6, 1),
-        ],
-    );
+    let transactions = vec![
+        signer.sign(recipient.address, 4, 0),
+        signer.sign(recipient.address, 7, 1),
+        signer.sign(recipient.address, 6, 1),
+    ];
+    let proposal: TestProposal = propose(&accounts, transactions.clone(), signers(&transactions));
 
     assert_eq!(proposal.valid.len(), 2);
     assert_eq!(proposal.invalid.len(), 1);
@@ -86,9 +91,10 @@ fn propose_and_verify_match_for_transfer_batch() {
         sender_b.sign(recipient.address, 6, 0),
     ];
 
-    let proposal = propose(&accounts, transactions);
-    let changeset =
-        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
+    let proposal = propose(&accounts, transactions.clone(), signers(&transactions));
+    let valid_signers = signers(&proposal.valid);
+    let changeset = execute(&accounts, &proposal.valid, &valid_signers)
+        .expect("valid proposal transactions should execute");
 
     assert_eq!(proposal.changeset, changeset);
     assert_eq!(
@@ -111,9 +117,11 @@ fn self_transfer_only_bumps_nonce() {
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 3));
 
-    let proposal = propose(&accounts, vec![signer.sign(signer.address, 4, 3)]);
-    let changeset =
-        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
+    let transactions = vec![signer.sign(signer.address, 4, 3)];
+    let proposal = propose(&accounts, transactions.clone(), signers(&transactions));
+    let valid_signers = signers(&proposal.valid);
+    let changeset = execute(&accounts, &proposal.valid, &valid_signers)
+        .expect("valid proposal transactions should execute");
     assert_eq!(
         changeset_account(&changeset, signer.address),
         Some(account(9, 4))
@@ -127,7 +135,8 @@ fn self_transfer_is_included_and_preserves_balance() {
     accounts.insert(signer.address, account(12, 5));
 
     let transaction = signer.sign(signer.address, 7, 5);
-    let proposal = propose(&accounts, vec![transaction]);
+    let transactions = vec![transaction];
+    let proposal = propose(&accounts, transactions.clone(), signers(&transactions));
 
     assert_eq!(proposal.valid.len(), 1);
     assert!(proposal.invalid.is_empty());
@@ -136,8 +145,9 @@ fn self_transfer_is_included_and_preserves_balance() {
         Some(account(12, 6))
     );
 
-    let changeset =
-        execute(&accounts, &proposal.valid).expect("self-transfer should execute successfully");
+    let valid_signers = signers(&proposal.valid);
+    let changeset = execute(&accounts, &proposal.valid, &valid_signers)
+        .expect("self-transfer should execute successfully");
     assert_eq!(
         changeset_account(&changeset, signer.address),
         Some(account(12, 6))
@@ -153,9 +163,11 @@ fn missing_recipient_starts_with_default_balance() {
     accounts.insert(signer.address, account(9, 0));
     accounts.insert(recipient.address, Account::default());
 
-    let proposal = propose(&accounts, vec![signer.sign(recipient.address, 4, 0)]);
-    let changeset =
-        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
+    let transactions = vec![signer.sign(recipient.address, 4, 0)];
+    let proposal = propose(&accounts, transactions.clone(), signers(&transactions));
+    let valid_signers = signers(&proposal.valid);
+    let changeset = execute(&accounts, &proposal.valid, &valid_signers)
+        .expect("valid proposal transactions should execute");
 
     assert_eq!(
         changeset_account(&changeset, recipient.address),

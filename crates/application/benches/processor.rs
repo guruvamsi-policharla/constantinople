@@ -1,8 +1,11 @@
 use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
+use commonware_parallel::Sequential;
 use constantinople_application::processor::{executor, state::State};
-use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
+use constantinople_primitives::{
+    Account, Address, Signable, Transaction, VerifiedTransaction, transaction_senders,
+};
 use core::num::NonZeroU64;
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
@@ -20,17 +23,17 @@ fn main() {
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn execution(bencher: Bencher<'_, '_>, transaction_count: usize) {
-    let (state, transactions) = build_fixture(transaction_count);
+    let (state, transactions, signers) = build_fixture(transaction_count);
     bencher.bench_local(|| {
         black_box(
-            executor::execute(&state, &transactions)
+            executor::execute(&state, &transactions, &signers)
                 .expect("bench transactions should execute")
                 .len(),
         )
     });
 }
 
-fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
+fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>, Vec<Address>) {
     let mut accounts = HashMap::new();
     let mut transactions = Vec::with_capacity(transaction_count);
 
@@ -48,8 +51,12 @@ fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
         transactions.push(signer.sign(recipient, 1, 0));
     }
 
-    let valid = executor::propose(&accounts, transactions).valid;
-    (accounts, valid)
+    let signers = transaction_senders(&Sequential, &transactions)
+        .expect("bench transactions should have decodable senders");
+    let valid = executor::propose(&accounts, transactions, signers).valid;
+    let valid_signers = transaction_senders(&Sequential, &valid)
+        .expect("bench transactions should have decodable senders");
+    (accounts, valid, valid_signers)
 }
 
 struct TestSigner {
@@ -71,7 +78,7 @@ impl TestSigner {
             NonZeroU64::new(value).expect("bench value must be non-zero"),
             nonce,
         )
-        .seal_and_sign_verified(&self.key, NAMESPACE, &mut TestHasher::default())
+        .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
 }
 
