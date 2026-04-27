@@ -50,7 +50,9 @@ use commonware_storage::{
 };
 use commonware_utils::{non_empty_range, sync::AsyncRwLock};
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Account, Block, Header, Sealable, SealedBlock, SignedTransaction};
+use constantinople_primitives::{
+    Account, AccountKey, Block, Header, Sealable, SealedBlock, SignedTransaction,
+};
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
@@ -73,7 +75,8 @@ pub use utils::{load_lazy_state, load_state};
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Shared QMDB handle for the application state database.
-type StateDatabase<E, H, P, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, P, Account, H, T>>>;
+type StateDatabase<E, H, P, T> =
+    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T>>>;
 
 pub type TransactionHistoryDb<E, H> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H>;
@@ -93,10 +96,13 @@ type Databases<E, H, P, T> = (StateDatabase<E, H, P, T>, TransactionDatabase<E, 
 type StateBatch<E, H, P, T> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<P, FixedEncoding<Account>>>>,
+    FixedJournal<
+        E,
+        AnyOperation<mmr::Family, UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>>,
+    >,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<P, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>,
 >;
 
 type TransactionBatch<E, H> = <TransactionDatabase<E, H> as DatabaseSet<E>>::Unmerkleized;
@@ -117,8 +123,8 @@ where
 {
     changeset
         .iter()
-        .fold(batch, |batch, (public_key, account)| {
-            batch.write(public_key.clone(), Some(*account))
+        .fold(batch, |batch, (account_key, account)| {
+            batch.write(account_key.clone(), Some(*account))
         })
 }
 

@@ -1,7 +1,7 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use constantinople_application::processor::{executor, state::State};
-use constantinople_primitives::{Account, Signable, Transaction, VerifiedTransaction};
+use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
@@ -37,13 +37,13 @@ fn build_fixture(transaction_count: usize) -> (State<ed25519::PublicKey>, Vec<Te
         let signer = TestSigner::new(index as u64);
         let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
         accounts.insert(
-            signer.public_key.clone(),
+            AccountKey::from_public_key(&signer.public_key),
             Account {
                 balance: 1,
                 nonce: 0,
             },
         );
-        accounts.insert(recipient.clone(), Account::default());
+        accounts.insert(AccountKey::from_public_key(&recipient), Account::default());
         transactions.push(signer.sign(recipient, 1, 0));
     }
 

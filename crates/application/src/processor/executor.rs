@@ -3,10 +3,10 @@
 use super::state::{Overlay, State};
 use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::{Account, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 
 /// Deterministic account writes produced by execution.
-pub type Changeset<PK> = Vec<(PK, Account)>;
+pub type Changeset<PK> = Vec<(AccountKey<PK>, Account)>;
 
 /// The final result of proposal-side filtering and execution.
 #[derive(Debug)]
@@ -75,15 +75,22 @@ where
 pub fn execute_lazy<H, PK>(
     state: &State<PK>,
     transactions: &[Lazy<SignedTransaction<PK, H>>],
+    signers: &[AccountKey<PK>],
 ) -> Option<Changeset<PK>>
 where
     H: Hasher,
     PK: PublicKey,
 {
+    assert_eq!(
+        transactions.len(),
+        signers.len(),
+        "transactions and cached signer keys must have the same length",
+    );
+
     let mut overlay = Overlay::new(state);
 
-    for transaction in transactions {
-        if !execute_transfer(&mut overlay, transaction.get()?) {
+    for (transaction, signer) in transactions.iter().zip(signers) {
+        if !execute_transfer_with_sender(&mut overlay, transaction.get()?, signer) {
             return None;
         }
     }
@@ -103,14 +110,30 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let Some(sender_key) = transaction.value().sender().cloned() else {
+    let Some(sender_key) = transaction
+        .value()
+        .sender()
+        .map(AccountKey::from_public_key)
+    else {
         return false;
     };
-    let recipient_key = transaction.value().to.clone();
+    execute_transfer_with_sender(state, transaction, &sender_key)
+}
+
+fn execute_transfer_with_sender<H, PK>(
+    state: &mut Overlay<'_, PK>,
+    transaction: &SignedTransaction<PK, H>,
+    sender_key: &AccountKey<PK>,
+) -> bool
+where
+    H: Hasher,
+    PK: PublicKey,
+{
+    let recipient_key = &transaction.value().to;
     let value = transaction.value().value.get();
     let nonce = transaction.value().nonce;
 
-    let Some(sender) = state.get(&sender_key) else {
+    let Some(sender) = state.get(sender_key) else {
         return false;
     };
     if sender.nonce != nonce || sender.balance < value {
@@ -122,23 +145,23 @@ where
 
     // Self-transfer: only bump the nonce.
     if sender_key == recipient_key {
-        let sender = state.get_mut(&sender_key).expect("checked above");
+        let sender = state.get_mut(sender_key).expect("checked above");
         sender.nonce = next_nonce;
         return true;
     }
 
-    let Some(recipient) = state.get(&recipient_key) else {
+    let Some(recipient) = state.get(recipient_key) else {
         return false;
     };
     let Some(recipient_balance) = recipient.balance.checked_add(value) else {
         return false;
     };
 
-    let sender = state.get_mut(&sender_key).expect("checked above");
+    let sender = state.get_mut(sender_key).expect("checked above");
     sender.balance -= value;
     sender.nonce = next_nonce;
 
-    let recipient = state.get_mut(&recipient_key).expect("checked above");
+    let recipient = state.get_mut(recipient_key).expect("checked above");
     recipient.balance = recipient_balance;
 
     true

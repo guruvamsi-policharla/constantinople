@@ -14,7 +14,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
-    Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
+    AccountKey, Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
@@ -35,6 +35,7 @@ where
     P: PublicKey,
 {
     pub(super) transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+    pub(super) signers: Vec<AccountKey<P>>,
 }
 
 /// Timing information for the execution side of verification.
@@ -208,7 +209,21 @@ where
 {
     let transactions =
         preload_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
-    Ok(Prepared { transactions })
+    let signers = strategy
+        .map_collect_vec(&transactions, |transaction| {
+            transaction
+                .get()
+                .and_then(|transaction| transaction.value().sender())
+                .map(AccountKey::from_public_key)
+        })
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(MALFORMED_TRANSACTION)?;
+
+    Ok(Prepared {
+        transactions,
+        signers,
+    })
 }
 
 /// Executes and merkleizes a block body for verification.
@@ -226,15 +241,15 @@ where
     H: Hasher,
 {
     let load_state_started_at = Instant::now();
-    let state = load_lazy_state(&state_batches, &prepared.transactions)
+    let state = load_lazy_state(&state_batches, &prepared.transactions, &prepared.signers)
         .await
         .expect("block state loading during verification must succeed")
         .ok_or(MALFORMED_TRANSACTION)?;
     let load_state_ms = load_state_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset =
-        executor::execute_lazy(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = executor::execute_lazy(&state, &prepared.transactions, &prepared.signers)
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
 
     let state_batch = apply_changeset(state_batches, &changeset);
@@ -279,12 +294,12 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    let state = load_lazy_state(&state_batches, &prepared.transactions)
+    let state = load_lazy_state(&state_batches, &prepared.transactions, &prepared.signers)
         .await
         .expect("state loading must succeed for certified apply")
         .ok_or(MALFORMED_TRANSACTION)?;
-    let changeset =
-        executor::execute_lazy(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = executor::execute_lazy(&state, &prepared.transactions, &prepared.signers)
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let state_batch = apply_changeset(state_batches, &changeset);
     let transaction_batch =

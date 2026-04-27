@@ -2,7 +2,7 @@
 
 use super::executor::{ProposalOutput, execute, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
-use constantinople_primitives::{Account, Signable, Transaction, VerifiedTransaction};
+use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use std::collections::HashMap;
 
@@ -40,13 +40,18 @@ fn account(balance: u64, nonce: u64) -> Account {
     Account { balance, nonce }
 }
 
+fn account_key(public_key: &ed25519::PublicKey) -> AccountKey<ed25519::PublicKey> {
+    AccountKey::from_public_key(public_key)
+}
+
 fn changeset_account(
-    changeset: &[(ed25519::PublicKey, Account)],
+    changeset: &[(AccountKey<ed25519::PublicKey>, Account)],
     public_key: ed25519::PublicKey,
 ) -> Option<Account> {
+    let account_key = account_key(&public_key);
     changeset
         .iter()
-        .find_map(|(candidate, account)| (candidate == &public_key).then_some(*account))
+        .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
 }
 
 #[test]
@@ -54,8 +59,8 @@ fn validate_tracks_pending_nonce_and_balance() {
     let signer = TestSigner::from_seed(0);
     let recipient = TestSigner::from_seed(1);
     let mut accounts = HashMap::new();
-    accounts.insert(signer.public_key.clone(), account(10, 0));
-    accounts.insert(recipient.public_key.clone(), Account::default());
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 4, 0),
@@ -78,9 +83,9 @@ fn propose_and_verify_match_for_transfer_batch() {
     let recipient = TestSigner::from_seed(12);
 
     let mut accounts = HashMap::new();
-    accounts.insert(sender_a.public_key.clone(), account(11, 0));
-    accounts.insert(sender_b.public_key.clone(), account(13, 0));
-    accounts.insert(recipient.public_key.clone(), account(5, 0));
+    accounts.insert(account_key(&sender_a.public_key), account(11, 0));
+    accounts.insert(account_key(&sender_b.public_key), account(13, 0));
+    accounts.insert(account_key(&recipient.public_key), account(5, 0));
 
     let transactions = vec![
         sender_a.sign(recipient.public_key.clone(), 4, 0),
@@ -110,7 +115,7 @@ fn propose_and_verify_match_for_transfer_batch() {
 fn self_transfer_only_bumps_nonce() {
     let signer = TestSigner::from_seed(0);
     let mut accounts = HashMap::new();
-    accounts.insert(signer.public_key.clone(), account(9, 3));
+    accounts.insert(account_key(&signer.public_key), account(9, 3));
 
     let transactions = vec![signer.sign(signer.public_key.clone(), 4, 3)];
     let proposal = propose(&accounts, transactions);
@@ -126,7 +131,7 @@ fn self_transfer_only_bumps_nonce() {
 fn self_transfer_is_included_and_preserves_balance() {
     let signer = TestSigner::from_seed(0);
     let mut accounts = HashMap::new();
-    accounts.insert(signer.public_key.clone(), account(12, 5));
+    accounts.insert(account_key(&signer.public_key), account(12, 5));
 
     let transaction = signer.sign(signer.public_key.clone(), 7, 5);
     let transactions = vec![transaction];
@@ -153,8 +158,8 @@ fn missing_recipient_starts_with_default_balance() {
     let signer = TestSigner::from_seed(20);
     let recipient = TestSigner::from_seed(21);
     let mut accounts = HashMap::new();
-    accounts.insert(signer.public_key.clone(), account(9, 0));
-    accounts.insert(recipient.public_key.clone(), Account::default());
+    accounts.insert(account_key(&signer.public_key), account(9, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
 
     let transactions = vec![signer.sign(recipient.public_key.clone(), 4, 0)];
     let proposal = propose(&accounts, transactions);

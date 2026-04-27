@@ -21,7 +21,7 @@ use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, Block, Sealed};
+use constantinople_primitives::{Account, AccountKey, Block, Sealed};
 use std::sync::Arc;
 
 /// A finalized block with its seal (commitment-based).
@@ -38,7 +38,7 @@ pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitme
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, P> = fixed::Db<mmr::Family, E, P, Account, H, EightCap>;
+pub type StateDb<E, H, P> = fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap>;
 
 pub type StateSyncDb<E, H, P> = Arc<AsyncRwLock<StateDb<E, H, P>>>;
 

@@ -5,7 +5,7 @@ use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use constantinople_engine::types::StateSyncDb;
 use constantinople_mempool::webserver::AccountReader;
-use constantinople_primitives::Account;
+use constantinople_primitives::{Account, AccountKey};
 use futures::future::{BoxFuture, FutureExt};
 
 /// Forwards [`AccountReader::get`] to the attached state database.
@@ -38,7 +38,10 @@ where
     fn get<'a>(&'a self, public_key: P) -> BoxFuture<'a, Option<Account>> {
         async move {
             let db = self.db.read().await;
-            db.get(&public_key).await.ok().flatten()
+            db.get(&AccountKey::from_public_key(&public_key))
+                .await
+                .ok()
+                .flatten()
         }
         .boxed()
     }

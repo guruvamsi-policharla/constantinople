@@ -6,7 +6,7 @@ use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
-use constantinople_primitives::SignedTransaction;
+use constantinople_primitives::{AccountKey, SignedTransaction};
 use std::collections::{HashMap, HashSet};
 
 /// Loads the accounts needed by `transactions` from `batch`.
@@ -24,16 +24,16 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let mut public_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    let mut account_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
     for transaction in transactions {
         let Some(sender) = transaction.value().sender() else {
             return Ok(None);
         };
-        public_keys.insert(sender.clone());
-        public_keys.insert(transaction.value().to.clone());
+        account_keys.insert(AccountKey::from_public_key(sender));
+        account_keys.insert(transaction.value().to.clone());
     }
 
-    load_accounts(batch, public_keys).await
+    load_accounts(batch, account_keys).await
 }
 
 /// Loads the accounts needed by lazily decoded `transactions`.
@@ -42,6 +42,7 @@ where
 pub async fn load_lazy_state<E, H, P, T>(
     batch: &StateBatch<E, H, P, T>,
     transactions: &[Lazy<SignedTransaction<P, H>>],
+    signers: &[AccountKey<P>],
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -49,24 +50,27 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let mut public_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
-    for transaction in transactions {
+    assert_eq!(
+        transactions.len(),
+        signers.len(),
+        "transactions and cached signer keys must have the same length",
+    );
+
+    let mut account_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    for (transaction, signer) in transactions.iter().zip(signers) {
         let Some(transaction) = transaction.get() else {
             return Ok(None);
         };
-        let Some(sender) = transaction.value().sender() else {
-            return Ok(None);
-        };
-        public_keys.insert(sender.clone());
-        public_keys.insert(transaction.value().to.clone());
+        account_keys.insert(signer.clone());
+        account_keys.insert(transaction.value().to.clone());
     }
 
-    load_accounts(batch, public_keys).await
+    load_accounts(batch, account_keys).await
 }
 
 async fn load_accounts<E, H, P, T>(
     batch: &StateBatch<E, H, P, T>,
-    public_keys: HashSet<P>,
+    account_keys: HashSet<AccountKey<P>>,
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -74,18 +78,18 @@ where
     P: PublicKey,
     T: Translator,
 {
-    if public_keys.is_empty() {
+    if account_keys.is_empty() {
         return Ok(Some(HashMap::new()));
     }
 
-    let public_keys: Vec<_> = public_keys.into_iter().collect();
-    let keys: Vec<_> = public_keys.iter().collect();
+    let account_keys: Vec<_> = account_keys.into_iter().collect();
+    let keys: Vec<_> = account_keys.iter().collect();
     let values = batch.get_many(&keys).await?;
 
-    let accounts = public_keys
+    let accounts = account_keys
         .into_iter()
         .zip(values)
-        .map(|(public_key, account)| (public_key, account.unwrap_or_default()))
+        .map(|(account_key, account)| (account_key, account.unwrap_or_default()))
         .collect();
 
     Ok(Some(accounts))

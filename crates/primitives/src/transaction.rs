@@ -1,6 +1,6 @@
 //! Constantinople transaction type and transaction wrappers.
 
-use crate::{Sealable, Sealed, Signed};
+use crate::{AccountKey, Sealable, Sealed, Signed};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
@@ -18,8 +18,8 @@ pub type VerifiedTransaction<P, H> = SignedTransaction<P, H>;
 pub struct Transaction<D: Digest, P: PublicKey> {
     /// The sender public key, decoded lazily on demand.
     pub sender: Lazy<P>,
-    /// The recipient public key.
-    pub to: P,
+    /// The recipient account key.
+    pub to: AccountKey<P>,
     /// The value to send with the transaction.
     pub value: NonZeroU64,
     /// The sender nonce.
@@ -33,7 +33,7 @@ impl<D: Digest, P: PublicKey> Transaction<D, P> {
     pub fn new(sender: P, to: P, value: NonZeroU64, nonce: u64) -> Self {
         Self {
             sender: Lazy::new(sender),
-            to,
+            to: AccountKey::from_public_key(&to),
             value,
             nonce,
             _digest: core::marker::PhantomData,
@@ -71,7 +71,7 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
 }
 
 impl<D: Digest, P: PublicKey> FixedSize for Transaction<D, P> {
-    const SIZE: usize = P::SIZE + P::SIZE + u64::SIZE + u64::SIZE;
+    const SIZE: usize = P::SIZE + AccountKey::<P>::SIZE + u64::SIZE + u64::SIZE;
 }
 
 impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
@@ -79,7 +79,7 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
         let sender = Lazy::<P>::read(buf)?;
-        let to = P::read(buf)?;
+        let to = AccountKey::<P>::read(buf)?;
         let value = u64::read(buf)?;
         let value = NonZeroU64::new(value)
             .ok_or(Error::Invalid("Transaction", "value must be non-zero"))?;
@@ -109,9 +109,10 @@ where
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        let to = u.arbitrary::<P>()?;
         Ok(Self {
             sender: Lazy::new(u.arbitrary()?),
-            to: u.arbitrary()?,
+            to: AccountKey::from_public_key(&to),
             value: NonZeroU64::new(u.int_in_range(1..=u64::MAX)?)
                 .expect("arbitrary non-zero value should construct"),
             nonce: u.arbitrary()?,
