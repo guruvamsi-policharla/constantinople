@@ -7,7 +7,7 @@
 //! - [`Signable`] — A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
-use crate::{Address, Sealable, Sealed, SignedTransaction};
+use crate::{Sealable, Sealed, SignedTransaction};
 use commonware_codec::{Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
@@ -217,29 +217,6 @@ where
         .collect()
 }
 
-/// Hashes transaction sender public keys into addresses in parallel.
-///
-/// Returns `None` if any sender public key fails to decode.
-pub fn transaction_senders<P, H, St>(
-    strategy: &St,
-    transactions: &[SignedTransaction<P, H>],
-) -> Option<Vec<Address>>
-where
-    P: PublicKey,
-    H: Hasher,
-    St: Strategy,
-{
-    strategy
-        .map_collect_vec(transactions, |transaction| {
-            transaction
-                .value()
-                .sender()
-                .map(|sender| Address::from_public_key(&mut H::default(), sender))
-        })
-        .into_iter()
-        .collect()
-}
-
 /// Verifies a slice of lazily-encoded signed transactions using batch
 /// verification.
 ///
@@ -344,12 +321,11 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{Address, Sealable, Sealed, Transaction, signed::Signable};
+    use crate::{Sealable, Sealed, Transaction, signed::Signable};
     use commonware_cryptography::{
-        Digest, Hasher, Signer, Verifier, ed25519, secp256r1::recoverable, sha256,
+        Hasher, Signer, Verifier, ed25519, secp256r1::recoverable, sha256,
     };
     use commonware_math::algebra::Random;
-    use commonware_parallel::Sequential;
     use commonware_utils::test_rng;
     use core::num::NonZeroU64;
 
@@ -420,23 +396,19 @@ mod test {
     }
 
     #[test]
-    fn transaction_senders_hashes_signer_address() {
+    fn signed_transaction_exposes_sender_public_key() {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = private_key.public_key();
         let signed = Transaction::new(
             public_key.clone(),
-            Address::EMPTY,
+            public_key.clone(),
             NonZeroU64::new(1).expect("test value should be non-zero"),
             0,
         )
         .seal_and_sign(&private_key, NAMESPACE, hasher);
 
-        let expected = Address::from_public_key(&mut sha256::Sha256::default(), &public_key);
-        let senders = super::transaction_senders(&Sequential, std::slice::from_ref(&signed))
-            .expect("locally constructed sender should decode");
-
-        assert_eq!(senders, vec![expected]);
+        assert_eq!(signed.value().sender(), Some(&public_key));
         assert!(
             signed.verify(
                 NAMESPACE,

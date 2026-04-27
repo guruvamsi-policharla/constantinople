@@ -2,10 +2,10 @@
 
 use super::state::{Overlay, State};
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::{Account, Address, SignedTransaction};
+use constantinople_primitives::{Account, SignedTransaction};
 
 /// Deterministic account writes produced by execution.
-pub type Changeset = Vec<(Address, Account)>;
+pub type Changeset<PK> = Vec<(PK, Account)>;
 
 /// The final result of proposal-side filtering and execution.
 #[derive(Debug)]
@@ -15,31 +15,24 @@ pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
     /// Transactions that failed static validation and were excluded.
     pub invalid: Vec<SignedTransaction<PK, H>>,
     /// Persistent account writes produced by the included transactions.
-    pub changeset: Changeset,
+    pub changeset: Changeset<PK>,
 }
 
 /// Filters invalid proposal candidates and executes the valid transfers.
 pub fn propose<H, PK>(
-    state: &State,
+    state: &State<PK>,
     transactions: Vec<SignedTransaction<PK, H>>,
-    signers: Vec<Address>,
 ) -> ProposalOutput<PK, H>
 where
     H: Hasher,
     PK: PublicKey,
 {
-    assert_eq!(
-        transactions.len(),
-        signers.len(),
-        "transactions and cached signer addresses must have the same length",
-    );
-
     let mut overlay = Overlay::new(state);
     let mut valid = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
 
-    for (transaction, signer) in transactions.into_iter().zip(signers) {
-        if execute_transfer(&mut overlay, &transaction, signer) {
+    for transaction in transactions {
+        if execute_transfer(&mut overlay, &transaction) {
             valid.push(transaction);
         } else {
             invalid.push(transaction);
@@ -57,24 +50,17 @@ where
 ///
 /// Returns `None` if any transaction in the batch fails validation.
 pub fn execute<H, PK>(
-    state: &State,
+    state: &State<PK>,
     transactions: &[SignedTransaction<PK, H>],
-    signers: &[Address],
-) -> Option<Changeset>
+) -> Option<Changeset<PK>>
 where
     H: Hasher,
     PK: PublicKey,
 {
-    assert_eq!(
-        transactions.len(),
-        signers.len(),
-        "transactions and cached signer addresses must have the same length",
-    );
-
     let mut overlay = Overlay::new(state);
 
-    for (transaction, signer) in transactions.iter().zip(signers) {
-        if !execute_transfer(&mut overlay, transaction, *signer) {
+    for transaction in transactions {
+        if !execute_transfer(&mut overlay, transaction) {
             return None;
         }
     }
@@ -87,19 +73,21 @@ where
 /// Returns `false` if the sender has an incorrect nonce, insufficient balance,
 /// or if the recipient balance would overflow.
 fn execute_transfer<H, PK>(
-    state: &mut Overlay<'_>,
+    state: &mut Overlay<'_, PK>,
     transaction: &SignedTransaction<PK, H>,
-    sender_address: Address,
 ) -> bool
 where
     H: Hasher,
     PK: PublicKey,
 {
-    let recipient_address = transaction.value().to;
+    let Some(sender_key) = transaction.value().sender().cloned() else {
+        return false;
+    };
+    let recipient_key = transaction.value().to.clone();
     let value = transaction.value().value.get();
     let nonce = transaction.value().nonce;
 
-    let Some(sender) = state.get(&sender_address) else {
+    let Some(sender) = state.get(&sender_key) else {
         return false;
     };
     if sender.nonce != nonce || sender.balance < value {
@@ -110,24 +98,24 @@ where
     };
 
     // Self-transfer: only bump the nonce.
-    if sender_address == recipient_address {
-        let sender = state.get_mut(&sender_address).expect("checked above");
+    if sender_key == recipient_key {
+        let sender = state.get_mut(&sender_key).expect("checked above");
         sender.nonce = next_nonce;
         return true;
     }
 
-    let Some(recipient) = state.get(&recipient_address) else {
+    let Some(recipient) = state.get(&recipient_key) else {
         return false;
     };
     let Some(recipient_balance) = recipient.balance.checked_add(value) else {
         return false;
     };
 
-    let sender = state.get_mut(&sender_address).expect("checked above");
+    let sender = state.get_mut(&sender_key).expect("checked above");
     sender.balance -= value;
     sender.nonce = next_nonce;
 
-    let recipient = state.get_mut(&recipient_address).expect("checked above");
+    let recipient = state.get_mut(&recipient_key).expect("checked above");
     recipient.balance = recipient_balance;
 
     true

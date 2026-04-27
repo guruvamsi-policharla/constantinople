@@ -5,7 +5,7 @@ use crate::processor::state::State;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
-use constantinople_primitives::{Address, SignedTransaction};
+use constantinople_primitives::SignedTransaction;
 use std::collections::{HashMap, HashSet};
 
 /// Loads the accounts needed by `transactions` from `batch`.
@@ -14,45 +14,38 @@ use std::collections::{HashMap, HashSet};
 /// reads each account at most once, and builds an in-memory [`State`] snapshot
 /// for verification.
 pub async fn load_state<E, H, P, T>(
-    batch: &StateBatch<E, H, T>,
+    batch: &StateBatch<E, H, P, T>,
     transactions: &[SignedTransaction<P, H>],
-    signers: &[Address],
-) -> Result<State, StorageError<mmr::Family>>
+) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     T: Translator,
 {
-    assert_eq!(
-        transactions.len(),
-        signers.len(),
-        "transactions and cached signer addresses must have the same length",
-    );
-
-    let addresses = transactions.iter().zip(signers).fold(
-        HashSet::with_capacity(transactions.len().saturating_mul(2)),
-        |mut acc, (tx, signer)| {
-            acc.insert(*signer);
-            acc.insert(tx.value().to);
-            acc
-        },
-    );
-    if addresses.is_empty() {
-        return Ok(HashMap::new());
+    let mut public_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    for transaction in transactions {
+        let Some(sender) = transaction.value().sender() else {
+            return Ok(None);
+        };
+        public_keys.insert(sender.clone());
+        public_keys.insert(transaction.value().to.clone());
+    }
+    if public_keys.is_empty() {
+        return Ok(Some(HashMap::new()));
     }
 
-    let addresses: Vec<_> = addresses.into_iter().collect();
-    let keys: Vec<_> = addresses.iter().collect();
+    let public_keys: Vec<_> = public_keys.into_iter().collect();
+    let keys: Vec<_> = public_keys.iter().collect();
     let values = batch.get_many(&keys).await?;
 
-    let accounts = addresses
+    let accounts = public_keys
         .into_iter()
         .zip(values)
-        .map(|(addr, account)| (addr, account.unwrap_or_default()))
+        .map(|(public_key, account)| (public_key, account.unwrap_or_default()))
         .collect();
 
-    Ok(accounts)
+    Ok(Some(accounts))
 }
 
 #[cfg(test)]
@@ -61,7 +54,7 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519, sha256};
     use commonware_parallel::Rayon;
     use constantinople_primitives::{
-        Address, Signable, SignedTransaction, Transaction, verify_transaction_chunks,
+        Signable, SignedTransaction, Transaction, verify_transaction_chunks,
     };
     use core::num::{NonZeroU64, NonZeroUsize};
     use rand::{SeedableRng, rngs::StdRng};
@@ -71,21 +64,20 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestSigner {
         key: ed25519::PrivateKey,
-        address: Address,
+        public_key: ed25519::PublicKey,
     }
 
     impl TestSigner {
         fn from_seed(seed: u64) -> Self {
             let key = ed25519::PrivateKey::from_seed(seed);
-            let address =
-                Address::from_public_key(&mut sha256::Sha256::default(), &key.public_key());
-            Self { key, address }
+            let public_key = key.public_key();
+            Self { key, public_key }
         }
     }
 
     fn signed_transaction(
         signer: &TestSigner,
-        to: Address,
+        to: ed25519::PublicKey,
         nonce: u64,
     ) -> SignedTransaction<ed25519::PublicKey, sha256::Sha256> {
         Transaction::new(
@@ -100,7 +92,7 @@ mod tests {
     fn invalid_transaction(
         claimed_signer: &TestSigner,
         actual_signer: &TestSigner,
-        to: Address,
+        to: ed25519::PublicKey,
         nonce: u64,
     ) -> SignedTransaction<ed25519::PublicKey, sha256::Sha256> {
         Transaction::new(
@@ -124,7 +116,7 @@ mod tests {
         let sender = TestSigner::from_seed(7);
         let recipient = TestSigner::from_seed(9);
         let transactions = (0..64)
-            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
+            .map(|nonce| signed_transaction(&sender, recipient.public_key.clone(), nonce))
             .collect::<Vec<_>>();
         let expected_digests = transactions
             .iter()
@@ -155,9 +147,9 @@ mod tests {
         let attacker = TestSigner::from_seed(17);
         let recipient = TestSigner::from_seed(19);
         let mut transactions = (0..64)
-            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
+            .map(|nonce| signed_transaction(&sender, recipient.public_key.clone(), nonce))
             .collect::<Vec<_>>();
-        transactions[31] = invalid_transaction(&sender, &attacker, recipient.address, 31);
+        transactions[31] = invalid_transaction(&sender, &attacker, recipient.public_key, 31);
         let mut rng = StdRng::seed_from_u64(23);
         let lazy_txs = transactions.into_iter().map(Lazy::new).collect();
 
@@ -176,7 +168,7 @@ mod tests {
                 .expect("rayon strategy should construct");
         let sender = TestSigner::from_seed(29);
         let recipient = TestSigner::from_seed(31);
-        let transaction = signed_transaction(&sender, recipient.address, 0);
+        let transaction = signed_transaction(&sender, recipient.public_key, 0);
         let mut encoded = transaction.encode().to_vec();
 
         let invalid_sender = (0u8..=u8::MAX)

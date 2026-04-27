@@ -14,8 +14,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
-    Address, Header, SealedBlock, SignedTransaction, materialize_transaction_chunks,
-    transaction_senders,
+    Header, SealedBlock, SignedTransaction, materialize_transaction_chunks,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
@@ -29,14 +28,13 @@ const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
-/// Decoded transactions paired with cached sender addresses.
+/// Decoded transactions ready for execution.
 pub(super) struct Prepared<P, H>
 where
     H: Hasher,
     P: PublicKey,
 {
     pub(super) transactions: Vec<SignedTransaction<P, H>>,
-    pub(super) signers: Vec<Address>,
 }
 
 /// Timing information for the execution side of verification.
@@ -48,26 +46,31 @@ pub(super) struct ExecutionTimings {
 }
 
 /// Merkleized output produced by verification execution.
-pub(super) struct Execution<E, H>
+pub(super) struct Execution<E, H, P>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
+    P: PublicKey,
 {
-    pub(super) state: StateMerkleized<E, H, EightCap>,
+    pub(super) state: StateMerkleized<E, H, P, EightCap>,
     pub(super) transactions: TransactionMerkleized<E, H>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transaction_count: usize,
     pub(super) timings: ExecutionTimings,
 }
 
-impl<E, H> Execution<E, H>
+impl<E, H, P> Execution<E, H, P>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
+    P: PublicKey,
 {
     pub(super) fn into_merkleized(
         self,
-    ) -> (StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>) {
+    ) -> (
+        StateMerkleized<E, H, P, EightCap>,
+        TransactionMerkleized<E, H>,
+    ) {
         (self.state, self.transactions)
     }
 }
@@ -190,7 +193,7 @@ where
     Ok(started_at.elapsed().as_millis())
 }
 
-/// Materializes transactions and caches sender addresses.
+/// Materializes transactions.
 pub(super) fn prepare_transactions<P, H, St>(
     strategy: &St,
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
@@ -202,21 +205,17 @@ where
 {
     let transactions =
         materialize_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
-    let signers = transaction_senders(strategy, &transactions).ok_or(MALFORMED_TRANSACTION)?;
-    Ok(Prepared {
-        transactions,
-        signers,
-    })
+    Ok(Prepared { transactions })
 }
 
 /// Executes and merkleizes a block body for verification.
 pub(super) async fn execute_block<E, C, P, H>(
-    state_batches: StateBatch<E, H, EightCap>,
+    state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
     parent: &SealedBlock<C, P, H>,
     prepared: &Prepared<P, H>,
     prepare_ms: u128,
-) -> Result<Execution<E, H>>
+) -> Result<Execution<E, H, P>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -224,14 +223,15 @@ where
     H: Hasher,
 {
     let load_state_started_at = Instant::now();
-    let state = load_state(&state_batches, &prepared.transactions, &prepared.signers)
+    let state = load_state(&state_batches, &prepared.transactions)
         .await
-        .expect("block state loading during verification must succeed");
+        .expect("block state loading during verification must succeed")
+        .ok_or(MALFORMED_TRANSACTION)?;
     let load_state_ms = load_state_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset = executor::execute(&state, &prepared.transactions, &prepared.signers)
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset =
+        executor::execute(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
 
     let state_batch = apply_changeset(state_batches, &changeset);
@@ -261,21 +261,25 @@ where
 
 /// Executes and merkleizes a certified block body.
 pub(super) async fn apply_block<E, P, H>(
-    state_batches: StateBatch<E, H, EightCap>,
+    state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
     transactions_floor: mmr::Location,
     prepared: &Prepared<P, H>,
-) -> Result<(StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>)>
+) -> Result<(
+    StateMerkleized<E, H, P, EightCap>,
+    TransactionMerkleized<E, H>,
+)>
 where
     E: Storage + Clock + Metrics,
     P: PublicKey,
     H: Hasher,
 {
-    let state = load_state(&state_batches, &prepared.transactions, &prepared.signers)
+    let state = load_state(&state_batches, &prepared.transactions)
         .await
-        .expect("state loading must succeed for certified apply");
-    let changeset = executor::execute(&state, &prepared.transactions, &prepared.signers)
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+        .expect("state loading must succeed for certified apply")
+        .ok_or(MALFORMED_TRANSACTION)?;
+    let changeset =
+        executor::execute(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let state_batch = apply_changeset(state_batches, &changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.transactions)
@@ -293,7 +297,7 @@ pub(super) fn reject(height: u64, reason: &'static str) {
 /// Returns whether execution output matches the proposed header.
 pub(super) fn commitments_match<E, C, P, H>(
     header: &Header<C, H::Digest, P>,
-    execution: &Execution<E, H>,
+    execution: &Execution<E, H, P>,
 ) -> bool
 where
     E: Storage + Clock + Metrics,

@@ -190,7 +190,7 @@ async fn fetch_starting_round(
     let mut max_nonce = 0u64;
     for account in accounts {
         loop {
-            match client.fetch_account(&account.address).await {
+            match client.fetch_account(&account.public_key).await {
                 Ok(Some(view)) => {
                     max_nonce = max_nonce.max(view.nonce);
                     break;

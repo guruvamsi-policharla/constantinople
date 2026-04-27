@@ -21,7 +21,7 @@ use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, Address, Block, Sealed};
+use constantinople_primitives::{Account, Block, Sealed};
 use std::sync::Arc;
 
 /// A finalized block with its seal (commitment-based).
@@ -38,16 +38,19 @@ pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitme
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H> = fixed::Db<mmr::Family, E, Address, Account, H, EightCap>;
+pub type StateDb<E, H, P> = fixed::Db<mmr::Family, E, P, Account, H, EightCap>;
 
-pub type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
+pub type StateSyncDb<E, H, P> = Arc<AsyncRwLock<StateDb<E, H, P>>>;
 
-pub(crate) type StateResolverMailbox<E, H> = commonware_glue::stateful::db::p2p::Mailbox<
-    StateDb<E, H>,
+pub(crate) type StateResolverMailbox<E, H, P> = commonware_glue::stateful::db::p2p::Mailbox<
+    StateDb<E, H, P>,
     mmr::Family,
-    <StateSyncDb<E, H> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-    <StateSyncDb<E, H> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
+    <StateSyncDb<E, H, P> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
+    <StateSyncDb<E, H, P> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
 >;
+
+pub(crate) type StateResolverActor<E, P, M, B, H> =
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, P>>;
 
 pub type TransactionDb<E, H> = TransactionHistoryDb<E, H>;
 
@@ -72,7 +75,10 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, T> = Stateful<
     E,
     App<H, P, V, I, B, T>,
     EngineMarshalMailbox<H, P, V>,
-    (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
+    (
+        StateResolverMailbox<E, H, P>,
+        TransactionResolverMailbox<E, H>,
+    ),
 >;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, T> = Marshaled<

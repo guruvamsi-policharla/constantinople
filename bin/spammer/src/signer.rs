@@ -12,11 +12,11 @@ pub type Tx = SignedTransaction<ed25519::PublicKey, Sha256>;
 /// Signs one transaction for a single sender in the ring.
 fn sign_one(
     sender: &SpamAccount,
-    recipient_address: &constantinople_primitives::Address,
+    recipient: &ed25519::PublicKey,
     value: NonZeroU64,
     nonce: u64,
 ) -> Tx {
-    let tx = Transaction::new(sender.public_key.clone(), *recipient_address, value, nonce);
+    let tx = Transaction::new(sender.public_key.clone(), recipient.clone(), value, nonce);
     tx.seal_and_sign(
         &sender.private_key,
         TRANSACTION_NAMESPACE,
@@ -50,8 +50,8 @@ pub fn sign_rounds<St: Strategy>(
     // Sign in parallel across the rayon pool.
     strategy.map_collect_vec(work, |(i, round)| {
         let sender = &accounts[i];
-        let recipient_address = &accounts[(i + 1) % n].address;
-        sign_one(sender, recipient_address, value, round)
+        let recipient = &accounts[(i + 1) % n].public_key;
+        sign_one(sender, recipient, value, round)
     })
 }
 

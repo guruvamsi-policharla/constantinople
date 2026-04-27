@@ -3,7 +3,7 @@
 use super::TxStatus;
 use commonware_codec::Encode;
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::{Address, SignedTransaction};
+use constantinople_primitives::SignedTransaction;
 use derive_more::Display;
 use serde::Deserialize;
 
@@ -92,18 +92,18 @@ impl Client {
         }
     }
 
-    /// Fetches the committed account at `address`.
+    /// Fetches the committed account for `public_key`.
     ///
     /// Returns `Ok(Some(account))` when the account has been written, `Ok(None)`
     /// when no record exists yet, and [`SubmitError::ServiceUnavailable`]
     /// while the validator's state database is still attaching.
-    pub async fn fetch_account(
-        &self,
-        address: &Address,
-    ) -> Result<Option<AccountView>, SubmitError> {
+    pub async fn fetch_account<P>(&self, public_key: &P) -> Result<Option<AccountView>, SubmitError>
+    where
+        P: PublicKey,
+    {
         let response = self
             .http
-            .get(format!("{}/account/{}", self.url, address))
+            .get(format!("{}/account/{}", self.url, public_key))
             .send()
             .await?;
 

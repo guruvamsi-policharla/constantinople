@@ -12,7 +12,7 @@ use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_utils::from_hex;
-use constantinople_primitives::{Account, Address, SignedTransaction, verify_transaction_chunks};
+use constantinople_primitives::{Account, SignedTransaction, verify_transaction_chunks};
 use rand_core::OsRng;
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ where
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
     pub strategy: St,
-    pub account_reader: AccountReaderCell,
+    pub account_reader: AccountReaderCell<P>,
 }
 
 /// Builds the axum [`Router`] for the mempool HTTP API.
@@ -58,7 +58,7 @@ where
 
     Router::new()
         .route("/transactions", post(submit_batch::<C, P, H, BV, St>))
-        .route("/account/{address}", get(fetch_account::<C, P, H, St>))
+        .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
 }
@@ -71,7 +71,7 @@ const fn min_signed_transaction_bytes<P>() -> usize
 where
     P: PublicKey,
 {
-    P::SIZE + Address::SIZE + MIN_U64_VARINT_BYTES + MIN_U64_VARINT_BYTES + P::Signature::SIZE
+    P::SIZE + P::SIZE + MIN_U64_VARINT_BYTES + MIN_U64_VARINT_BYTES + P::Signature::SIZE
 }
 
 fn max_transaction_count<P>(body_len: usize) -> Option<usize>
@@ -156,16 +156,16 @@ where
     )
 }
 
-/// Returns the committed account at the hex-encoded address.
+/// Returns the committed account for the hex-encoded public key.
 ///
 /// Responds with:
 /// - `200 OK` and `{"balance": u64, "nonce": u64}` if the account exists.
 /// - `404 Not Found` if the account has not been written.
-/// - `400 Bad Request` if the path is not a 20-byte hex string.
+/// - `400 Bad Request` if the path is not a valid public key hex string.
 /// - `503 Service Unavailable` if the state database has not been attached yet.
 async fn fetch_account<C, P, H, St>(
     State(state): State<Arc<AppState<C, P, H, St>>>,
-    Path(address): Path<String>,
+    Path(public_key): Path<String>,
 ) -> (StatusCode, String)
 where
     C: Digest,
@@ -173,14 +173,14 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let Some(bytes) = from_hex(&address) else {
+    let Some(bytes) = from_hex(&public_key) else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    if bytes.len() != Address::SIZE {
+    if bytes.len() != P::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let address = match Address::decode(bytes.as_slice()) {
-        Ok(address) => address,
+    let public_key = match P::decode(bytes.as_slice()) {
+        Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };
 
@@ -188,7 +188,7 @@ where
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
 
-    reader.get(address).await.map_or_else(
+    reader.get(public_key).await.map_or_else(
         || (StatusCode::NOT_FOUND, String::new()),
         |account| {
             (

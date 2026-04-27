@@ -1,13 +1,11 @@
 //! Deterministic spam account generation.
 
-use commonware_cryptography::{Signer, ed25519, sha256};
-use constantinople_primitives::Address;
+use commonware_cryptography::{Signer, ed25519};
 
-/// A spam account with its signing key and derived address.
+/// A spam account with its signing key.
 pub struct SpamAccount {
     pub private_key: ed25519::PrivateKey,
     pub public_key: ed25519::PublicKey,
-    pub address: Address,
 }
 
 /// Generates `count` deterministic spam accounts from sequential seeds
@@ -17,11 +15,9 @@ pub fn generate_accounts(count: u32, seed_offset: u64) -> Vec<SpamAccount> {
         .map(|i| {
             let private_key = ed25519::PrivateKey::from_seed(seed_offset + u64::from(i));
             let public_key = private_key.public_key();
-            let address = Address::from_public_key(&mut sha256::Sha256::default(), &public_key);
             SpamAccount {
                 private_key,
                 public_key,
-                address,
             }
         })
         .collect()
@@ -37,7 +33,6 @@ mod tests {
         let b = generate_accounts(3, 1000);
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.public_key, y.public_key);
-            assert_eq!(x.address, y.address);
         }
     }
 
@@ -49,12 +44,12 @@ mod tests {
     }
 
     #[test]
-    fn addresses_are_unique() {
+    fn public_keys_are_unique() {
         let accounts = generate_accounts(10, 1000);
         for (i, a) in accounts.iter().enumerate() {
             for (j, b) in accounts.iter().enumerate() {
                 if i != j {
-                    assert_ne!(a.address, b.address);
+                    assert_ne!(a.public_key, b.public_key);
                 }
             }
         }

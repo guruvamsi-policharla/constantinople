@@ -1,11 +1,7 @@
-use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
-use commonware_parallel::Sequential;
 use constantinople_application::processor::{executor, state::State};
-use constantinople_primitives::{
-    Account, Address, Signable, Transaction, VerifiedTransaction, transaction_senders,
-};
+use constantinople_primitives::{Account, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
@@ -23,55 +19,51 @@ fn main() {
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
 fn execution(bencher: Bencher<'_, '_>, transaction_count: usize) {
-    let (state, transactions, signers) = build_fixture(transaction_count);
+    let (state, transactions) = build_fixture(transaction_count);
     bencher.bench_local(|| {
         black_box(
-            executor::execute(&state, &transactions, &signers)
+            executor::execute(&state, &transactions)
                 .expect("bench transactions should execute")
                 .len(),
         )
     });
 }
 
-fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>, Vec<Address>) {
+fn build_fixture(transaction_count: usize) -> (State<ed25519::PublicKey>, Vec<TestTransaction>) {
     let mut accounts = HashMap::new();
     let mut transactions = Vec::with_capacity(transaction_count);
 
     for index in 0..transaction_count {
         let signer = TestSigner::new(index as u64);
-        let recipient = address(index as u64);
+        let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
         accounts.insert(
-            signer.address,
+            signer.public_key.clone(),
             Account {
                 balance: 1,
                 nonce: 0,
             },
         );
-        accounts.insert(recipient, Account::default());
+        accounts.insert(recipient.clone(), Account::default());
         transactions.push(signer.sign(recipient, 1, 0));
     }
 
-    let signers = transaction_senders(&Sequential, &transactions)
-        .expect("bench transactions should have decodable senders");
-    let valid = executor::propose(&accounts, transactions, signers).valid;
-    let valid_signers = transaction_senders(&Sequential, &valid)
-        .expect("bench transactions should have decodable senders");
-    (accounts, valid, valid_signers)
+    let valid = executor::propose(&accounts, transactions).valid;
+    (accounts, valid)
 }
 
 struct TestSigner {
     key: ed25519::PrivateKey,
-    address: Address,
+    public_key: ed25519::PublicKey,
 }
 
 impl TestSigner {
     fn new(index: u64) -> Self {
         let key = ed25519::PrivateKey::random(&mut StdRng::seed_from_u64(index));
-        let address = Address::from_public_key(&mut TestHasher::default(), &key.public_key());
-        Self { key, address }
+        let public_key = key.public_key();
+        Self { key, public_key }
     }
 
-    fn sign(&self, to: Address, value: u64, nonce: u64) -> TestTransaction {
+    fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
         Transaction::new(
             self.key.public_key(),
             to,
@@ -80,10 +72,4 @@ impl TestSigner {
         )
         .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
-}
-
-fn address(index: u64) -> Address {
-    let mut bytes = [0; Address::SIZE];
-    bytes[..8].copy_from_slice(&index.to_be_bytes());
-    Address::decode(&bytes[..]).expect("address bytes should decode")
 }

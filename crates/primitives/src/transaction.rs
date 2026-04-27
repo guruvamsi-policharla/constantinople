@@ -1,6 +1,6 @@
 //! Constantinople transaction type and transaction wrappers.
 
-use crate::{Address, Sealable, Sealed, Signed};
+use crate::{Sealable, Sealed, Signed};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
@@ -18,8 +18,8 @@ pub type VerifiedTransaction<P, H> = SignedTransaction<P, H>;
 pub struct Transaction<D: Digest, P: PublicKey> {
     /// The sender public key, decoded lazily on demand.
     pub sender: Lazy<P>,
-    /// The recipient address.
-    pub to: Address,
+    /// The recipient public key.
+    pub to: P,
     /// The value to send with the transaction.
     pub value: NonZeroU64,
     /// The sender nonce.
@@ -30,7 +30,7 @@ pub struct Transaction<D: Digest, P: PublicKey> {
 
 impl<D: Digest, P: PublicKey> Transaction<D, P> {
     /// Creates a new transaction.
-    pub fn new(sender: P, to: Address, value: NonZeroU64, nonce: u64) -> Self {
+    pub fn new(sender: P, to: P, value: NonZeroU64, nonce: u64) -> Self {
         Self {
             sender: Lazy::new(sender),
             to,
@@ -71,7 +71,7 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
 }
 
 impl<D: Digest, P: PublicKey> FixedSize for Transaction<D, P> {
-    const SIZE: usize = P::SIZE + Address::SIZE + u64::SIZE + u64::SIZE;
+    const SIZE: usize = P::SIZE + P::SIZE + u64::SIZE + u64::SIZE;
 }
 
 impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
@@ -79,7 +79,7 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
         let sender = Lazy::<P>::read(buf)?;
-        let to = Address::read(buf)?;
+        let to = P::read(buf)?;
         let value = u64::read(buf)?;
         let value = NonZeroU64::new(value)
             .ok_or(Error::Invalid("Transaction", "value must be non-zero"))?;
@@ -180,7 +180,7 @@ mod test {
     fn transaction_roundtrip() {
         let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             test_sender(),
-            Address::EMPTY,
+            test_sender(),
             NonZeroU64::new(12_345).expect("test value should be non-zero"),
             1,
         );
@@ -197,7 +197,7 @@ mod test {
     fn transaction_encode_size_matches_written() {
         let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             test_sender(),
-            Address::arbitrary(&mut Unstructured::new(&[0xCC; 64])).unwrap(),
+            test_sender(),
             NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
             u64::MAX,
         );
@@ -213,7 +213,7 @@ mod test {
         let sender = test_sender();
         let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             sender.clone(),
-            Address::EMPTY,
+            test_sender(),
             NonZeroU64::new(1).expect("test value should be non-zero"),
             7,
         );
@@ -245,7 +245,7 @@ mod test {
 
         let mut buf = Vec::new();
         invalid_sender.write(&mut buf);
-        Address::EMPTY.write(&mut buf);
+        test_sender().write(&mut buf);
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 

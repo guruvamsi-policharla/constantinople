@@ -6,12 +6,12 @@ pub use sealed::{Sealable, Sealed};
 
 mod signed;
 pub use signed::{
-    Signable, Signed, materialize_transaction_chunks, transaction_senders,
-    verify_transaction_batch, verify_transaction_chunks,
+    Signable, Signed, materialize_transaction_chunks, verify_transaction_batch,
+    verify_transaction_chunks,
 };
 
 mod account;
-pub use account::{Account, Address, DEFAULT_ACCOUNT_BALANCE};
+pub use account::{Account, DEFAULT_ACCOUNT_BALANCE};
 
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};

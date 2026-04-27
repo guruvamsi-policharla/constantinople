@@ -49,9 +49,7 @@ use commonware_storage::{
 };
 use commonware_utils::{non_empty_range, sync::AsyncRwLock};
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{
-    Account, Address, Block, Header, Sealable, SealedBlock, SignedTransaction,
-};
+use constantinople_primitives::{Account, Block, Header, Sealable, SealedBlock, SignedTransaction};
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
@@ -65,7 +63,6 @@ use tracing::{info, warn};
 
 mod utils;
 mod verification;
-use constantinople_primitives::transaction_senders;
 pub use utils::load_state;
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
@@ -75,7 +72,7 @@ pub use utils::load_state;
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Shared QMDB handle for the application state database.
-type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
+type StateDatabase<E, H, P, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, P, Account, H, T>>>;
 
 pub type TransactionHistoryDb<E, H> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H>;
@@ -89,36 +86,39 @@ pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 type TransactionDatabase<E, H> = Arc<AsyncRwLock<TransactionHistoryDb<E, H>>>;
 
 /// The backing databases owned by the application.
-type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
+type Databases<E, H, P, T> = (StateDatabase<E, H, P, T>, TransactionDatabase<E, H>);
 
 /// Unmerkleized application state batch used for processor read-through.
-type StateBatch<E, H, T> = AnyUnmerkleized<
+type StateBatch<E, H, P, T> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Address, FixedEncoding<Account>>>>,
+    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<P, FixedEncoding<Account>>>>,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<Address, FixedEncoding<Account>>,
+    UnorderedUpdate<P, FixedEncoding<Account>>,
 >;
 
 type TransactionBatch<E, H> = <TransactionDatabase<E, H> as DatabaseSet<E>>::Unmerkleized;
 
-type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
+type StateMerkleized<E, H, P, T> = <StateBatch<E, H, P, T> as Unmerkleized>::Merkleized;
 
 type TransactionMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
 
 /// Writes a changeset of account updates to a state batch.
-fn apply_changeset<E, H>(
-    batch: StateBatch<E, H, EightCap>,
-    changeset: &Changeset,
-) -> StateBatch<E, H, EightCap>
+fn apply_changeset<E, H, P>(
+    batch: StateBatch<E, H, P, EightCap>,
+    changeset: &Changeset<P>,
+) -> StateBatch<E, H, P, EightCap>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
+    P: PublicKey,
 {
-    changeset.iter().fold(batch, |batch, (address, account)| {
-        batch.write(*address, Some(*account))
-    })
+    changeset
+        .iter()
+        .fold(batch, |batch, (public_key, account)| {
+            batch.write(public_key.clone(), Some(*account))
+        })
 }
 
 fn apply_transaction_digests<E, H, P>(
@@ -186,16 +186,20 @@ where
     non_empty_range!(*parent_transactions_inactivity_floor(parent), end)
 }
 
-async fn finalize_execution<E, H>(
-    state_batch: StateBatch<E, H, EightCap>,
+async fn finalize_execution<E, H, P>(
+    state_batch: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
 ) -> Result<
-    (StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>),
+    (
+        StateMerkleized<E, H, P, EightCap>,
+        TransactionMerkleized<E, H>,
+    ),
     commonware_storage::qmdb::Error<mmr::Family>,
 >
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
+    P: PublicKey,
 {
     let (state_merkleized, transaction_merkleized) =
         futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
@@ -315,7 +319,7 @@ where
     type SigningScheme = S;
     type Context = Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, EightCap>;
+    type Databases = Databases<E, H, P, EightCap>;
     type InputProvider = I;
 
     /// Returns the sync targets required to fetch the block's state.
@@ -368,17 +372,13 @@ where
         let body = input.propose(&parent.header, &context).await;
         let input_ms = input_started_at.elapsed().as_millis();
 
-        let sender_started_at = Instant::now();
-        let senders = transaction_senders(&self.strategy, &body)
-            .expect("proposal transactions must have decodable senders");
-        let sender_ms = sender_started_at.elapsed().as_millis();
-
         let (state_batches, transaction_batch) = batches;
 
         let load_state_started_at = Instant::now();
-        let state = load_state(&state_batches, &body, &senders)
+        let state = load_state(&state_batches, &body)
             .await
-            .expect("proposal state loading must succeed");
+            .expect("proposal state loading must succeed")
+            .expect("proposal transactions must have decodable senders");
         let load_state_ms = load_state_started_at.elapsed().as_millis();
 
         let execute_started_at = Instant::now();
@@ -386,7 +386,7 @@ where
             valid,
             invalid: _,
             changeset,
-        } = executor::propose(&state, body, senders);
+        } = executor::propose(&state, body);
         let execute_ms = execute_started_at.elapsed().as_millis();
 
         self.proposed_transactions.inc_by(valid.len() as u64);
@@ -425,7 +425,6 @@ where
             txs = block.body.len(),
             timestamp = block.header.timestamp,
             input_ms,
-            sender_ms,
             load_state_ms,
             execute_ms,
             finalize_ms,
@@ -604,7 +603,7 @@ mod tests {
     use super::{TransactionHistoryTarget, genesis_block, parent_transactions_inactivity_floor};
     use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
     use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Address, Block, Sealable, Signable, Transaction};
+    use constantinople_primitives::{Block, Sealable, Signable, Transaction};
     use std::num::NonZeroU64;
 
     #[test]
@@ -625,14 +624,14 @@ mod tests {
         .header;
         header.transactions_range = non_empty_range!(5, 10);
 
-        let to = Address::from_public_key(&mut sha256::Sha256::default(), &recipient.public_key());
+        let to = recipient.public_key();
         let parent = Block::<sha256::Digest, _, sha256::Sha256>::new(
             header,
             (0..3)
                 .map(|nonce| {
                     Transaction::new(
                         leader.public_key(),
-                        to,
+                        to.clone(),
                         NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
                         nonce,
                     )

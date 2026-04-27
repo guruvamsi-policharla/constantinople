@@ -83,7 +83,7 @@ mod tests {
     };
     use commonware_cryptography::{Digest, Signer, ed25519, sha256};
     use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Address, Header, Signable, Transaction, VerifiedTransaction};
+    use constantinople_primitives::{Header, Signable, Transaction, VerifiedTransaction};
     use core::num::NonZeroU64;
 
     const NAMESPACE: &[u8] = b"mempool-test";
@@ -95,7 +95,7 @@ mod tests {
         let hasher = &mut sha256::Sha256::default();
         Transaction::new(
             key.public_key(),
-            Address::EMPTY,
+            key.public_key(),
             NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
         )

@@ -24,7 +24,7 @@ use tracing::warn;
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
 /// startup; HTTP handlers return 503 until then.
-pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
+pub type AccountReaderCell<P> = Arc<OnceLock<Arc<dyn AccountReader<P>>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +132,7 @@ where
     namespace: &'static [u8],
     drop_grace_blocks: u64,
     strategy: St,
-    account_reader: AccountReaderCell,
+    account_reader: AccountReaderCell<P>,
 }
 
 impl<E, C, P, H, St> Actor<E, C, P, H, St>
@@ -156,7 +156,7 @@ where
         config: Config<St>,
         mailbox: Mailbox<C, P, H>,
         receiver: ActorReceiver<C, P, H>,
-        account_reader: AccountReaderCell,
+        account_reader: AccountReaderCell<P>,
     ) -> Self {
         Self {
             context: ContextCell::new(context),

@@ -169,7 +169,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let network_handle = network.start();
 
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
-        let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
+        let account_reader: Arc<OnceLock<Arc<dyn AccountReader<ed25519::PublicKey>>>> =
+            Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
             context.with_label("mempool"),
             webserver::Config {
@@ -243,7 +244,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let account_reader_setter = account_reader.clone();
         let _account_reader_setup = tokio::spawn(async move {
             let db = subscribe_fut.await;
-            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
+            let reader: Arc<dyn AccountReader<ed25519::PublicKey>> =
+                Arc::new(StateDbReader::new(db));
             let _ = account_reader_setter.set(reader);
             info!("account reader attached");
         });

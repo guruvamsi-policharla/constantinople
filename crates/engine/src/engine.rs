@@ -73,7 +73,7 @@ const IMMUTABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(262_144);
 const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
 const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 2u32.pow(16);
 const FREEZER_VALUE_TARGET_SIZE: u64 = 1024 * 1024 * 1024;
-const FREEZER_VALUE_COMPRESSION: Option<u8> = Some(3);
+const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
@@ -181,7 +181,7 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, StateDb<E, H>>,
+    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H>,
     transaction_resolver:
         crate::compact_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, TransactionDb<E, H>, H>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
@@ -230,7 +230,7 @@ where
 
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -242,7 +242,7 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H>> + Send + 'static {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey>> + Send + 'static {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
@@ -268,7 +268,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            qmdb_resolver::Actor::<_, C::PublicKey, _, _, _, StateDb<E, H>>::new(
+            StateResolverActor::<_, C::PublicKey, _, _, H>::new(
                 context.with_label("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
