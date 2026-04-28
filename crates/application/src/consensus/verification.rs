@@ -5,7 +5,7 @@ use super::{
         StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
         apply_lazy_transaction_digests, finalize_execution,
     },
-    history::{child_transactions_range, parent_transactions_inactivity_floor},
+    execution::{BlockExecution, finalize_child_execution},
     load_lazy_state,
 };
 use crate::processor::executor;
@@ -15,7 +15,6 @@ use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
-use commonware_utils::non_empty_range;
 use constantinople_primitives::{
     AccountKey, Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
 };
@@ -39,44 +38,6 @@ where
 {
     pub(super) transactions: Vec<Lazy<SignedTransaction<P, H>>>,
     pub(super) signers: Vec<AccountKey<P>>,
-}
-
-/// Timing information for the execution side of verification.
-pub(super) struct ExecutionTimings {
-    pub(super) prepare_ms: u128,
-    pub(super) load_state_ms: u128,
-    pub(super) execute_ms: u128,
-    pub(super) finalize_ms: u128,
-}
-
-/// Merkleized output produced by verification execution.
-pub(super) struct Execution<E, H, P>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    pub(super) state: StateMerkleized<E, H, P, EightCap>,
-    pub(super) transactions: TransactionMerkleized<E, H>,
-    pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
-    pub(super) transaction_count: usize,
-    pub(super) timings: ExecutionTimings,
-}
-
-impl<E, H, P> Execution<E, H, P>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    pub(super) fn into_merkleized(
-        self,
-    ) -> (
-        StateMerkleized<E, H, P, EightCap>,
-        TransactionMerkleized<E, H>,
-    ) {
-        (self.state, self.transactions)
-    }
 }
 
 /// Verifies lazily decoded signed transactions.
@@ -235,8 +196,7 @@ pub(super) async fn execute_block<E, C, P, H>(
     transaction_batch: TransactionBatch<E, H>,
     parent: &SealedBlock<C, P, H>,
     prepared: &Prepared<P, H>,
-    prepare_ms: u128,
-) -> Result<Execution<E, H, P>>
+) -> Result<BlockExecution<E, H, P>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -258,28 +218,17 @@ where
     let state_batch = apply_changeset(state_batches, &changeset);
     let transaction_batch =
         apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
-            .ok_or(MALFORMED_TRANSACTION)?
-            .with_inactivity_floor(parent_transactions_inactivity_floor(parent));
-    let transactions_range = child_transactions_range(parent, prepared.transactions.len());
-
-    let finalize_started_at = Instant::now();
-    let (state, transactions) = finalize_execution(state_batch, transaction_batch)
-        .await
-        .expect("database merkleization during verification must succeed");
-    let finalize_ms = finalize_started_at.elapsed().as_millis();
-
-    Ok(Execution {
-        state,
-        transactions,
-        transactions_range,
-        transaction_count: prepared.transactions.len(),
-        timings: ExecutionTimings {
-            prepare_ms,
-            load_state_ms,
-            execute_ms,
-            finalize_ms,
-        },
-    })
+            .ok_or(MALFORMED_TRANSACTION)?;
+    Ok(finalize_child_execution(
+        state_batch,
+        transaction_batch,
+        parent,
+        prepared.transactions.len(),
+        load_state_ms,
+        execute_ms,
+        "database merkleization during verification must succeed",
+    )
+    .await)
 }
 
 /// Executes and merkleizes a certified block body.
@@ -322,7 +271,7 @@ pub(super) fn reject(height: u64, reason: &'static str) {
 /// Returns whether execution output matches the proposed header.
 pub(super) fn commitments_match<E, C, P, H>(
     header: &Header<C, H::Digest, P>,
-    execution: &Execution<E, H, P>,
+    execution: &BlockExecution<E, H, P>,
 ) -> bool
 where
     E: Storage + Clock + Metrics,
@@ -330,9 +279,6 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    let state_range =
-        non_empty_range!(*execution.state.inactivity_floor(), *execution.state.size());
-
     if execution.state.root() != header.state_root {
         warn!(
             height = header.height,
@@ -340,7 +286,7 @@ where
         );
         return false;
     }
-    if state_range != header.state_range {
+    if execution.state_range() != header.state_range {
         warn!(
             height = header.height,
             "verify rejected: state range mismatch"

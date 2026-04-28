@@ -48,14 +48,14 @@ use std::{
 use tracing::{info, warn};
 
 mod db;
+mod execution;
 mod history;
 mod utils;
 mod verification;
-use db::{Databases, apply_changeset, apply_transaction_digests, finalize_execution};
+use db::{Databases, apply_changeset, apply_transaction_digests};
 pub use db::{TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget};
-use history::{
-    child_transactions_range, header_range_to_target, parent_transactions_inactivity_floor,
-};
+use execution::finalize_child_execution;
+use history::header_range_to_target;
 pub use utils::{load_lazy_state, load_state};
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
@@ -204,29 +204,28 @@ where
         self.proposed_transactions.inc_by(valid.len() as u64);
 
         let state_batch = apply_changeset(state_batches, &changeset);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &valid)
-            .with_inactivity_floor(parent_transactions_inactivity_floor(parent));
-        let transactions_range = child_transactions_range(parent, valid.len());
-
-        let finalize_started_at = Instant::now();
-        let (state_merkleized, transaction_merkleized) =
-            finalize_execution(state_batch, transaction_batch)
-                .await
-                .expect("database merkleization must succeed");
-        let finalize_ms = finalize_started_at.elapsed().as_millis();
+        let transaction_count = valid.len();
+        let transaction_batch = apply_transaction_digests(transaction_batch, &valid);
+        let execution = finalize_child_execution(
+            state_batch,
+            transaction_batch,
+            parent,
+            transaction_count,
+            load_state_ms,
+            execute_ms,
+            "database merkleization must succeed",
+        )
+        .await;
 
         let header = Header {
             context,
             parent: parent.digest(),
             height: parent.header.height + 1,
             timestamp: self.timestamp(&runtime),
-            state_root: state_merkleized.root(),
-            state_range: non_empty_range!(
-                *state_merkleized.inactivity_floor(),
-                *state_merkleized.size()
-            ),
-            transactions_root: transaction_merkleized.root(),
-            transactions_range,
+            state_root: execution.state.root(),
+            state_range: execution.state_range(),
+            transactions_root: execution.transactions.root(),
+            transactions_range: execution.transactions_range.clone(),
         };
         let block = Block::new(header, valid).seal(&mut H::default());
 
@@ -237,16 +236,16 @@ where
             txs = block.body.len(),
             timestamp = block.header.timestamp,
             input_ms,
-            load_state_ms,
-            execute_ms,
-            finalize_ms,
+            load_state_ms = execution.timings.load_state_ms,
+            execute_ms = execution.timings.execute_ms,
+            finalize_ms = execution.timings.finalize_ms,
             total_ms = propose_started_at.elapsed().as_millis(),
             "proposed block"
         );
 
         Some(Proposed {
             block,
-            merkleized: (state_merkleized, transaction_merkleized),
+            merkleized: execution.into_merkleized(),
         })
     }
 
@@ -303,7 +302,6 @@ where
             transaction_batch,
             parent,
             prepared.as_ref(),
-            prepare_ms,
         );
         let sleep = verification::wait_for_timestamp(runtime, deadline);
 
@@ -328,7 +326,7 @@ where
             timestamp = header.timestamp,
             signature_ms,
             sleep_ms,
-            prepare_ms = execution.timings.prepare_ms,
+            prepare_ms,
             load_state_ms = execution.timings.load_state_ms,
             execute_ms = execution.timings.execute_ms,
             finalize_ms = execution.timings.finalize_ms,
