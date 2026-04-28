@@ -10,12 +10,9 @@ use commonware_cryptography::{
     ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Sequential;
+use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Error as RuntimeError, Metrics as _, Storage as _,
-    benchmarks::{context as bench_context, tokio as bench_tokio},
-    buffer::paged::CacheRef,
-    tokio::{Config as RuntimeConfig, Context as RuntimeContext},
+    Error as RuntimeError, Metrics as _, Storage as _, ThreadPooler, benchmarks::{context as bench_context, tokio as bench_tokio}, buffer::paged::CacheRef, tokio::{Config as RuntimeConfig, Context as RuntimeContext}
 };
 use commonware_storage::{
     journal::contiguous::fixed::Config as FixedJournalConfig,
@@ -56,7 +53,7 @@ type TestApplication = Application<
     TestPublicKey,
     TestTransactionSource,
     ed25519::Batch,
-    Sequential,
+    Rayon,
 >;
 type TestStateDb = fixed::Db<
     mmr::Family,
@@ -533,7 +530,7 @@ async fn new_application(
 
     TestApplication::new(
         runtime.with_label("application"),
-        Sequential,
+        Rayon::with_pool(runtime.create_thread_pool(NZUsize!(8)).unwrap()),
         leader,
         TRANSACTION_NAMESPACE,
         genesis_transactions_target,
