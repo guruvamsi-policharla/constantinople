@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::{
     simplex::types::Context,
     types::{Round, View},
@@ -32,8 +33,8 @@ use commonware_utils::{
 use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Account, AccountKey, Block, Header, Sealable, SealedBlock, Signable, TRANSACTION_NAMESPACE,
-    Transaction, VerifiedTransaction,
+    Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, Signable,
+    TRANSACTION_NAMESPACE, Transaction, VerifiedTransaction,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{
@@ -178,16 +179,23 @@ impl CertificateScheme for BenchScheme {
 enum Operation {
     Propose,
     Verify,
+    VerifyDecoded,
     Apply,
 }
 
 impl Operation {
-    const ALL: [Self; 3] = [Self::Propose, Self::Verify, Self::Apply];
+    const ALL: [Self; 4] = [
+        Self::Propose,
+        Self::Verify,
+        Self::VerifyDecoded,
+        Self::Apply,
+    ];
 
     const fn name(self) -> &'static str {
         match self {
             Self::Propose => "propose",
             Self::Verify => "verify",
+            Self::VerifyDecoded => "verify-decoded",
             Self::Apply => "apply",
         }
     }
@@ -207,6 +215,9 @@ impl Operation {
         let elapsed = match self {
             Self::Propose => propose_once(runtime.clone(), transaction_count, &prefix).await,
             Self::Verify => verify_once(runtime.clone(), transaction_count, &prefix).await,
+            Self::VerifyDecoded => {
+                verify_decoded_once(runtime.clone(), transaction_count, &prefix).await
+            }
             Self::Apply => apply_once(runtime.clone(), transaction_count, &prefix).await,
         };
 
@@ -276,12 +287,40 @@ async fn propose_once(runtime: RuntimeContext, transaction_count: usize, prefix:
 }
 
 async fn verify_once(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
+    let prepared = PreparedBlock::new(runtime.clone(), transaction_count, prefix).await;
+    verify_prepared_once(
+        runtime,
+        prepared,
+        "verification should accept the proposed block",
+    )
+    .await
+}
+
+async fn verify_decoded_once(
+    runtime: RuntimeContext,
+    transaction_count: usize,
+    prefix: &str,
+) -> Duration {
+    let prepared = PreparedBlock::new_decoded(runtime.clone(), transaction_count, prefix).await;
+    verify_prepared_once(
+        runtime,
+        prepared,
+        "verification should accept the decoded block",
+    )
+    .await
+}
+
+async fn verify_prepared_once(
+    runtime: RuntimeContext,
+    prepared: PreparedBlock,
+    success: &str,
+) -> Duration {
     let PreparedBlock {
         mut app,
         databases,
         parent,
         block,
-    } = PreparedBlock::new(runtime.clone(), transaction_count, prefix).await;
+    } = prepared;
     let batches = databases.new_batches().await;
     let context = block.header.context.clone();
 
@@ -289,7 +328,7 @@ async fn verify_once(runtime: RuntimeContext, transaction_count: usize, prefix: 
     let merkleized = app
         .verify_child((runtime, context), block, &parent, batches)
         .await
-        .expect("verification should accept the proposed block");
+        .expect(success);
     let elapsed = started_at.elapsed();
 
     black_box(merkleized.0.root());
@@ -381,6 +420,16 @@ impl PreparedBlock {
             block,
         }
     }
+
+    async fn new_decoded(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
+        let mut prepared = Self::new(runtime, transaction_count, prefix).await;
+        prepared.block = decode_block(prepared.block);
+        prepared
+    }
+}
+
+fn decode_block(block: TestBlock) -> TestBlock {
+    TestBlock::decode_cfg(block.encode(), &BlockCfg::default()).expect("bench block should decode")
 }
 
 struct GeneratedTransactions {
