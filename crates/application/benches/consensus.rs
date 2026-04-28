@@ -287,7 +287,7 @@ async fn verify_once(runtime: RuntimeContext, transaction_count: usize, prefix: 
 
     let started_at = Instant::now();
     let merkleized = app
-        .verify_child((runtime, context), &block, &parent, batches)
+        .verify_child((runtime, context), block, &parent, batches)
         .await
         .expect("verification should accept the proposed block");
     let elapsed = started_at.elapsed();

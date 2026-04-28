@@ -15,9 +15,7 @@ use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
-use constantinople_primitives::{
-    AccountKey, Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
-};
+use constantinople_primitives::{AccountKey, Header, SealedBlock, SignedTransaction};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
@@ -171,23 +169,50 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let transactions =
-        preload_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
-    let signers = strategy
-        .map_collect_vec(&transactions, |transaction| {
-            transaction
-                .get()
-                .and_then(|transaction| transaction.value().sender())
-                .map(AccountKey::from_public_key)
-        })
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or(MALFORMED_TRANSACTION)?;
+    let signers = prepare_signers(strategy, &transactions).ok_or(MALFORMED_TRANSACTION)?;
 
     Ok(Prepared {
         transactions,
         signers,
     })
+}
+
+fn prepare_signers<P, H, St>(
+    strategy: &St,
+    transactions: &[Lazy<SignedTransaction<P, H>>],
+) -> Option<Vec<AccountKey<P>>>
+where
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    if transactions.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let parallelism = strategy.parallelism_hint();
+    if parallelism <= 1 || transactions.len() <= parallelism {
+        let mut signers = Vec::with_capacity(transactions.len());
+        for transaction in transactions {
+            signers.push(prepare_signer(transaction)?);
+        }
+        return Some(signers);
+    }
+
+    strategy
+        .map_collect_vec(transactions, prepare_signer)
+        .into_iter()
+        .collect()
+}
+
+fn prepare_signer<P, H>(transaction: &Lazy<SignedTransaction<P, H>>) -> Option<AccountKey<P>>
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    let transaction = transaction.get()?;
+    let sender = transaction.value().sender()?;
+    Some(AccountKey::from_public_key(sender))
 }
 
 /// Executes and merkleizes a block body for verification.

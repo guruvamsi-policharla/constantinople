@@ -215,7 +215,7 @@ where
     pub async fn verify_child<E>(
         &mut self,
         (runtime, _context): (E, Context<C, P>),
-        block: &SealedBlock<C, P, H>,
+        block: SealedBlock<C, P, H>,
         parent: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
@@ -227,7 +227,7 @@ where
         St: Strategy + Clone + Send + Sync + 'static,
     {
         let verify_started_at = Instant::now();
-        let Block { header, body } = block.clone().into_inner();
+        let Block { header, body } = block.into_inner();
 
         if !time::is_valid_child_timestamp(parent.header.timestamp, header.timestamp) {
             warn!(
@@ -414,7 +414,7 @@ where
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let block = ancestry.next().await?;
         let parent = ancestry.next().await?;
-        self.verify_child(context, &block, &parent, batches).await
+        self.verify_child(context, block, &parent, batches).await
     }
 
     /// Applies a certified block to speculative batches and returns merkleized state.
