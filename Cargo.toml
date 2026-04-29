@@ -14,6 +14,7 @@ resolver = "2"
 members = [
   "crates/application",
   "crates/engine",
+  "crates/indexer",
   "crates/mempool",
   "crates/primitives",
   "bin/deploy",
@@ -38,6 +39,7 @@ redundant-clone = "warn"
 [workspace.dependencies]
 # Workspace
 constantinople-engine = { path = "crates/engine" }
+constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
@@ -58,6 +60,10 @@ commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", b
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+
+# Exoware
+exoware-sdk = "2026.4.1"
+exoware-simulator = "2026.4.1"
 
 # Other
 axum = "0.8"
