@@ -1,6 +1,6 @@
 use crate::{
-    ClusterMaterial, GenerateArgs, LocalArgs, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    ClusterMaterial, GenerateArgs, IndexerConfig, LocalArgs, PEERS_CONFIG_FILE, PeerEntry,
+    PeersConfig, ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
     default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
     write_yaml_config,
 };
@@ -20,6 +20,12 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     assert!(args.validators >= 1, "need at least one validator");
+    if local.indexer {
+        assert!(
+            args.secondaries >= 1,
+            "--indexer requires at least one secondary; only secondaries upload",
+        );
+    }
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -47,7 +53,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
-    print_local_run_commands(&output_dir, args);
+    print_local_run_commands(&output_dir, args, local);
 }
 
 fn build_validators(
@@ -102,6 +108,7 @@ fn build_validators(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
+            indexer: None,
         };
 
         validators.push(GeneratedValidator {
@@ -128,6 +135,9 @@ fn build_secondaries(
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
+    let indexer_config = local
+        .indexer
+        .then(|| local_indexer_config(local.indexer_port));
 
     // Secondary ports start after the primary range to avoid collisions on
     // the same loopback host.
@@ -172,6 +182,7 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
+            indexer: indexer_config.clone(),
         };
 
         secondaries.push(GeneratedValidator {
@@ -188,8 +199,24 @@ fn build_secondaries(
     secondaries
 }
 
-fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs) {
-    let commands = local_run_commands(output_dir, args);
+/// Build the indexer wiring written into every secondary's YAML when the
+/// local deploy is started with `--indexer`. All three URLs point at the same
+/// simulator; routing-by-family in the indexer client keeps writes correct
+/// because key prefixes are disjoint. Splitting the simulator into three
+/// processes is deferred until we actually need physically separate stores.
+fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
+    let url = format!("http://127.0.0.1:{indexer_port}");
+    IndexerConfig {
+        enabled: true,
+        blocks_url: url.clone(),
+        transactions_url: url.clone(),
+        meta_url: url,
+        upload_buffer: 1024,
+    }
+}
+
+fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs) {
+    let commands = local_run_commands(output_dir, args, local);
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
@@ -205,7 +232,7 @@ fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs) {
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
 }
 
-fn local_run_commands(output_dir: &Path, args: &GenerateArgs) -> Vec<String> {
+fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
@@ -224,6 +251,15 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs) -> Vec<String> {
             "cargo run --bin constantinople -- --config {} --peers {}",
             path.display(),
             peers_path.display()
+        ));
+    }
+
+    if local.indexer {
+        let data_dir = output_dir.join("indexer-data");
+        commands.push(format!(
+            "cargo run -p constantinople-indexer --bin indexer -- --port {} --data-dir {}",
+            local.indexer_port,
+            data_dir.display(),
         ));
     }
 
@@ -246,8 +282,10 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::local_run_commands;
-    use crate::{GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig};
+    use super::{build_secondaries, build_validators, local_run_commands};
+    use crate::{
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, generate_local_cluster_material,
+    };
     use std::path::{Path, PathBuf};
 
     fn test_args(spammer: bool) -> GenerateArgs {
@@ -263,18 +301,33 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
-            target: GenerateTarget::Local(LocalArgs {
-                base_port: 9000,
-                base_http_port: 8080,
-                base_metrics_port: 9090,
-            }),
+            target: GenerateTarget::Local(test_local_args()),
+        }
+    }
+
+    fn test_local_args() -> LocalArgs {
+        LocalArgs {
+            base_port: 9000,
+            base_http_port: 8080,
+            base_metrics_port: 9090,
+            indexer: false,
+            indexer_port: 8090,
+        }
+    }
+
+    /// Borrow the [`LocalArgs`] embedded in a [`GenerateArgs`] built by
+    /// [`test_args`], avoiding duplicate construction in every test.
+    fn local_args(args: &GenerateArgs) -> &LocalArgs {
+        match &args.target {
+            GenerateTarget::Local(local) => local,
+            _ => panic!("test_args must construct a Local target"),
         }
     }
 
     #[test]
     fn local_run_commands_only_start_validators() {
         let args = test_args(false);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args);
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
@@ -283,7 +336,7 @@ mod tests {
     #[test]
     fn local_run_commands_include_spammer_when_enabled() {
         let args = test_args(true);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args);
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-spammer"));
@@ -297,11 +350,104 @@ mod tests {
     fn local_run_commands_include_secondaries() {
         let mut args = test_args(false);
         args.secondaries = 2;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args);
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
         assert_eq!(commands.len(), 4);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
+    }
+
+    /// Mutate the [`LocalArgs`] embedded in the test [`GenerateArgs`] in a
+    /// short-lived scope so the test can immutably re-borrow it later.
+    fn enable_indexer(args: &mut GenerateArgs, port: u16) {
+        let GenerateTarget::Local(ref mut local) = args.target else {
+            panic!("test_args must construct a Local target");
+        };
+        local.indexer = true;
+        local.indexer_port = port;
+    }
+
+    #[test]
+    fn local_run_commands_include_indexer_when_enabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+        enable_indexer(&mut args, 8090);
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        // 2 validators + 1 secondary + 1 indexer = 4 commands.
+        assert_eq!(commands.len(), 4);
+        let indexer_cmd = commands
+            .iter()
+            .find(|c| c.contains("constantinople-indexer"))
+            .expect("indexer command should be present");
+        assert!(indexer_cmd.contains("--port 8090"));
+        assert!(indexer_cmd.contains("--data-dir /tmp/configs/indexer-data"));
+    }
+
+    #[test]
+    fn secondary_yaml_gets_indexer_when_enabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+        enable_indexer(&mut args, 8090);
+
+        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let validators = build_validators(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+        let secondaries = build_secondaries(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+
+        // Primaries never get indexer wiring.
+        assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+
+        // Secondaries point at the configured simulator URL on every URL field.
+        let indexer = secondaries[0]
+            .config
+            .indexer
+            .as_ref()
+            .expect("secondary should have indexer config");
+        assert!(indexer.enabled);
+        let expected_url = "http://127.0.0.1:8090".to_string();
+        assert_eq!(indexer.blocks_url, expected_url);
+        assert_eq!(indexer.transactions_url, expected_url);
+        assert_eq!(indexer.meta_url, expected_url);
+    }
+
+    #[test]
+    fn secondary_yaml_has_no_indexer_when_disabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+
+        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let secondaries = build_secondaries(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+
+        assert!(secondaries[0].config.indexer.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "--indexer requires at least one secondary")]
+    fn indexer_requires_at_least_one_secondary() {
+        let mut args = test_args(false);
+        args.secondaries = 0;
+        // Use a unique nonexistent output dir so `ensure_output_dir_missing`
+        // does not fire before our intended assertion.
+        args.output_dir = PathBuf::from("/tmp/constantinople-deploy-test-indexer-no-secondaries");
+        enable_indexer(&mut args, 8090);
+
+        super::generate(&args, local_args(&args));
     }
 
     #[test]

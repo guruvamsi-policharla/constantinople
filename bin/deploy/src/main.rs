@@ -107,6 +107,16 @@ pub(crate) struct LocalArgs {
     base_http_port: u16,
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
+    /// Spawn a local exoware simulator and wire secondaries to upload to it.
+    ///
+    /// Requires `--secondaries >= 1`. For now only transactions are uploaded;
+    /// blocks and meta are physically routed to the same simulator URL because
+    /// the indexer schema requires all three URLs.
+    #[arg(long, default_value_t = false)]
+    indexer: bool,
+    /// Port for the local exoware simulator launched by `--indexer`.
+    #[arg(long, default_value_t = 8090)]
+    indexer_port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -188,6 +198,26 @@ pub(crate) struct ValidatorConfig {
     max_propose_bytes: usize,
     max_pool_bytes: usize,
     bootstrappers: Vec<NamedBootstrapperEntry>,
+    /// Optional indexer wiring. Set on secondary validators only when the
+    /// `--indexer` flag is enabled on the local deploy job. Primaries always
+    /// leave this unset; the validator runtime ignores it for primaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexer: Option<IndexerConfig>,
+}
+
+/// Indexer wiring serialized into a secondary validator's YAML.
+///
+/// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
+/// local deploy currently only spins up a single exoware simulator and routes
+/// all three URLs to the same backend; routing-by-family in the indexer
+/// client keeps the data correct because key prefixes are disjoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IndexerConfig {
+    pub enabled: bool,
+    pub blocks_url: String,
+    pub transactions_url: String,
+    pub meta_url: String,
+    pub upload_buffer: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

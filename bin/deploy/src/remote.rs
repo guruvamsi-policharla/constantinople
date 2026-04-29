@@ -133,6 +133,7 @@ fn build_validators(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
+            indexer: None,
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -183,6 +184,7 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
+            indexer: None,
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -310,6 +312,8 @@ mod tests {
                 base_port: 9000,
                 base_http_port: 8080,
                 base_metrics_port: 9090,
+                indexer: false,
+                indexer_port: 8090,
             }),
         }
     }
@@ -355,6 +359,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers: Vec::new(),
+                indexer: None,
             },
         }
     }
