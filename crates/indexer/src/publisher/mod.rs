@@ -22,8 +22,10 @@ use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug, error, warn};
 
 pub mod block;
+pub mod certificate;
 
 pub use block::BlockReporter;
+pub use certificate::CertificateReporter;
 
 /// One atomic write to the exoware store.
 ///

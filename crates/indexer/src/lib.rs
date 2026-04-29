@@ -8,5 +8,6 @@ pub mod publisher;
 
 pub use client::{IndexerClient, ReadError};
 pub use publisher::{
-    BlockReporter, UploadBatch, UploaderHandle, spawn_uploader, standard_store_client,
+    BlockReporter, CertificateReporter, UploadBatch, UploaderHandle, spawn_uploader,
+    standard_store_client,
 };
