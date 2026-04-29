@@ -25,6 +25,10 @@ commonware-utils.workspace = true
 # Exoware
 exoware-sdk.workspace = true
 exoware-simulator.workspace = true
+exoware-sql.workspace = true
+
+# Datafusion (re-exposed by exoware-sql; needed to declare column types).
+datafusion.workspace = true
 
 # Other
 bytes.workspace = true

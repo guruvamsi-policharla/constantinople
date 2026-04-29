@@ -64,6 +64,8 @@ commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git
 # Exoware
 exoware-sdk = "2026.4.1"
 exoware-simulator = "2026.4.1"
+exoware-sql = "2026.4.1"
+datafusion = "52"
 
 # Other
 axum = "0.8"
