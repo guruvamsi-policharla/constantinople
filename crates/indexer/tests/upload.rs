@@ -1,7 +1,8 @@
 //! End-to-end integration: drive `BlockReporter` against three in-process
-//! `exoware-simulator` instances (blocks, transactions, meta) and read every
-//! artifact back out via `IndexerClient`. Also asserts that each store only
-//! contains the families it owns.
+//! `exoware-simulator` instances (blocks, transactions, sql) and read every
+//! artifact back out via `IndexerClient` (KV) and a fresh DataFusion
+//! `SessionContext` (SQL). Also asserts that each store only contains the
+//! families it owns.
 
 use bytes::Bytes;
 use commonware_codec::Encode;
@@ -99,15 +100,14 @@ fn valid_commitment() -> Commitment {
     ))
 }
 
-/// Four running simulators with their connected store clients. The temp dirs
+/// Three running simulators with their connected store clients. The temp dirs
 /// and join handles are kept alive for the duration of the test.
 struct Stores {
     blocks: StoreClient,
     transactions: StoreClient,
-    meta: StoreClient,
     sql: StoreClient,
-    _handles: [tokio::task::JoinHandle<()>; 4],
-    _dirs: [TempDir; 4],
+    _handles: [tokio::task::JoinHandle<()>; 3],
+    _dirs: [TempDir; 3],
 }
 
 async fn spawn_stores() -> Stores {
@@ -122,15 +122,13 @@ async fn spawn_stores() -> Stores {
 
     let (h_b, d_b, blocks) = one().await;
     let (h_t, d_t, transactions) = one().await;
-    let (h_m, d_m, meta) = one().await;
     let (h_s, d_s, sql) = one().await;
     Stores {
         blocks,
         transactions,
-        meta,
         sql,
-        _handles: [h_b, h_t, h_m, h_s],
-        _dirs: [d_b, d_t, d_m, d_s],
+        _handles: [h_b, h_t, h_s],
+        _dirs: [d_b, d_t, d_s],
     }
 }
 
@@ -139,30 +137,24 @@ fn make_uploaders(stores: &Stores) -> UploaderHandles {
     spawn_uploaders(
         stores.blocks.clone(),
         stores.transactions.clone(),
-        stores.meta.clone(),
         stores.sql.clone(),
         16,
     )
 }
 
 fn make_client(stores: &Stores) -> IndexerClient {
-    IndexerClient::new(
-        stores.blocks.clone(),
-        stores.transactions.clone(),
-        stores.meta.clone(),
-    )
+    IndexerClient::new(stores.blocks.clone(), stores.transactions.clone())
 }
 
-/// Sum of rows visible in `client` across every indexer key family.
+/// Sum of rows visible in `client` across every indexer KV family.
 async fn count_all(client: &StoreClient) -> usize {
-    let bounds: [(Key, Key); 7] = [
+    let bounds: [(Key, Key); 6] = [
         indexer_keys::block_bounds(),
         indexer_keys::block_by_height_bounds(),
         indexer_keys::finalized_bounds(),
         indexer_keys::notarized_bounds(),
         indexer_keys::tx_bounds(),
         indexer_keys::tx_by_height_bounds(),
-        indexer_keys::META.prefix_bounds(),
     ];
     let mut total = 0;
     for (lo, hi) in bounds {
@@ -183,7 +175,6 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores()
     let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
-        uploaders.meta.clone(),
         uploaders.sql.clone(),
     );
 
@@ -194,11 +185,11 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores()
 
     waiter.await.expect("uploader must acknowledge");
 
-    // Verify routing: blocks store has BLOCK + BLOCK_BY_H (= 2 rows), the tx
-    // store has 2 rows per tx, and the meta store has exactly 1 row.
+    // Verify routing: blocks store has BLOCK + BLOCK_BY_H (= 2 rows), the
+    // tx store has 2 KV rows per tx. SQL metadata is verified separately
+    // by `block_reporter_writes_block_meta_and_tx_meta_rows`.
     assert_eq!(count_all(&stores.blocks).await, 2);
     assert_eq!(count_all(&stores.transactions).await, 2 * block.body.len());
-    assert_eq!(count_all(&stores.meta).await, 1);
 
     // Verify every row of the logical batch is readable by the typed client.
     let client = make_client(&stores);
@@ -254,7 +245,6 @@ async fn block_reporter_advances_latest_height_monotonically() {
     let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
-        uploaders.meta.clone(),
         uploaders.sql.clone(),
     );
 
@@ -289,7 +279,6 @@ async fn block_reporter_handles_empty_block_body() {
     let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
-        uploaders.meta.clone(),
         uploaders.sql.clone(),
     );
 
@@ -300,7 +289,6 @@ async fn block_reporter_handles_empty_block_body() {
 
     assert_eq!(count_all(&stores.blocks).await, 2);
     assert_eq!(count_all(&stores.transactions).await, 0);
-    assert_eq!(count_all(&stores.meta).await, 1);
 
     drop(uploaders);
 }
@@ -313,7 +301,6 @@ async fn block_reporter_ignores_tip_updates() {
     let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
-        uploaders.meta.clone(),
         uploaders.sql.clone(),
     );
 
@@ -332,7 +319,6 @@ async fn block_reporter_ignores_tip_updates() {
     assert_eq!(client.latest_height().await.unwrap(), None);
     assert_eq!(count_all(&stores.blocks).await, 0);
     assert_eq!(count_all(&stores.transactions).await, 0);
-    assert_eq!(count_all(&stores.meta).await, 0);
 
     drop(uploaders);
 }
@@ -350,7 +336,6 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
     let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
-        uploaders.meta.clone(),
         uploaders.sql.clone(),
     );
 

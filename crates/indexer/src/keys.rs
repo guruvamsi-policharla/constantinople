@@ -12,11 +12,14 @@
 //! | `NOTARIZED`  | `0x4`  | `view` (u64 BE)                    | encoded `Notarization` |
 //! | `TX`         | `0x5`  | `tx_digest` (32B)                  | encoded `SignedTransaction` |
 //! | `TX_BY_H`    | `0x6`  | `height` (u64 BE) ‖ `index` (u32 BE) | tx digest (32B)    |
-//! | `META`       | `0x7`  | UTF-8 meta key name                | scalar value         |
 //!
 //! Reserved bits: 4. The remaining 4 bits of the first byte hold the family
 //! prefix. The full payload (including any digest or numeric field) starts at
 //! the second byte.
+//!
+//! The `latest_finalized_height` cursor and any other indexer metadata live
+//! exclusively in the SQL `block_meta` table (see [`crate::sql_schema`]);
+//! the KV path no longer carries a redundant `META` family.
 
 use exoware_sdk::keys::{Key, KeyCodec, KeyCodecError};
 
@@ -35,11 +38,6 @@ pub const NOTARIZED: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x4);
 pub const TX: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x5);
 /// Family for `(height, index) -> tx_digest`.
 pub const TX_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x6);
-/// Family for indexer metadata (e.g. cursors).
-pub const META: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x7);
-
-/// Meta key name for the highest indexed finalized block height.
-pub const META_LATEST_HEIGHT: &[u8] = b"latest_finalized_height";
 
 /// Encode a `BLOCK` key for the given block digest.
 pub fn block(digest: &[u8]) -> Result<Key, KeyCodecError> {
@@ -72,17 +70,6 @@ pub fn tx_by_height(height: u64, index: u32) -> Result<Key, KeyCodecError> {
     payload[..8].copy_from_slice(&height.to_be_bytes());
     payload[8..].copy_from_slice(&index.to_be_bytes());
     TX_BY_H.encode(&payload)
-}
-
-/// Encode a `META` key for the given metadata name.
-pub fn meta(name: &[u8]) -> Result<Key, KeyCodecError> {
-    META.encode(name)
-}
-
-/// Encode the canonical `META` key used to track the latest indexed finalized
-/// block height.
-pub fn meta_latest_height() -> Result<Key, KeyCodecError> {
-    meta(META_LATEST_HEIGHT)
 }
 
 /// Inclusive `(start, end)` bounds spanning every key under the `BLOCK` family.
@@ -129,7 +116,6 @@ mod tests {
         assert!(NOTARIZED.matches(&notarized(13).unwrap()));
         assert!(TX.matches(&tx(&digest).unwrap()));
         assert!(TX_BY_H.matches(&tx_by_height(17, 0).unwrap()));
-        assert!(META.matches(&meta_latest_height().unwrap()));
     }
 
     /// Family prefixes must not overlap; a key from one family must not match
@@ -143,7 +129,6 @@ mod tests {
         assert!(!NOTARIZED.matches(&k));
         assert!(!TX.matches(&k));
         assert!(!TX_BY_H.matches(&k));
-        assert!(!META.matches(&k));
     }
 
     /// Big-endian numeric encoding must preserve sortable order.

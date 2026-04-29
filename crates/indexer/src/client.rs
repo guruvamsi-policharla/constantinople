@@ -1,10 +1,12 @@
-//! Typed read-only wrapper around three [`StoreClient`]s.
+//! Typed read-only wrapper around the two KV [`StoreClient`]s.
 //!
-//! Constantinople fans its data out across three independent exoware stores:
-//! one for blocks + consensus certificates, one for transactions, and one for
-//! metadata. `IndexerClient` is the canonical way for tests and library
-//! consumers to pull artifacts back out of those stores; it routes each query
-//! to the store that owns the relevant key family.
+//! Constantinople fans its full-storage KV data across two independent
+//! exoware stores: one for blocks + consensus certificates, and one for
+//! transactions. (Block-level metadata lives in the SQL `block_meta`
+//! table — see [`crate::sql_schema`] — and is not served by this client.)
+//! `IndexerClient` is the canonical way for tests and library consumers to
+//! pull artifacts back out of those stores; it routes each query to the
+//! store that owns the relevant key family.
 //!
 //! The struct does not own any sockets beyond the underlying [`StoreClient`]s,
 //! so it is cheap to clone.
@@ -32,28 +34,25 @@ pub enum ReadError {
     Malformed { expected: usize, got: usize },
 }
 
-/// Typed read client over the three exoware [`StoreClient`]s that back the
-/// indexer.
+/// Typed read client over the two exoware [`StoreClient`]s that back the
+/// indexer's KV path.
 ///
 /// | Field          | Families served                                |
 /// | -------------- | ---------------------------------------------- |
 /// | `blocks`       | BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED        |
 /// | `transactions` | TX, TX_BY_H                                    |
-/// | `meta`         | META                                           |
 #[derive(Clone, Debug)]
 pub struct IndexerClient {
     blocks: StoreClient,
     transactions: StoreClient,
-    meta: StoreClient,
 }
 
 impl IndexerClient {
-    /// Wrap three existing [`StoreClient`]s, one per backing store.
-    pub const fn new(blocks: StoreClient, transactions: StoreClient, meta: StoreClient) -> Self {
+    /// Wrap two existing [`StoreClient`]s, one per backing store.
+    pub const fn new(blocks: StoreClient, transactions: StoreClient) -> Self {
         Self {
             blocks,
             transactions,
-            meta,
         }
     }
 
@@ -65,11 +64,6 @@ impl IndexerClient {
     /// Borrow the transactions-store [`StoreClient`] for raw access.
     pub const fn transactions(&self) -> &StoreClient {
         &self.transactions
-    }
-
-    /// Borrow the meta-store [`StoreClient`] for raw access.
-    pub const fn meta(&self) -> &StoreClient {
-        &self.meta
     }
 
     /// Fetch the encoded block for `digest`, or `None` if absent.
@@ -123,21 +117,25 @@ impl IndexerClient {
         self.block_by_digest::<H, P, _>(&digest, cfg).await
     }
 
-    /// Latest finalized block height stored in the META family, if any.
+    /// Latest finalized block height, derived from a backward scan of the
+    /// `BLOCK_BY_H` family.
+    ///
+    /// The previous implementation read a `META` `latest_finalized_height`
+    /// cursor written alongside every block. That cursor is gone — the SQL
+    /// `block_meta` table now serves the same role for streaming consumers
+    /// — so we ask the KV store directly for the highest indexed height by
+    /// taking the last key under [`keys::BLOCK_BY_H`].
     pub async fn latest_height(&self) -> Result<Option<u64>, ReadError> {
-        let key = keys::meta_latest_height().expect("meta key fits family payload");
-        let Some(bytes) = self.meta.query().get(&key).await? else {
+        let (lo, hi) = keys::block_by_height_bounds();
+        let rows = self
+            .blocks
+            .query()
+            .range_with_mode(&lo, &hi, 1, RangeMode::Reverse)
+            .await?;
+        let Some((key, _)) = rows.into_iter().next() else {
             return Ok(None);
         };
-        if bytes.len() != 8 {
-            return Err(ReadError::Malformed {
-                expected: 8,
-                got: bytes.len(),
-            });
-        }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&bytes);
-        Ok(Some(u64::from_be_bytes(buf)))
+        Ok(Some(decode_height(&key)?))
     }
 
     /// Latest indexed block, decoded.

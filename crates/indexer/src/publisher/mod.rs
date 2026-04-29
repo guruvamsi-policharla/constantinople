@@ -5,21 +5,22 @@
 //! - One or more cloneable [`Reporter`] implementations that encode incoming
 //!   consensus events into atomic [`UploadBatch`]es and push them to a bounded
 //!   MPSC channel.
-//! - Three uploader tasks (see [`spawn_uploaders`]) — one per backing store —
-//!   that each own a [`StoreClient`] and drain their channel, retrying until
-//!   the store accepts the batch. On success each task fulfills its clone of
-//!   the marshal acknowledgement bundled with the batch (if any).
+//! - Three uploader tasks (see [`spawn_uploaders`]) — two KV stores plus
+//!   one SQL metadata writer — that each own a [`StoreClient`] and drain
+//!   their channel, retrying until the store accepts the batch. On
+//!   success each task fulfills its clone of the marshal acknowledgement
+//!   bundled with the batch (if any).
 //!
-//! Constantinople fans its data out across three independent exoware stores:
+//! Constantinople fans its data across two KV stores plus one SQL stream:
 //!
-//! | Store          | Families                                   |
-//! | -------------- | ------------------------------------------ |
-//! | `blocks`       | `BLOCK`, `BLOCK_BY_H`, `FINALIZED`, `NOTARIZED` |
-//! | `transactions` | `TX`, `TX_BY_H`                            |
-//! | `meta`         | `META`                                     |
+//! | Path              | Families / tables                              |
+//! | ----------------- | ---------------------------------------------- |
+//! | `blocks` (KV)     | `BLOCK`, `BLOCK_BY_H`, `FINALIZED`, `NOTARIZED` |
+//! | `transactions` (KV) | `TX`, `TX_BY_H`                              |
+//! | `sql` (metadata)  | `block_meta`, `tx_meta`                        |
 //!
 //! The marshal [`Exact`] acknowledgement is cloned once per uploader so the
-//! waiter resolves only after every store has durably accepted its batch.
+//! waiter resolves only after every path has durably accepted its batch.
 //!
 //! [`Reporter`]: commonware_consensus::Reporter
 //! [`StoreClient`]: exoware_sdk::StoreClient
@@ -54,11 +55,11 @@ pub struct UploadBatch {
     pub ack: Option<Exact>,
 }
 
-/// Handles for the four uploader tasks and their feeder channels.
+/// Handles for the three uploader tasks and their feeder channels.
 ///
-/// Three of the channels carry pre-encoded KV [`UploadBatch`]es to the
-/// `blocks`, `transactions`, and `meta` exoware Stores. The fourth carries
-/// typed [`SqlBatch`]es to the SQL metadata uploader, which owns a single
+/// Two of the channels carry pre-encoded KV [`UploadBatch`]es to the
+/// `blocks` and `transactions` exoware Stores. The third carries typed
+/// [`SqlBatch`]es to the SQL metadata uploader, which owns a single
 /// [`exoware_sql::BatchWriter`] over its own [`StoreClient`]. Cloneable
 /// [`BlockReporter`] / [`CertificateReporter`] instances clone these
 /// senders and forward batches to the per-store tasks.
@@ -67,43 +68,37 @@ pub struct UploaderHandles {
     pub blocks: mpsc::Sender<UploadBatch>,
     /// Sender for the `transactions` store (TX, TX_BY_H).
     pub transactions: mpsc::Sender<UploadBatch>,
-    /// Sender for the `meta` store (META).
-    pub meta: mpsc::Sender<UploadBatch>,
     /// Sender for the SQL metadata uploader (`block_meta`, `tx_meta`).
     pub sql: mpsc::Sender<SqlBatch>,
     /// Background uploader join handles, kept alive for the lifetime of the
     /// validator process so the tasks are not aborted prematurely.
-    pub joins: [JoinHandle<()>; 4],
+    pub joins: [JoinHandle<()>; 3],
 }
 
 /// Spawn one uploader task per backing store on the current tokio runtime.
 ///
-/// The first three uploaders write pre-encoded KV pairs through
-/// [`StoreClient::ingest`]; the fourth (`sql_client`) is a SQL metadata
+/// The first two uploaders write pre-encoded KV pairs through
+/// [`StoreClient::ingest`]; the third (`sql_client`) is a SQL metadata
 /// publisher that owns an [`exoware_sql::BatchWriter`] and flushes once
 /// per finalized block.
 pub fn spawn_uploaders(
     blocks_client: StoreClient,
     transactions_client: StoreClient,
-    meta_client: StoreClient,
     sql_client: StoreClient,
     buffer: usize,
 ) -> UploaderHandles {
     let (blocks_tx, blocks_rx) = mpsc::channel::<UploadBatch>(buffer);
     let (txs_tx, txs_rx) = mpsc::channel::<UploadBatch>(buffer);
-    let (meta_tx, meta_rx) = mpsc::channel::<UploadBatch>(buffer);
 
     let blocks_join = tokio::spawn(run_uploader("blocks", blocks_client, blocks_rx));
     let txs_join = tokio::spawn(run_uploader("transactions", transactions_client, txs_rx));
-    let meta_join = tokio::spawn(run_uploader("meta", meta_client, meta_rx));
     let (sql_tx, sql_join) = spawn_sql_uploader(sql_client, buffer);
 
     UploaderHandles {
         blocks: blocks_tx,
         transactions: txs_tx,
-        meta: meta_tx,
         sql: sql_tx,
-        joins: [blocks_join, txs_join, meta_join, sql_join],
+        joins: [blocks_join, txs_join, sql_join],
     }
 }
 

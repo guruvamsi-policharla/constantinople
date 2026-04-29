@@ -31,18 +31,20 @@ pub(crate) const fn default_upload_buffer() -> usize {
 ///
 /// Primary (voting) validators ignore this section; secondaries with
 /// `enabled = true` upload finalized blocks, transactions, and consensus
-/// certificates to four independent exoware stores:
+/// certificates to three independent exoware stores:
 ///
-/// - `blocks_url`       — BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED.
-/// - `transactions_url` — TX, TX_BY_H.
-/// - `meta_url`         — META (`latest_finalized_height` cursor).
+/// - `blocks_url`       — BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED (KV).
+/// - `transactions_url` — TX, TX_BY_H (KV).
 /// - `sql_url`          — `block_meta` / `tx_meta` SQL metadata tables.
+///
+/// The latest-finalized-height cursor that earlier versions of the
+/// indexer wrote to a separate `META` KV family now lives in
+/// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
     pub enabled: bool,
     pub blocks_url: String,
     pub transactions_url: String,
-    pub meta_url: String,
     pub sql_url: String,
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,

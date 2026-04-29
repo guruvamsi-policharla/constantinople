@@ -1,15 +1,19 @@
-//! Block reporter that fans a finalized block out across three exoware stores.
+//! Block reporter that fans a finalized block out across the KV stores
+//! and the SQL metadata uploader.
 //!
 //! Wired into the engine via the existing `marshal` reporter slot. On every
 //! `Update::Block(block, ack)` we:
 //!
 //! 1. Encode three batches:
-//!    - **blocks store**: BLOCK + BLOCK_BY_H rows (block payload + height index).
-//!    - **transactions store**: TX + TX_BY_H rows for every contained tx.
-//!    - **meta store**: the META `latest_finalized_height` cursor.
+//!    - **blocks store** (KV): BLOCK + BLOCK_BY_H rows.
+//!    - **transactions store** (KV): TX + TX_BY_H rows for every contained tx.
+//!    - **sql metadata** (`block_meta` + `tx_meta`): one row per block plus
+//!      one row per transaction. The latest-finalized-height cursor is
+//!      derived from `MAX(height)` on `block_meta`; the KV path no longer
+//!      maintains a redundant META scalar.
 //! 2. Clone the marshal acknowledgement once per uploader. Each uploader
 //!    fulfills its clone after its own put succeeds; the marshal waiter only
-//!    resolves after every store has durably accepted its batch.
+//!    resolves after every uploader has durably accepted its batch.
 //! 3. Forward each batch to its uploader and return immediately so consensus
 //!    is not blocked on the network store — marshal itself back-pressures
 //!    the engine through the still-held ack.
@@ -41,7 +45,6 @@ use tracing::warn;
 pub struct BlockReporter<H, P> {
     blocks: mpsc::Sender<UploadBatch>,
     transactions: mpsc::Sender<UploadBatch>,
-    meta: mpsc::Sender<UploadBatch>,
     sql: mpsc::Sender<SqlBatch>,
     _marker: PhantomData<fn() -> (H, P)>,
 }
@@ -49,20 +52,18 @@ pub struct BlockReporter<H, P> {
 impl<H, P> BlockReporter<H, P> {
     /// Build a reporter that forwards batches to the per-store uploader channels.
     ///
-    /// Three KV channels mirror the existing per-store layout (BLOCK,
-    /// TX, META). The fourth (`sql`) feeds the SQL metadata uploader,
-    /// which writes typed rows into the `block_meta` and `tx_meta`
-    /// tables declared by [`crate::sql_schema`].
+    /// Two KV channels (`blocks`, `transactions`) carry pre-encoded rows
+    /// to the existing exoware Stores. The third (`sql`) feeds the SQL
+    /// metadata uploader, which writes typed rows into the `block_meta`
+    /// and `tx_meta` tables declared by [`crate::sql_schema`].
     pub const fn new(
         blocks: mpsc::Sender<UploadBatch>,
         transactions: mpsc::Sender<UploadBatch>,
-        meta: mpsc::Sender<UploadBatch>,
         sql: mpsc::Sender<SqlBatch>,
     ) -> Self {
         Self {
             blocks,
             transactions,
-            meta,
             sql,
             _marker: PhantomData,
         }
@@ -74,7 +75,6 @@ impl<H, P> Clone for BlockReporter<H, P> {
         Self {
             blocks: self.blocks.clone(),
             transactions: self.transactions.clone(),
-            meta: self.meta.clone(),
             sql: self.sql.clone(),
             _marker: PhantomData,
         }
@@ -100,7 +100,6 @@ where
                 let EncodedRows {
                     blocks,
                     transactions,
-                    meta,
                     sql,
                 } = encode_block_rows(&block);
 
@@ -111,7 +110,6 @@ where
                 // dispatcher fulfills its clone immediately.
                 let ack_blocks = ack.clone();
                 let ack_transactions = ack.clone();
-                let ack_meta = ack.clone();
                 let ack_sql = ack;
 
                 dispatch_batch(
@@ -126,13 +124,6 @@ where
                     UploadBatch {
                         rows: transactions,
                         ack: Some(ack_transactions),
-                    },
-                );
-                dispatch_batch(
-                    &self.meta,
-                    UploadBatch {
-                        rows: meta,
-                        ack: Some(ack_meta),
                     },
                 );
                 dispatch_sql_batch(
@@ -151,7 +142,6 @@ where
 struct EncodedRows {
     blocks: Vec<(Key, Bytes)>,
     transactions: Vec<(Key, Bytes)>,
-    meta: Vec<(Key, Bytes)>,
     sql: Vec<crate::publisher::SqlRow>,
 }
 
@@ -224,13 +214,9 @@ where
         tx_digests.push(digest_arr);
     }
 
-    // META: latest_finalized_height = u64 BE.
-    let meta = vec![(
-        keys::meta_latest_height().expect("meta key fits family payload"),
-        Bytes::copy_from_slice(&height.to_be_bytes()),
-    )];
-
     // SQL: one block_meta row + one tx_meta row per surviving transaction.
+    // The `latest_finalized_height` cursor that the previous KV META family
+    // carried is now derived from `MAX(block_meta.height)` instead.
     // `view` is currently 0; see `encode_sql_rows` docs for why.
     let tx_count = u64::try_from(tx_digests.len()).expect("tx count fits u64");
     let sql = encode_sql_rows(
@@ -245,7 +231,6 @@ where
     EncodedRows {
         blocks,
         transactions,
-        meta,
         sql,
     }
 }
