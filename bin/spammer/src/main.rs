@@ -33,7 +33,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (accounts_count, value, seed_offset, http_port, primary_validators) =
+    let (accounts_count, value, seed_offset, http_port, primary_validators, rounds_jitter) =
         if let Some(config_path) = &cli.config {
             let cfg = config::load_config(config_path);
             (
@@ -42,6 +42,7 @@ fn main() {
                 cfg.seed_offset,
                 cfg.http_port,
                 cfg.primary_validators,
+                cfg.rounds_jitter,
             )
         } else {
             (
@@ -50,8 +51,10 @@ fn main() {
                 cli.seed_offset,
                 cli.http_port,
                 Vec::new(),
+                cli.rounds_jitter,
             )
         };
+    assert!(rounds_jitter >= 1, "--rounds-jitter must be >= 1");
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -121,11 +124,24 @@ fn main() {
             let stats = stats.clone();
             tokio::spawn(async move {
                 let submitter = ValidatorSubmitter::new(client, stats, i);
+                // Per-task xorshift state. Seeded distinctly per validator so
+                // submitters don't lock-step their batch sizes; mixing in
+                // `seed_offset` keeps the jitter stream reproducible across
+                // runs that use the same seed.
+                let mut rng = JitterRng::new(seed_offset.wrapping_add(i as u64).wrapping_add(1));
                 let mut round = 0;
                 loop {
-                    // Sign one round: n txs, one per account, all at nonce = round.
-                    let batch = sign_rounds(&strategy, &accounts, value, round, 1);
-                    round += 1;
+                    // Pick a per-batch round count in `1..=rounds_jitter`.
+                    // With jitter == 1 this is always 1 (the original
+                    // single-round behavior).
+                    let num_rounds = if rounds_jitter <= 1 {
+                        1
+                    } else {
+                        rng.range(1, rounds_jitter)
+                    };
+                    let batch =
+                        sign_rounds(&strategy, &accounts, value, round, u64::from(num_rounds));
+                    round += u64::from(num_rounds);
 
                     // Submit and block until every tx is finalized.
                     submitter.submit_until_finalized(batch).await;
@@ -160,4 +176,75 @@ fn main() {
             );
         }
     });
+}
+
+/// Tiny inline xorshift64 used to jitter per-batch round counts. We don't pull
+/// `rand` in here because we only need a few bits per submission and the
+/// statistical quality of xorshift is more than sufficient for visual block
+/// size variance.
+struct JitterRng {
+    state: u64,
+}
+
+impl JitterRng {
+    /// `seed` of zero would lock the generator; we map it to a non-zero value.
+    const fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
+        }
+    }
+
+    const fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Uniform integer in `lo..=hi` (inclusive). Caller must pass `lo <= hi`.
+    fn range(&mut self, lo: u32, hi: u32) -> u32 {
+        debug_assert!(lo <= hi);
+        let span = u64::from(hi - lo) + 1;
+        lo + (self.next_u64() % span) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JitterRng;
+
+    /// `range` must hit both endpoints over enough draws and never escape them.
+    #[test]
+    fn jitter_rng_range_is_inclusive_and_bounded() {
+        let mut rng = JitterRng::new(42);
+        let mut hit_lo = false;
+        let mut hit_hi = false;
+        for _ in 0..2_000 {
+            let v = rng.range(1, 5);
+            assert!((1..=5).contains(&v));
+            if v == 1 {
+                hit_lo = true;
+            }
+            if v == 5 {
+                hit_hi = true;
+            }
+        }
+        assert!(hit_lo, "should sample the lower bound");
+        assert!(hit_hi, "should sample the upper bound");
+    }
+
+    /// `range(lo, lo)` collapses to the constant `lo`.
+    #[test]
+    fn jitter_rng_range_collapses_when_lo_equals_hi() {
+        let mut rng = JitterRng::new(7);
+        for _ in 0..32 {
+            assert_eq!(rng.range(3, 3), 3);
+        }
+    }
 }

@@ -52,6 +52,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
             seed_offset: args.spammer_seed_offset,
             http_port: remote.http_port,
             primary_validators: material.primary_hex(),
+            rounds_jitter: args.spammer_rounds_jitter,
         };
         write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
     }
@@ -308,6 +309,7 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
+            spammer_rounds_jitter: 1,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,

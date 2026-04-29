@@ -24,6 +24,15 @@ pub struct SpammerConfig {
     /// hex-named validator host (local/CLI-only fallback).
     #[serde(default)]
     pub primary_validators: Vec<String>,
+    /// Maximum nonce rounds per submitted batch. `1` (the default) preserves
+    /// the original lockstep behavior; values > 1 randomize each submission's
+    /// `num_rounds` in `1..=rounds_jitter` so block sizes vary.
+    #[serde(default = "default_rounds_jitter")]
+    pub rounds_jitter: u32,
+}
+
+const fn default_rounds_jitter() -> u32 {
+    1
 }
 
 /// A peer entry from the local `peers.yaml` file.
@@ -112,6 +121,7 @@ mod tests {
             seed_offset: 2000,
             http_port: 9090,
             primary_validators: vec!["deadbeef".to_string()],
+            rounds_jitter: 3,
         };
         let yaml = serde_yaml::to_string(&config).expect("serialize");
         let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");
@@ -120,6 +130,16 @@ mod tests {
         assert_eq!(parsed.seed_offset, config.seed_offset);
         assert_eq!(parsed.http_port, config.http_port);
         assert_eq!(parsed.primary_validators, config.primary_validators);
+        assert_eq!(parsed.rounds_jitter, config.rounds_jitter);
+    }
+
+    /// Older configs that predate `rounds_jitter` must still parse: the field
+    /// is `#[serde(default)]` and defaults to `1`.
+    #[test]
+    fn config_yaml_defaults_rounds_jitter_when_absent() {
+        let yaml = "accounts: 10\nvalue: 1\nseed_offset: 1000\nhttp_port: 8080\n";
+        let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
+        assert_eq!(parsed.rounds_jitter, 1);
     }
 
     #[test]

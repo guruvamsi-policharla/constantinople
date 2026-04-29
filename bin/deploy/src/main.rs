@@ -88,6 +88,12 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
+    /// Maximum nonce rounds the spammer signs per submitted batch. `1`
+    /// (the default) keeps the original lockstep behavior; values > 1
+    /// randomize each submission's `num_rounds` in `1..=N`, which gives the
+    /// indexer a less monotonous block-size stream to display.
+    #[arg(long, default_value_t = 1)]
+    spammer_rounds_jitter: u32,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -163,6 +169,15 @@ pub(crate) struct SpammerConfig {
     /// the spammer target only primaries.
     #[serde(default)]
     pub primary_validators: Vec<String>,
+    /// Maximum nonce rounds per submitted batch. Mirrors
+    /// `constantinople-spammer --rounds-jitter`. Defaults to 1 to preserve
+    /// the original lockstep behavior on older config files.
+    #[serde(default = "default_rounds_jitter")]
+    pub rounds_jitter: u32,
+}
+
+const fn default_rounds_jitter() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

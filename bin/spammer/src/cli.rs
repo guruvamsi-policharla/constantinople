@@ -42,6 +42,14 @@ pub struct Cli {
     /// Number of rayon threads for parallel signing.
     #[arg(long, default_value_t = 2)]
     pub rayon_threads: usize,
+
+    /// Maximum number of nonce rounds signed per submission. When greater
+    /// than 1 the spammer picks a random `num_rounds` in `1..=rounds_jitter`
+    /// for each batch, so block sizes vary instead of staying flat at
+    /// `accounts` per block. Default `1` preserves the original
+    /// "one round per submission" behavior.
+    #[arg(long, default_value_t = 1)]
+    pub rounds_jitter: u32,
 }
 
 #[cfg(test)]
