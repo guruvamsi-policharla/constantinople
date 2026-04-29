@@ -62,8 +62,8 @@ use std::{
 };
 use tracing::{error, info, warn};
 
-/// The fixed threshold VRF scheme used by simplex and marshal.
-pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::vrf::Scheme<P, V>;
+/// The fixed threshold scheme used by simplex and marshal.
+pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::Scheme<P, V>;
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: usize = 1024;
