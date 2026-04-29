@@ -1,0 +1,182 @@
+/*
+ * Terminal-aesthetic styling inspired by SRCL (www-sacred).
+ *
+ * SRCL ships as a Next.js + SCSS application rather than a consumable npm
+ * library, so rather than pulling Next as a transitive dependency we mirror
+ * the look-and-feel here with a small set of OKLCH-derived tokens, a single
+ * monospace stack, and tabular-num figures. See ../README.md for the call.
+ */
+
+:root {
+    --font-family-mono:
+        ui-monospace, 'SF Mono', Menlo, Monaco, 'Cascadia Code', Consolas,
+        'Liberation Mono', monospace;
+    --font-size: 14px;
+    --line-height: 1.4;
+
+    --theme-background: #0e0f10;
+    --theme-text: #eeeeee;
+    --theme-text-dim: #8a8a8a;
+    --theme-border: #2a2a2a;
+    --theme-accent: #e4f221;
+    --theme-row-alt: #131415;
+    --theme-row-hover: #1c1d1e;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--theme-background);
+    color: var(--theme-text);
+    font-family: var(--font-family-mono);
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    font-variant-numeric: tabular-nums lining-nums;
+    text-rendering: geometricPrecision;
+}
+
+#root {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.app {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.app__header {
+    border-bottom: 1px solid var(--theme-border);
+    padding: 1ch 2ch;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2ch;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.app__title {
+    margin: 0;
+    font-size: var(--font-size);
+    font-weight: 400;
+    letter-spacing: 0.02em;
+}
+
+.app__title .accent {
+    color: var(--theme-accent);
+}
+
+.app__status {
+    color: var(--theme-text-dim);
+    display: flex;
+    gap: 2ch;
+    align-items: center;
+}
+
+.app__status .dot {
+    display: inline-block;
+    width: 0.7ch;
+    height: 0.7ch;
+    border-radius: 50%;
+    margin-right: 0.6ch;
+    vertical-align: middle;
+    background: var(--theme-text-dim);
+}
+
+.app__status.live .dot {
+    background: var(--theme-accent);
+    box-shadow: 0 0 0.6ch var(--theme-accent);
+}
+
+.app__status.error {
+    color: #ff6b6b;
+}
+
+.app__status.error .dot {
+    background: #ff6b6b;
+}
+
+.app__main {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 1ch 2ch 4ch;
+}
+
+.tx-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+.tx-table th,
+.tx-table td {
+    text-align: left;
+    padding: 0.6ch 1ch;
+    border-bottom: 1px solid var(--theme-border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tx-table th {
+    color: var(--theme-text-dim);
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85em;
+    position: sticky;
+    top: 0;
+    background: var(--theme-background);
+}
+
+.tx-table tbody tr:nth-child(even) {
+    background: var(--theme-row-alt);
+}
+
+.tx-table tbody tr:hover {
+    background: var(--theme-row-hover);
+}
+
+.tx-table tbody tr.is-fresh {
+    animation: flash 700ms ease-out;
+}
+
+@keyframes flash {
+    from {
+        background: rgba(228, 242, 33, 0.18);
+    }
+    to {
+        background: transparent;
+    }
+}
+
+.col-height {
+    width: 12ch;
+}
+
+.col-index {
+    width: 6ch;
+}
+
+.col-time {
+    width: 16ch;
+    color: var(--theme-text-dim);
+}
+
+.col-digest {
+    /* Fluid; takes the rest. */
+}
+
+.empty {
+    padding: 4ch 2ch;
+    color: var(--theme-text-dim);
+    text-align: center;
+}
