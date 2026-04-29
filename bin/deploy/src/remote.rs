@@ -316,6 +316,7 @@ mod tests {
                 base_metrics_port: 9090,
                 indexer: false,
                 indexer_port: 8090,
+                sql_port: 8091,
             }),
         }
     }

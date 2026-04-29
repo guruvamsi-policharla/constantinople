@@ -262,14 +262,28 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
             local.indexer_port,
             data_dir.display(),
         ));
-        // Bring up the React explorer dev server alongside the simulator so
-        // operators get a live view of streaming transactions for free.
-        // `VITE_INDEXER_URL` is consumed by `explorer/src/App.tsx`; the
-        // default there matches `--indexer-port`, but we pass it explicitly
-        // so a non-default port still works.
+        // SQL server: exposes Constantinople's `block_meta` / `tx_meta`
+        // tables over `store.sql.v1.Service`. The explorer subscribes to
+        // this server (NOT the raw exoware simulator) for live block
+        // metadata. Sleep briefly so the simulator has bound its port
+        // first; otherwise the SQL server's first GET races the bind.
         commands.push(format!(
-            "VITE_INDEXER_URL=http://127.0.0.1:{} npm --prefix explorer run dev",
-            local.indexer_port,
+            "sleep 2 && cargo run -p constantinople-indexer --bin sql -- \
+             run --store-url http://127.0.0.1:{} --port {}",
+            local.indexer_port, local.sql_port,
+        ));
+        // Bring up the React explorer dev server alongside the SQL server
+        // so operators get a live view of streaming blocks for free.
+        // `VITE_SQL_URL` is consumed by `explorer/src/App.tsx`; the
+        // default there matches `--sql-port`, but we pass it explicitly
+        // so a non-default port still works. `VITE_INDEXER_URL` is also
+        // forwarded for any future drill-down that needs to fetch a
+        // specific block / transaction body via the KV path.
+        commands.push(format!(
+            "VITE_INDEXER_URL=http://127.0.0.1:{} \
+             VITE_SQL_URL=http://127.0.0.1:{} \
+             npm --prefix explorer run dev",
+            local.indexer_port, local.sql_port,
         ));
     }
 
@@ -325,6 +339,7 @@ mod tests {
             base_metrics_port: 9090,
             indexer: false,
             indexer_port: 8090,
+            sql_port: 8091,
         }
     }
 
@@ -398,14 +413,31 @@ mod tests {
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
-        // 2 validators + 1 secondary + 1 indexer + 1 explorer = 5 commands.
-        assert_eq!(commands.len(), 5);
+        // 2 validators + 1 secondary + 1 indexer + 1 sql + 1 explorer = 6.
+        assert_eq!(commands.len(), 6);
         let indexer_cmd = commands
             .iter()
-            .find(|c| c.contains("constantinople-indexer"))
+            .find(|c| c.contains("--bin indexer"))
             .expect("indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/indexer-data"));
+    }
+
+    #[test]
+    fn local_run_commands_include_sql_server_when_indexer_enabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+        enable_indexer(&mut args, 8090);
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        let sql_cmd = commands
+            .iter()
+            .find(|c| c.contains("--bin sql"))
+            .expect("sql server command should be present");
+        // The SQL server reads from the simulator and serves on its own port.
+        assert!(sql_cmd.contains("--store-url http://127.0.0.1:8090"));
+        assert!(sql_cmd.contains("--port 8091"));
     }
 
     #[test]
@@ -420,8 +452,10 @@ mod tests {
             .iter()
             .find(|c| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
-        // Explorer must be wired to the same port the simulator binds.
+        // Explorer must be wired to the SQL server (subscribe path) and
+        // also told the KV indexer URL for any future drill-down.
         assert!(explorer_cmd.contains("VITE_INDEXER_URL=http://127.0.0.1:8090"));
+        assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:8091"));
         assert!(explorer_cmd.contains("run dev"));
     }
 

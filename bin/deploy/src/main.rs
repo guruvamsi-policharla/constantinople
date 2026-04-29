@@ -115,14 +115,19 @@ pub(crate) struct LocalArgs {
     base_metrics_port: u16,
     /// Spawn a local exoware simulator and wire secondaries to upload to it.
     ///
-    /// Requires `--secondaries >= 1`. For now only transactions are uploaded;
-    /// blocks and meta are physically routed to the same simulator URL because
-    /// the indexer schema requires all three URLs.
+    /// Requires `--secondaries >= 1`. The simulator backs both the KV
+    /// publisher (BLOCK / TX families) and the SQL publisher
+    /// (`block_meta` / `tx_meta` tables).
     #[arg(long, default_value_t = false)]
     indexer: bool,
     /// Port for the local exoware simulator launched by `--indexer`.
     #[arg(long, default_value_t = 8090)]
     indexer_port: u16,
+    /// Port for the local SQL server (Constantinople's `block_meta`
+    /// service) launched by `--indexer`. The explorer reads from this
+    /// port via `VITE_SQL_URL`.
+    #[arg(long, default_value_t = 8091)]
+    sql_port: u16,
 }
 
 #[derive(Debug, Args)]

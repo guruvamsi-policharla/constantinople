@@ -31,11 +31,13 @@ exoware-sql.workspace = true
 datafusion.workspace = true
 
 # Other
+axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
@@ -49,6 +51,10 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 [[bin]]
 name = "indexer"
 path = "src/main.rs"
+
+[[bin]]
+name = "sql"
+path = "src/bin/sql.rs"
 
 [lib]
 name = "constantinople_indexer"
