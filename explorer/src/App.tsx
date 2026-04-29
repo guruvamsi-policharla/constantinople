@@ -28,6 +28,10 @@ const indexerUrl = import.meta.env.VITE_INDEXER_URL ?? DEFAULT_INDEXER_URL;
 
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
+    // Cumulative tx count across every block we've ever observed on the
+    // stream. Tracked independently of `blocks` so the "total txs observed"
+    // stat keeps climbing when older entries roll off the MAX_ROWS buffer.
+    const [totalTxObserved, setTotalTxObserved] = useState(0);
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const lastSequenceRef = useRef<bigint | null>(null);
 
@@ -41,6 +45,7 @@ export default function App() {
                     if (cancelled) return;
                     lastSequenceRef.current = block.sequence;
                     setBlocks((current) => prependBounded(block, current));
+                    setTotalTxObserved((current) => current + block.txCount);
                     setStatus({ kind: 'live' });
                 }
             } catch (error) {
@@ -67,7 +72,7 @@ export default function App() {
                     </h1>
                     <StatusBadge status={status} url={indexerUrl} />
                 </header>
-                <SummaryPanel blocks={blocks} />
+                <SummaryPanel blocks={blocks} totalTxObserved={totalTxObserved} />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
                     <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
@@ -110,13 +115,19 @@ function StatusBadge({ status, url }: { status: Status; url: string }) {
     );
 }
 
-function SummaryPanel({ blocks }: { blocks: ObservedBlock[] }) {
+function SummaryPanel({
+    blocks,
+    totalTxObserved,
+}: {
+    blocks: ObservedBlock[];
+    totalTxObserved: number;
+}) {
     const stats = useMemo(() => computeStats(blocks), [blocks]);
     return (
         <section className="summary">
             <Stat label="latest height" value={stats.latestHeight ?? '—'} />
             <Stat label="blocks" value={stats.blockCount.toLocaleString()} />
-            <Stat label="total txs" value={stats.totalTx.toLocaleString()} />
+            <Stat label="total txs observed" value={totalTxObserved.toLocaleString()} />
             <Stat label="peak txs/block" value={stats.peakTx.toLocaleString()} />
             <Stat label="avg txs/block" value={stats.avgTx.toLocaleString()} />
         </section>
@@ -135,14 +146,13 @@ function Stat({ label, value }: { label: string; value: React.ReactNode }) {
 interface DerivedStats {
     latestHeight: string | null;
     blockCount: number;
-    totalTx: number;
     peakTx: number;
     avgTx: number;
 }
 
 function computeStats(blocks: ObservedBlock[]): DerivedStats {
     if (blocks.length === 0) {
-        return { latestHeight: null, blockCount: 0, totalTx: 0, peakTx: 0, avgTx: 0 };
+        return { latestHeight: null, blockCount: 0, peakTx: 0, avgTx: 0 };
     }
     let totalTx = 0;
     let peakTx = 0;
@@ -155,7 +165,6 @@ function computeStats(blocks: ObservedBlock[]): DerivedStats {
     return {
         latestHeight: maxHeight.toString(),
         blockCount: blocks.length,
-        totalTx,
         peakTx,
         avgTx: Math.round(totalTx / blocks.length),
     };
