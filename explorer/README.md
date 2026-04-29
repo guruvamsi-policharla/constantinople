@@ -10,19 +10,22 @@ The explorer opens a single `subscribe()` stream against the indexer's
 [`store.stream.v1.Service`][rpc] for the `TX_BY_H` key family
 (`reservedBits = 4`, `prefix = 0x6` — see
 [`crates/indexer/src/keys.rs`](../crates/indexer/src/keys.rs)). Every key in
-that family is `(u64 BE height, u32 BE index) → 32-byte tx digest`, so a single
-subscription is enough to surface block height, intra-block index, and the
-canonical transaction id.
+that family is `(u64 BE height, u32 BE index) → 32-byte tx digest`, and each
+atomic store batch corresponds to the transactions of a single finalized
+block.
 
 [rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/store/v1/stream.proto
 
-Each emitted batch corresponds to one atomic store batch — i.e. one finalized
-block — and is flushed to the UI as a unit rather than per-row, matching the
-upstream cadence of the block reporter.
+Rather than streaming every transaction (a single block can contain tens of
+thousands during spammer runs), the UI aggregates each batch into a one-line
+block summary — `(height, txCount, arrival time)` — and renders an ASCII
+throughput bar per row plus a rolling sparkline at the top so the operator
+can see throughput scale at a glance.
 
 The full transaction body lives in the `TX` family (`prefix = 0x5`). Decoding
 it requires deserializing `SignedTransaction`, which is non-trivial from
-TypeScript; v1 of the explorer leaves that out and shows the digest only.
+TypeScript; the explorer deliberately leaves that out — height + tx count is
+enough to read the live cadence of the chain.
 
 ## Configuration
 
