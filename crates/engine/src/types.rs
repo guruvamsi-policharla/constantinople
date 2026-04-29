@@ -7,6 +7,7 @@
 use crate::ThresholdScheme;
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
+    Reporter, Reporters,
     marshal::{
         coding::{Coding, Marshaled, shards, types::StoredCodedBlock},
         core::Mailbox as MarshalMailbox,
@@ -14,7 +15,9 @@ use commonware_consensus::{
     simplex::{self, types::Finalization},
     types::{Epoch, FixedEpocher, coding::Commitment},
 };
-use commonware_cryptography::certificate::ConstantProvider;
+use commonware_cryptography::{
+    PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
+};
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
 use commonware_utils::sync::AsyncRwLock;
@@ -22,7 +25,7 @@ use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
 use constantinople_primitives::{Account, AccountKey, Block, Sealed};
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 /// A finalized block with its seal (commitment-based).
 pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
@@ -35,6 +38,45 @@ pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, E
 
 /// A finalization certificate over the engine's threshold scheme.
 pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;
+
+/// Simplex activity stream observed by the engine, used by the optional
+/// `simplex_observer` reporter slot in [`crate::Config`].
+pub type EngineActivity<P, V> = simplex::types::Activity<ThresholdScheme<P, V>, Commitment>;
+
+/// A no-op [`Reporter`] over [`EngineActivity`].
+///
+/// Pass `None::<NoopActivityReporter<P, V>>` to [`crate::Config::simplex_observer`]
+/// when no external observer is wired in. The type parameter exists only to
+/// pin the activity type; the reporter never forwards anything.
+pub struct NoopActivityReporter<P, V>(PhantomData<fn() -> (P, V)>);
+
+impl<P, V> Default for NoopActivityReporter<P, V> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<P, V> Clone for NoopActivityReporter<P, V> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<P, V> std::fmt::Debug for NoopActivityReporter<P, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoopActivityReporter").finish()
+    }
+}
+
+impl<P, V> Reporter for NoopActivityReporter<P, V>
+where
+    P: PublicKey,
+    V: Variant,
+{
+    type Activity = EngineActivity<P, V>;
+
+    async fn report(&mut self, _: Self::Activity) {}
+}
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
@@ -97,7 +139,12 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I, BV> = simplex::Engine<
+/// Reporter combinator that fans simplex activity to the marshal mailbox and
+/// an optional external observer (e.g. the indexer's certificate publisher).
+pub(crate) type SimplexReporter<H, P, V, O> =
+    Reporters<EngineActivity<P, V>, EngineMarshalMailbox<H, P, V>, O>;
+
+pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I, BV, O> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
@@ -105,6 +152,6 @@ pub(crate) type SimplexEngine<E, B, H, P, V, L, T, I, BV> = simplex::Engine<
     Commitment,
     MarshaledApp<E, H, P, V, I, BV, T>,
     MarshaledApp<E, H, P, V, I, BV, T>,
-    EngineMarshalMailbox<H, P, V>,
+    SimplexReporter<H, P, V, O>,
     T,
 >;

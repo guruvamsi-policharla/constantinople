@@ -135,7 +135,11 @@ where
 }
 
 /// Engine initialization parameters.
-pub struct Config<C, M, B, V, T, I, H>
+///
+/// `O` is the type of an optional simplex activity observer (e.g. the
+/// indexer's certificate publisher). Pass `None::<NoopActivityReporter<P, V>>`
+/// when no external observer is wired in.
+pub struct Config<C, M, B, V, T, I, H, O>
 where
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
@@ -143,6 +147,7 @@ where
     V: Variant,
     T: Strategy,
     H: Hasher,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
     pub signer: C,
     pub manager: M,
@@ -160,10 +165,15 @@ where
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
+    /// Optional external observer of the simplex activity stream. The marshal
+    /// reporter is always wired up; this slot is fanned out via
+    /// [`commonware_consensus::Reporters`] so primaries that pass `None`
+    /// behave exactly as before.
+    pub simplex_observer: Option<O>,
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, T, I, BV>
+pub struct Engine<E, C, M, B, H, V, L, T, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
     C: Signer,
@@ -175,6 +185,7 @@ where
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
     context: ContextCell<E>,
     signer: C,
@@ -206,10 +217,10 @@ where
     >,
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I, BV>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, T, I, BV, O>,
 }
 
-impl<E, C, M, B, H, V, L, T, I, BV> Engine<E, C, M, B, H, V, L, T, I, BV>
+impl<E, C, M, B, H, V, L, T, I, BV, O> Engine<E, C, M, B, H, V, L, T, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
     C: Signer,
@@ -221,6 +232,7 @@ where
     T: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
@@ -247,7 +259,7 @@ where
     }
 
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<C, M, B, V, T, I, H>) -> Self {
+    pub async fn new(context: E, config: Config<C, M, B, V, T, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.with_label("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -414,10 +426,17 @@ where
                 epocher,
             },
         );
+        // Fan simplex activity to the marshal mailbox and any external
+        // observer (e.g. the indexer's certificate publisher). When
+        // `simplex_observer` is `None`, this combinator is equivalent to
+        // forwarding activity to the marshal mailbox alone — primaries that
+        // pass `None` see exactly the previous behavior.
         #[cfg(all(test, feature = "test-utils"))]
-        let simplex_reporter = marshal_mailbox.clone();
+        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
+            Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
         #[cfg(not(all(test, feature = "test-utils")))]
-        let simplex_reporter = marshal_mailbox;
+        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
+            Reporters::from((marshal_mailbox, config.simplex_observer));
 
         let simplex = simplex::Engine::new(
             context.with_label("simplex"),

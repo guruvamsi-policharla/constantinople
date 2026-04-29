@@ -22,7 +22,7 @@ use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper, types::NoopActivityReporter,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
@@ -207,29 +207,41 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!(startup_mode, "selected validator startup mode");
 
         info!("initializing engine");
-        let engine =
-            Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _, Batch>::new(
-                context.with_label("engine"),
-                EngineConfig {
-                    signer: decoded.signer,
-                    manager: oracle.clone(),
-                    blocker: oracle,
-                    namespace: b"constantinople".to_vec(),
-                    output: decoded.dkg_output,
-                    share: decoded.share,
-                    input: mempool_mailbox.clone(),
-                    partition_prefix: decoded.partition_prefix,
-                    freezer_table_initial_size: 1024,
-                    strategy,
-                    startup,
-                    sync_config: production_sync_config(),
-                    genesis_leader: decoded.genesis_leader,
-                    transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                    block_codec: Default::default(),
-                    bootstrapper: bootstrapper_mailbox.clone(),
-                },
-            )
-            .await;
+        let engine = Engine::<
+            _,
+            _,
+            _,
+            _,
+            Sha256,
+            MinSig,
+            RoundRobin<Sha256>,
+            Rayon,
+            _,
+            Batch,
+            NoopActivityReporter<ed25519::PublicKey, MinSig>,
+        >::new(
+            context.with_label("engine"),
+            EngineConfig {
+                signer: decoded.signer,
+                manager: oracle.clone(),
+                blocker: oracle,
+                namespace: b"constantinople".to_vec(),
+                output: decoded.dkg_output,
+                share: decoded.share,
+                input: mempool_mailbox.clone(),
+                partition_prefix: decoded.partition_prefix,
+                freezer_table_initial_size: 1024,
+                strategy,
+                startup,
+                sync_config: production_sync_config(),
+                genesis_leader: decoded.genesis_leader,
+                transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                block_codec: Default::default(),
+                bootstrapper: bootstrapper_mailbox.clone(),
+                simplex_observer: None,
+            },
+        )
+        .await;
 
         // Install the account reader as soon as the stateful actor attaches
         // its databases. Runs concurrently with engine.start so the HTTP

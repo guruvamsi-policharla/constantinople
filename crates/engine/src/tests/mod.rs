@@ -280,6 +280,7 @@ impl EngineDefinition for TestEngineDefinition {
                     _,
                     _,
                     Ed25519Batch,
+                    crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
                 >::new(
                     context.with_label("engine"),
                     Config {
@@ -305,6 +306,7 @@ impl EngineDefinition for TestEngineDefinition {
                         transaction_namespace: TRANSACTION_NAMESPACE,
                         block_codec: Default::default(),
                         bootstrapper: bootstrapper_mailbox.clone(),
+                        simplex_observer: None,
                     },
                 )
                 .await;
