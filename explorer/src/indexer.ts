@@ -17,7 +17,7 @@
 //   pub const RESERVED_BITS: u8 = 4;
 //   pub const TX_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x6);
 
-import { Client, StoreKeyPrefix, type StoreBatch } from '@exowarexyz/sdk';
+import { Client, HttpError, StoreKeyPrefix, type StoreBatch } from '@exowarexyz/sdk';
 
 /** Mirrors `RESERVED_BITS` in `crates/indexer/src/keys.rs`. */
 export const KEY_RESERVED_BITS = 4;
@@ -55,6 +55,11 @@ export interface ObservedBatch {
  * `ObservedBatch` per atomic store batch — i.e. each yielded batch is the
  * set of transactions from a single finalized block. Yielding per-batch
  * (rather than per-row) lets the UI flush a whole block in one render.
+ *
+ * Transient `OUT_OF_RANGE` errors from the simulator (see
+ * [`isTransientBatchRaceError`]) are caught and the subscription is
+ * automatically reopened — they're a documented race against concurrent
+ * uploads and reconnecting fresh always recovers.
  */
 export async function* subscribeTransactions(
     baseUrl: string,
@@ -65,28 +70,82 @@ export async function* subscribeTransactions(
         new StoreKeyPrefix(KEY_RESERVED_BITS, KEY_FAMILY_TX_BY_H),
     );
 
-    // The SDK rewrites this match key with our store's prefix before sending,
-    // so reservedBits=0/prefix=0/payload_regex=".*" means "every key in the
-    // TX_BY_H family". Same trick the SDK README uses.
-    const stream = txByH.subscribe(
-        {
-            matchKeys: [
-                {
-                    reservedBits: 0,
-                    prefix: 0,
-                    payloadRegex: '(?s-u).*',
-                },
-            ],
-        },
-        { signal },
-    );
+    // Cap consecutive transient retries so a genuinely broken simulator
+    // can't trap us in a tight reconnect loop. A single successful batch
+    // resets the counter.
+    const MAX_TRANSIENT_RETRIES = 10;
+    let transientRetries = 0;
 
-    for await (const batch of stream) {
-        const decoded = decodeBatch(batch);
-        if (decoded.transactions.length > 0) {
-            yield decoded;
+    while (!signal?.aborted) {
+        try {
+            // The SDK rewrites this match key with our store's prefix before
+            // sending, so reservedBits=0/prefix=0/payload_regex=".*" means
+            // "every key in the TX_BY_H family". Same trick the SDK README uses.
+            const stream = txByH.subscribe(
+                {
+                    matchKeys: [
+                        {
+                            reservedBits: 0,
+                            prefix: 0,
+                            payloadRegex: '(?s-u).*',
+                        },
+                    ],
+                },
+                { signal },
+            );
+
+            for await (const batch of stream) {
+                transientRetries = 0;
+                const decoded = decodeBatch(batch);
+                if (decoded.transactions.length > 0) {
+                    yield decoded;
+                }
+            }
+            // Server-streaming RPC ended cleanly (no more frames). Loop and
+            // re-subscribe so the UI keeps following the live tail.
+        } catch (error) {
+            if (signal?.aborted) {
+                return;
+            }
+            if (
+                !isTransientBatchRaceError(error) ||
+                transientRetries >= MAX_TRANSIENT_RETRIES
+            ) {
+                throw error;
+            }
+            transientRetries++;
+            // Brief backoff before reconnecting; the race window is short
+            // (commit ordering across the simulator's three concurrent
+            // uploaders) so a single reconnect almost always succeeds.
+            await sleep(250);
         }
     }
+}
+
+/**
+ * The simulator publishes an in-memory "next published sequence" before each
+ * commit lands in its batch_log column family. With our three indexer
+ * uploaders racing concurrently against the same simulator, a subscriber that
+ * wakes mid-commit can briefly observe `current_sequence` ahead of the
+ * batch_log row, and the server returns
+ * `OUT_OF_RANGE { reason: BATCH_EVICTED }` instead of waiting. The race
+ * window is on the order of milliseconds; reopening the subscription resyncs
+ * past it and the new floor sits at the (now-committed) latest sequence.
+ *
+ * The SDK maps `OUT_OF_RANGE` to `HttpError { status: 400 }` — we recognize
+ * it by the eviction reason embedded in the underlying ConnectError details
+ * to avoid swallowing unrelated 400s.
+ */
+function isTransientBatchRaceError(error: unknown): boolean {
+    return (
+        error instanceof HttpError &&
+        error.status === 400 &&
+        /evicted|out_of_range/i.test(error.message)
+    );
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function decodeBatch(batch: StoreBatch): ObservedBatch {
