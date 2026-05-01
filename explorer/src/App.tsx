@@ -22,10 +22,10 @@ type Status =
     | { kind: 'live' }
     | { kind: 'error'; message: string };
 
-// The explorer subscribes to the SQL metadata server (block_meta) and
-// reads from no other store. The default port matches `--sql-port` in
-// `bin/deploy/src/local.rs`; override via `VITE_SQL_URL` for non-default
-// deployments.
+// The explorer subscribes to the `metadata-indexer` service (`block_meta`)
+// and reads from no other store. The default port matches
+// `--metadata-indexer-port` in `bin/deploy/src/local.rs`; override via
+// `VITE_SQL_URL` for non-default deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;

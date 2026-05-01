@@ -28,10 +28,10 @@ The Intel build uses `x86_64-unknown-linux-gnu` with `target-cpu=graniterapids`,
 closest Rust CPU target to AWS C8i's Intel Xeon 6 processors.
 
 Both builder images are built for the local Docker host architecture and then cross-compile the
-validator to the requested target triple. This avoids running `rustc` inside an emulated
+requested binary to the target triple. This avoids running `rustc` inside an emulated
 `linux/amd64` container on Apple Silicon.
 
-#### Build Validator Binary
+#### Build Deployable Binaries
 
 To build the Graviton binary, run:
 
@@ -45,10 +45,30 @@ To build the Intel validator binary, run:
 just validator-intel-binary
 ```
 
-Either command writes:
+To build the shared indexer binaries for Graviton, run:
+
+```sh
+just chain-indexer-graviton-binary
+just metadata-indexer-graviton-binary
+```
+
+To build the shared indexer binaries for Intel, run:
+
+```sh
+just chain-indexer-intel-binary
+just metadata-indexer-intel-binary
+```
+
+`just graviton-binaries` and `just intel-binaries` build the full remote-deploy set:
 
 * `deploy/validator`
 * `deploy/validator-debug`
+* `deploy/spammer`
+* `deploy/spammer-debug`
+* `deploy/chain-indexer`
+* `deploy/chain-indexer-debug`
+* `deploy/metadata-indexer`
+* `deploy/metadata-indexer-debug`
 
 #### Troubleshooting
 

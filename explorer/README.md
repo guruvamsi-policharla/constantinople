@@ -43,7 +43,7 @@ The indexer publishes every finalized block to two parallel surfaces
 
 | Env var        | Default                 | Notes                                                                    |
 | -------------- | ----------------------- | ------------------------------------------------------------------------ |
-| `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `exoware-sql` server. Matches the local-deploy `--sql-port` default. |
+| `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
 
 The exoware Store and the SQL server both enable a permissive CORS
 layer, so the dev server can talk to them cross-origin without a Vite
@@ -66,8 +66,8 @@ cargo run -p constantinople-deploy -- generate \
 mprocs ...   # the deploy job prints the full mprocs invocation
 ```
 
-`local --indexer` automatically appends the simulator (`indexer` bin),
-the SQL server (`sql` bin from `constantinople-indexer`), and this dev
+`local --indexer` automatically appends the shared store (`chain-indexer` bin),
+the metadata service (`metadata-indexer` bin from `constantinople-indexer`), and this dev
 server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 

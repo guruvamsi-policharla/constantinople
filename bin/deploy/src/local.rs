@@ -1,8 +1,9 @@
 use crate::{
-    ClusterMaterial, GenerateArgs, IndexerConfig, LocalArgs, PEERS_CONFIG_FILE, PeerEntry,
-    PeersConfig, ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
-    write_yaml_config,
+    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
+    DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig, ValidatorConfig,
+    absolute_path, default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -137,7 +138,7 @@ fn build_secondaries(
     let secondary_validators = material.secondary_hex();
     let indexer_config = local
         .indexer
-        .then(|| local_indexer_config(local.indexer_port));
+        .then(|| local_indexer_config(local.chain_indexer_port));
 
     // Secondary ports start after the primary range to avoid collisions on
     // the same loopback host.
@@ -208,11 +209,9 @@ fn build_secondaries(
 fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
-        enabled: true,
-        blocks_url: url.clone(),
-        transactions_url: url.clone(),
-        sql_url: url,
-        upload_buffer: 1024,
+        mode: IndexerMode::Full,
+        chain_indexer_url: url,
+        upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
     }
 }
 
@@ -256,32 +255,34 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
     }
 
     if local.indexer {
-        let data_dir = output_dir.join("indexer-data");
+        let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
-            "cargo run -p constantinople-indexer --bin indexer -- --port {} --data-dir {}",
-            local.indexer_port,
+            "cargo run -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+            CHAIN_INDEXER_BINARY_FILE,
+            local.chain_indexer_port,
             data_dir.display(),
         ));
-        // SQL server: exposes Constantinople's `block_meta` / `tx_meta`
-        // tables over `store.sql.v1.Service`. The explorer subscribes to
-        // this server (NOT the raw exoware simulator) for live block
-        // metadata. Sleep briefly so the simulator has bound its port
-        // first; otherwise the SQL server's first GET races the bind.
+        // `metadata-indexer`: exposes Constantinople's `block_meta` /
+        // `tx_meta` tables over `store.sql.v1.Service`. The explorer
+        // subscribes to this service (not the raw store) for live block
+        // metadata. Sleep briefly so the store has bound its port first;
+        // otherwise the service's first GET races the bind.
         commands.push(format!(
-            "sleep 2 && cargo run -p constantinople-indexer --bin sql -- \
-             run --store-url http://127.0.0.1:{} --port {}",
-            local.indexer_port, local.sql_port,
+            "sleep 2 && cargo run -p constantinople-indexer --bin {} -- \
+             --store-url http://127.0.0.1:{} --port {}",
+            METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
-        // Bring up the React explorer dev server alongside the SQL server
+        // Bring up the React explorer dev server alongside the
+        // `metadata-indexer` service
         // so operators get a live view of streaming blocks for free.
-        // `VITE_SQL_URL` is consumed by `explorer/src/App.tsx`; the
-        // default there matches `--sql-port`, but we pass it explicitly
-        // so a non-default port still works. The KV indexer URL is
-        // intentionally NOT forwarded — the explorer only consumes the
-        // SQL metadata path today.
+        // `VITE_SQL_URL` is consumed by `explorer/src/App.tsx`; the default
+        // there matches `--metadata-indexer-port`, but we pass it explicitly
+        // so a non-default port still works. The raw `chain-indexer` URL is
+        // intentionally not forwarded — the UI only consumes the metadata
+        // service today.
         commands.push(format!(
             "VITE_SQL_URL=http://127.0.0.1:{} npm --prefix explorer run dev",
-            local.sql_port,
+            local.metadata_indexer_port,
         ));
     }
 
@@ -308,7 +309,8 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, generate_local_cluster_material,
+        GenerateArgs, GenerateTarget, IndexerMode, LocalArgs, StartupModeConfig,
+        generate_local_cluster_material,
     };
     use std::path::{Path, PathBuf};
 
@@ -336,8 +338,8 @@ mod tests {
             base_http_port: 8080,
             base_metrics_port: 9090,
             indexer: false,
-            indexer_port: 8090,
-            sql_port: 8091,
+            chain_indexer_port: 8090,
+            metadata_indexer_port: 8091,
         }
     }
 
@@ -400,7 +402,7 @@ mod tests {
             panic!("test_args must construct a Local target");
         };
         local.indexer = true;
-        local.indexer_port = port;
+        local.chain_indexer_port = port;
     }
 
     #[test]
@@ -415,27 +417,27 @@ mod tests {
         assert_eq!(commands.len(), 6);
         let indexer_cmd = commands
             .iter()
-            .find(|c| c.contains("--bin indexer"))
-            .expect("indexer command should be present");
+            .find(|c| c.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
-        assert!(indexer_cmd.contains("--data-dir /tmp/configs/indexer-data"));
+        assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
     }
 
     #[test]
-    fn local_run_commands_include_sql_server_when_indexer_enabled() {
+    fn local_run_commands_include_metadata_indexer_when_indexer_enabled() {
         let mut args = test_args(false);
         args.secondaries = 1;
         enable_indexer(&mut args, 8090);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
-        let sql_cmd = commands
+        let metadata_cmd = commands
             .iter()
-            .find(|c| c.contains("--bin sql"))
-            .expect("sql server command should be present");
-        // The SQL server reads from the simulator and serves on its own port.
-        assert!(sql_cmd.contains("--store-url http://127.0.0.1:8090"));
-        assert!(sql_cmd.contains("--port 8091"));
+            .find(|c| c.contains("--bin metadata-indexer"))
+            .expect("metadata-indexer command should be present");
+        // The metadata service reads from the store and serves on its own port.
+        assert!(metadata_cmd.contains("--store-url http://127.0.0.1:8090"));
+        assert!(metadata_cmd.contains("--port 8091"));
     }
 
     #[test]
@@ -450,7 +452,7 @@ mod tests {
             .iter()
             .find(|c| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
-        // Explorer is wired to the SQL server only — the KV indexer URL
+        // Explorer is wired to the metadata service only — the raw store URL
         // is intentionally not forwarded because the UI doesn't read it.
         assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:8091"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
@@ -496,17 +498,15 @@ mod tests {
         // Primaries never get indexer wiring.
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
 
-        // Secondaries point at the configured simulator URL on every URL field.
+        // Secondaries point at the configured shared store URL.
         let indexer = secondaries[0]
             .config
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert!(indexer.enabled);
+        assert_eq!(indexer.mode, IndexerMode::Full);
         let expected_url = "http://127.0.0.1:8090".to_string();
-        assert_eq!(indexer.blocks_url, expected_url);
-        assert_eq!(indexer.transactions_url, expected_url);
-        assert_eq!(indexer.sql_url, expected_url);
+        assert_eq!(indexer.chain_indexer_url, expected_url);
     }
 
     #[test]

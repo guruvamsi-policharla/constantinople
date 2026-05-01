@@ -48,9 +48,9 @@ single store can host both without collision.
   `StoreClient`s. The latest-finalized-height cursor is now derived from
   a backward range scan of `BLOCK_BY_H` (formerly stored in a redundant
   KV `META` family).
-- `[[bin]] indexer` — thin wrapper around `exoware_simulator::server::run`
-  for local development.
-- `[[bin]] sql` — thin wrapper that registers
+- `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`
+  for local development and deployer-managed remote bundles.
+- `[[bin]] metadata-indexer` — thin wrapper that registers
   [`build_meta_schema`](src/sql_schema.rs) onto an
   [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)
   so the explorer can reach the `store.sql.v1.Service` `Subscribe` RPC.

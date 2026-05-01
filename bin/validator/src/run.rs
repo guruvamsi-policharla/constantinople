@@ -2,7 +2,8 @@
 
 use crate::{
     config::{
-        IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
+        IndexerConfig, IndexerMode, LoadedConfig, StartupModeConfig, load_deployer_config,
+        load_local_config,
     },
     state_reader::StateDbReader,
 };
@@ -28,9 +29,7 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
-use constantinople_indexer::{
-    BlockReporter, CertificateReporter, UploaderHandles, spawn_uploaders,
-};
+use constantinople_indexer::{BlockReporter, CertificateReporter, spawn_uploaders};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -39,6 +38,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
+use tokio::task::JoinHandle;
 use tracing::info;
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
@@ -79,45 +79,60 @@ impl Reporter for BlockUpdateReporter {
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
     block_reporter: BlockReporter<Sha256, PublicKey>,
-    cert_reporter: EngineCertReporter,
+    cert_reporter: Option<EngineCertReporter>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
-    _uploaders: UploaderHandles,
+    _uploaders: Vec<JoinHandle<()>>,
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
 fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Option<IndexerHandle> {
     let cfg = indexer?;
-    if !cfg.enabled || is_primary {
+    if is_primary {
         return None;
     }
 
     info!(
-        blocks_url = %cfg.blocks_url,
-        transactions_url = %cfg.transactions_url,
-        sql_url = %cfg.sql_url,
+        mode = ?cfg.mode,
+        chain_indexer_url = %cfg.chain_indexer_url,
         "starting indexer uploaders",
     );
-    let blocks_store = constantinople_indexer::standard_store_client(&cfg.blocks_url);
-    let transactions_store = constantinople_indexer::standard_store_client(&cfg.transactions_url);
-    let sql_store = constantinople_indexer::standard_store_client(&cfg.sql_url);
-    let uploaders = spawn_uploaders(
-        blocks_store,
-        transactions_store,
-        sql_store,
-        cfg.upload_buffer,
-    );
-    let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
-    // Certificates (FINALIZED, NOTARIZED) live in the blocks store.
-    let cert_reporter = EngineCertReporter::new(uploaders.blocks.clone());
-    Some(IndexerHandle {
-        block_reporter,
-        cert_reporter,
-        _uploaders: uploaders,
-    })
+    match cfg.mode {
+        IndexerMode::Full => {
+            let blocks_store =
+                constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let transactions_store =
+                constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let uploaders = spawn_uploaders(
+                blocks_store,
+                transactions_store,
+                sql_store,
+                cfg.upload_buffer,
+            );
+            let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
+                uploaders.blocks.clone(),
+                uploaders.transactions.clone(),
+                uploaders.sql.clone(),
+            );
+            // Certificates (FINALIZED, NOTARIZED) live in the blocks store.
+            let cert_reporter = Some(EngineCertReporter::new(uploaders.blocks.clone()));
+            Some(IndexerHandle {
+                block_reporter,
+                cert_reporter,
+                _uploaders: Vec::from(uploaders.joins),
+            })
+        }
+        IndexerMode::MetadataOnly => {
+            let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let (sql, sql_join) =
+                constantinople_indexer::publisher::spawn_sql_uploader(sql_store, cfg.upload_buffer);
+            Some(IndexerHandle {
+                block_reporter: BlockReporter::<Sha256, PublicKey>::metadata_only(sql),
+                cert_reporter: None,
+                _uploaders: vec![sql_join],
+            })
+        }
+    }
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -325,7 +340,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 bootstrapper: bootstrapper_mailbox.clone(),
-                simplex_observer: indexer_handle.as_ref().map(|h| h.cert_reporter.clone()),
+                simplex_observer: indexer_handle
+                    .as_ref()
+                    .and_then(|h| h.cert_reporter.clone()),
             },
         )
         .await;

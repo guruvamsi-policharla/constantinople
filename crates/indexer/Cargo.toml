@@ -20,6 +20,7 @@ constantinople-primitives.workspace = true
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true
+commonware-deployer.workspace = true
 commonware-utils.workspace = true
 
 # Exoware
@@ -35,6 +36,8 @@ axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -49,11 +52,11 @@ tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [[bin]]
-name = "indexer"
+name = "chain-indexer"
 path = "src/main.rs"
 
 [[bin]]
-name = "sql"
+name = "metadata-indexer"
 path = "src/bin/sql.rs"
 
 [lib]

@@ -1,5 +1,8 @@
 use crate::{
-    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
+    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
+    CHAIN_INDEXER_HOST, ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE,
+    DEFAULT_INDEXER_UPLOAD_BUFFER, DEPLOYER_CONFIG_FILE, GenerateArgs, IndexerConfig, IndexerMode,
+    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, RemoteArgs,
     SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE,
     ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
     default_max_propose_bytes, ensure_output_dir_missing, generate_deployer_tag,
@@ -28,6 +31,12 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         remote.regions.len() <= args.validators as usize,
         "need at least one validator per region"
     );
+    if remote.indexer_mode().is_some() {
+        assert!(
+            args.secondaries >= 1,
+            "remote indexers require at least one secondary; only secondaries upload",
+        );
+    }
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -43,6 +52,12 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     }
     for secondary in &secondaries {
         write_yaml_config(&secondary.config_file, &secondary.config);
+    }
+    if let Some(config) = chain_indexer_config(remote) {
+        write_yaml_config(&output_dir.join(CHAIN_INDEXER_CONFIG_FILE), &config);
+    }
+    if let Some(config) = metadata_indexer_config(remote) {
+        write_yaml_config(&output_dir.join(METADATA_INDEXER_CONFIG_FILE), &config);
     }
 
     if args.spammer {
@@ -77,18 +92,36 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         secondaries = args.secondaries,
         "generated remote deployment bundle"
     );
-    if args.spammer {
+    if let Some(mode) = remote.indexer_mode() {
         info!(
-            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-            spammer_binary = %output_dir.join(SPAMMER_BINARY_FILE).display(),
-            "build all binaries into the deployment directory before creating the remote deployment"
-        );
-    } else {
-        info!(
-            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-            "build the validator binary into the deployment directory before creating the remote deployment"
+            ?mode,
+            chain_indexer_port = remote.chain_indexer_port,
+            metadata_indexer_port = remote.metadata_indexer_port,
+            "configured shared remote indexer services"
         );
     }
+    let mut binaries = vec![output_dir.join(VALIDATOR_BINARY_FILE).display().to_string()];
+    if remote.indexer_mode().is_some() {
+        binaries.push(
+            output_dir
+                .join(CHAIN_INDEXER_BINARY_FILE)
+                .display()
+                .to_string(),
+        );
+        binaries.push(
+            output_dir
+                .join(METADATA_INDEXER_BINARY_FILE)
+                .display()
+                .to_string(),
+        );
+    }
+    if args.spammer {
+        binaries.push(output_dir.join(SPAMMER_BINARY_FILE).display().to_string());
+    }
+    info!(
+        ?binaries,
+        "build deployment binaries into the output directory before creating the remote deployment"
+    );
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -160,6 +193,9 @@ fn build_secondaries(
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
+    let indexer_config = remote
+        .indexer_mode()
+        .map(|mode| remote_indexer_config(mode, remote.chain_indexer_port));
 
     for index in 0..args.secondaries {
         let secondary_index = index as usize;
@@ -185,7 +221,7 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: None,
+            indexer: indexer_config.clone(),
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -199,6 +235,28 @@ fn build_secondaries(
     }
 
     secondaries
+}
+
+fn remote_indexer_config(mode: IndexerMode, port: u16) -> IndexerConfig {
+    IndexerConfig {
+        mode,
+        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
+        upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
+    }
+}
+
+fn chain_indexer_config(remote: &RemoteArgs) -> Option<ChainIndexerConfig> {
+    remote.indexer_mode().map(|_| ChainIndexerConfig {
+        port: remote.chain_indexer_port,
+        data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
+    })
+}
+
+fn metadata_indexer_config(remote: &RemoteArgs) -> Option<MetadataIndexerConfig> {
+    remote.indexer_mode().map(|_| MetadataIndexerConfig {
+        port: remote.metadata_indexer_port,
+        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+    })
 }
 
 fn build_deployer_config(
@@ -240,6 +298,29 @@ fn build_deployer_config(
         });
     }
 
+    if remote.indexer_mode().is_some() {
+        instances.push(aws::InstanceConfig {
+            name: CHAIN_INDEXER_HOST.to_string(),
+            region: regions[0].clone(),
+            instance_type: remote.instance_type.clone(),
+            storage_size: remote.storage_size,
+            storage_class: STORAGE_CLASS.to_string(),
+            binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
+            config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
+            profiling: false,
+        });
+        instances.push(aws::InstanceConfig {
+            name: crate::METADATA_INDEXER_HOST.to_string(),
+            region: regions[0].clone(),
+            instance_type: remote.instance_type.clone(),
+            storage_size: remote.storage_size,
+            storage_class: STORAGE_CLASS.to_string(),
+            binary: METADATA_INDEXER_BINARY_FILE.to_string(),
+            config: METADATA_INDEXER_CONFIG_FILE.to_string(),
+            profiling: false,
+        });
+    }
+
     if args.spammer {
         instances.push(aws::InstanceConfig {
             name: "spammer".to_string(),
@@ -276,6 +357,19 @@ fn port_configs(remote: &RemoteArgs) -> Vec<aws::PortConfig> {
         cidr: "0.0.0.0/0".to_string(),
     }];
 
+    if remote.indexer_mode().is_some() {
+        ports.push(aws::PortConfig {
+            protocol: "tcp".to_string(),
+            port: remote.chain_indexer_port,
+            cidr: "0.0.0.0/0".to_string(),
+        });
+        ports.push(aws::PortConfig {
+            protocol: "tcp".to_string(),
+            port: remote.metadata_indexer_port,
+            cidr: "0.0.0.0/0".to_string(),
+        });
+    }
+
     for cidr in &remote.http_cidrs {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
@@ -289,12 +383,14 @@ fn port_configs(remote: &RemoteArgs) -> Vec<aws::PortConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, port_configs};
+    use super::{build_deployer_config, build_secondaries, port_configs};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs, STORAGE_CLASS, StartupModeConfig,
+        CHAIN_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, IndexerMode, LocalArgs,
+        METADATA_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS, StartupModeConfig,
         VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        generate_local_cluster_material,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
@@ -315,8 +411,8 @@ mod tests {
                 base_http_port: 8080,
                 base_metrics_port: 9090,
                 indexer: false,
-                indexer_port: 8090,
-                sql_port: 8091,
+                chain_indexer_port: 8090,
+                metadata_indexer_port: 8091,
             }),
         }
     }
@@ -332,6 +428,10 @@ mod tests {
             listen_port: 9000,
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
+            indexer: false,
+            indexer_metadata_only: false,
+            chain_indexer_port: 8090,
+            metadata_indexer_port: 8091,
             profiling: true,
             spammer_instance_type: None,
             spammer_storage_size: 25,
@@ -441,5 +541,74 @@ mod tests {
 
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 9000);
+    }
+
+    #[test]
+    fn remote_secondaries_get_shared_chain_indexer_wiring() {
+        let mut args = generate_args();
+        args.secondaries = 1;
+        let mut remote = remote_args();
+        remote.indexer = true;
+        let material = generate_local_cluster_material(args.validators, args.secondaries);
+
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+
+        let indexer = secondaries[0]
+            .config
+            .indexer
+            .as_ref()
+            .expect("secondary should have indexer wiring");
+        assert_eq!(indexer.mode, IndexerMode::Full);
+        assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
+    }
+
+    #[test]
+    fn remote_secondaries_support_metadata_only_mode() {
+        let mut args = generate_args();
+        args.secondaries = 1;
+        let mut remote = remote_args();
+        remote.indexer_metadata_only = true;
+        let material = generate_local_cluster_material(args.validators, args.secondaries);
+
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+
+        let indexer = secondaries[0]
+            .config
+            .indexer
+            .as_ref()
+            .expect("secondary should have indexer wiring");
+        assert_eq!(indexer.mode, IndexerMode::MetadataOnly);
+    }
+
+    #[test]
+    fn remote_deployer_config_includes_shared_indexer_services() {
+        let mut args = generate_args();
+        args.secondaries = 1;
+        let mut remote = remote_args();
+        remote.indexer = true;
+        let validators = vec![validator(0), validator(1), validator(2)];
+        let secondaries = vec![super::GeneratedValidator {
+            public_key_hex: "secondary-0".to_string(),
+            config_name: "secondary-0.yaml".to_string(),
+            config_file: PathBuf::from("/tmp/secondary-0.yaml"),
+            config: validator(0).config,
+        }];
+
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        assert_eq!(config.instances.len(), 6);
+        assert_eq!(config.instances[4].name, "chain-indexer");
+        assert_eq!(config.instances[4].binary, CHAIN_INDEXER_BINARY_FILE);
+        assert_eq!(config.instances[5].name, "metadata-indexer");
+        assert_eq!(config.instances[5].binary, METADATA_INDEXER_BINARY_FILE);
+        assert!(config.ports.iter().any(|port| port.port == 8090));
+        assert!(config.ports.iter().any(|port| port.port == 8091));
     }
 }

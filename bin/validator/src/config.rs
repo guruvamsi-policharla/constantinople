@@ -27,25 +27,30 @@ pub(crate) const fn default_upload_buffer() -> usize {
     1024
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexerMode {
+    #[default]
+    Full,
+    MetadataOnly,
+}
+
 /// Indexer wiring for a secondary validator.
 ///
 /// Primary (voting) validators ignore this section; secondaries with
-/// `enabled = true` upload finalized blocks, transactions, and consensus
-/// certificates to three independent exoware stores:
-///
-/// - `blocks_url`       — BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED (KV).
-/// - `transactions_url` — TX, TX_BY_H (KV).
-/// - `sql_url`          — `block_meta` / `tx_meta` SQL metadata tables.
+/// `mode = full` upload finalized blocks, transactions, and consensus
+/// certificates into the shared `chain-indexer` store. Secondaries with
+/// `mode = metadata_only` upload only the SQL metadata tables (`block_meta`,
+/// `tx_meta`) into that same store.
 ///
 /// The latest-finalized-height cursor that earlier versions of the
 /// indexer wrote to a separate `META` KV family now lives in
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
-    pub enabled: bool,
-    pub blocks_url: String,
-    pub transactions_url: String,
-    pub sql_url: String,
+    #[serde(default)]
+    pub mode: IndexerMode,
+    pub chain_indexer_url: String,
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
 }
@@ -87,7 +92,7 @@ pub struct ValidatorConfig {
     pub metrics_port: u16,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
-    /// validators when `enabled` is true.
+    /// validators when this section is present.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
 }
@@ -188,6 +193,24 @@ fn parse_socket(name: &str, socket: &str) -> SocketAddr {
     socket
         .parse()
         .unwrap_or_else(|_| panic!("failed to parse {name} socket"))
+}
+
+fn resolve_named_http_url(url: &str, hosts_by_name: &HashMap<&str, std::net::IpAddr>) -> String {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return url.to_string();
+    };
+    let (authority, suffix) = match rest.split_once('/') {
+        Some((authority, suffix)) => (authority, format!("/{suffix}")),
+        None => (rest, String::new()),
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return url.to_string();
+    };
+    let Some(ip) = hosts_by_name.get(host) else {
+        return url.to_string();
+    };
+
+    format!("http://{ip}:{port}{suffix}")
 }
 
 fn decode_with_network(
@@ -318,7 +341,7 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
 }
 
 pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConfig {
-    let config = load_validator_config(config_path);
+    let mut config = load_validator_config(config_path);
     let signer = decode_private_key(&config.private_key);
     let self_public_key = signer.public_key();
     let self_name = hex(&self_public_key.encode());
@@ -336,6 +359,11 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .iter()
         .map(|host| (host.name.as_str(), host.ip))
         .collect::<HashMap<_, _>>();
+
+    if let Some(indexer) = config.indexer.as_mut() {
+        indexer.chain_indexer_url =
+            resolve_named_http_url(&indexer.chain_indexer_url, &hosts_by_name);
+    }
 
     let self_ip = hosts_by_name
         .get(self_name.as_str())
@@ -368,8 +396,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig, load_deployer_config,
-        load_local_config,
+        IndexerConfig, IndexerMode, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
+        default_upload_buffer, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -797,6 +825,67 @@ hosts:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);
+    }
+
+    #[test]
+    fn deployer_config_resolves_named_chain_indexer_url() {
+        let cluster = Cluster::new(2, 1);
+        let self_key = &cluster.secondary_keys[0];
+        let primary0_key = &cluster.primary_keys[0];
+        let primary1_key = &cluster.primary_keys[1];
+        let self_name = hex(&self_key.encode());
+        let primary0_name = hex(&primary0_key.encode());
+        let primary1_name = hex(&primary1_key.encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let hosts_path = temp_path("validator-hosts", ".yaml");
+
+        let mut config = cluster.secondary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            vec![bootstrapper_entry(primary0_key)],
+        );
+        config.indexer = Some(IndexerConfig {
+            mode: IndexerMode::MetadataOnly,
+            chain_indexer_url: "http://chain-indexer:8090".to_string(),
+            upload_buffer: default_upload_buffer(),
+        });
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &hosts_path,
+            format!(
+                r#"monitoring: 10.0.0.1
+hosts:
+  - name: "{primary0_name}"
+    region: us-east-1
+    ip: 203.0.113.1
+  - name: "{primary1_name}"
+    region: us-west-2
+    ip: 203.0.113.2
+  - name: "{self_name}"
+    region: eu-west-1
+    ip: 203.0.113.3
+  - name: "chain-indexer"
+    region: us-east-1
+    ip: 203.0.113.9
+"#,
+            ),
+        )
+        .expect("hosts should write");
+
+        let loaded = load_deployer_config(&hosts_path, &config_path);
+
+        let indexer = loaded
+            .indexer
+            .expect("secondary should keep indexer config");
+        assert_eq!(indexer.mode, IndexerMode::MetadataOnly);
+        assert_eq!(indexer.chain_indexer_url, "http://203.0.113.9:8090");
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(hosts_path);
     }
 
     /// Secondary validator: empty `dkg_share` must decode to `None`.

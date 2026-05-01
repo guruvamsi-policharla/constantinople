@@ -18,8 +18,24 @@ spammer-graviton-binary: build-graviton-image
     -e OUTPUT_NAME=spammer \
     constantinople-builder:graviton-local
 
+# Build the ARM64 chain-indexer binary into deploy/
+chain-indexer-graviton-binary: build-graviton-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=chain-indexer \
+    -e OUTPUT_NAME=chain-indexer \
+    constantinople-builder:graviton-local
+
+# Build the ARM64 metadata-indexer binary into deploy/
+metadata-indexer-graviton-binary: build-graviton-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=metadata-indexer \
+    -e OUTPUT_NAME=metadata-indexer \
+    constantinople-builder:graviton-local
+
 # Build all ARM64 binaries into deploy/
-graviton-binaries: validator-graviton-binary spammer-graviton-binary
+graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary
 
 # Build the Intel/C8i Docker builder image
 build-intel-image:
@@ -41,5 +57,21 @@ spammer-intel-binary: build-intel-image
     -e OUTPUT_NAME=spammer \
     constantinople-builder:intel-local
 
+# Build the Intel chain-indexer binary into deploy/
+chain-indexer-intel-binary: build-intel-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=chain-indexer \
+    -e OUTPUT_NAME=chain-indexer \
+    constantinople-builder:intel-local
+
+# Build the Intel metadata-indexer binary into deploy/
+metadata-indexer-intel-binary: build-intel-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=metadata-indexer \
+    -e OUTPUT_NAME=metadata-indexer \
+    constantinople-builder:intel-local
+
 # Build all Intel binaries into deploy/
-intel-binaries: validator-intel-binary spammer-intel-binary
+intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary

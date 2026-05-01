@@ -3,7 +3,7 @@
 mod local;
 mod remote;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use commonware_codec::Encode;
 use commonware_cryptography::{
     Signer,
@@ -33,7 +33,17 @@ const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
 const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
+const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
+const CHAIN_INDEXER_CONFIG_FILE: &str = "chain-indexer.yaml";
+const CHAIN_INDEXER_DATA_DIR: &str = "chain-indexer";
+const CHAIN_INDEXER_HOST: &str = "chain-indexer";
+const METADATA_INDEXER_BINARY_FILE: &str = "metadata-indexer";
+const METADATA_INDEXER_CONFIG_FILE: &str = "metadata-indexer.yaml";
+const METADATA_INDEXER_HOST: &str = "metadata-indexer";
+const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
+const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
+const DEFAULT_INDEXER_UPLOAD_BUFFER: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,17 +130,22 @@ pub(crate) struct LocalArgs {
     /// (`block_meta` / `tx_meta` tables).
     #[arg(long, default_value_t = false)]
     indexer: bool,
-    /// Port for the local exoware simulator launched by `--indexer`.
-    #[arg(long, default_value_t = 8090)]
-    indexer_port: u16,
-    /// Port for the local SQL server (Constantinople's `block_meta`
-    /// service) launched by `--indexer`. The explorer reads from this
+    /// Port for the local `chain-indexer` store launched by `--indexer`.
+    #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
+    chain_indexer_port: u16,
+    /// Port for the local `metadata-indexer` service launched by `--indexer`.
+    /// The explorer reads from this
     /// port via `VITE_SQL_URL`.
-    #[arg(long, default_value_t = 8091)]
-    sql_port: u16,
+    #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
+    metadata_indexer_port: u16,
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("indexer_mode")
+        .args(["indexer", "indexer_metadata_only"])
+        .multiple(false)
+))]
 pub(crate) struct RemoteArgs {
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
@@ -150,6 +165,19 @@ pub(crate) struct RemoteArgs {
     http_port: u16,
     #[arg(long = "http-cidr", value_delimiter = ',')]
     http_cidrs: Vec<String>,
+    /// Launch the shared `chain-indexer` + `metadata-indexer` stack.
+    #[arg(long, default_value_t = false)]
+    indexer: bool,
+    /// Launch the shared indexer stack, but have secondaries upload only SQL
+    /// metadata (`block_meta`, `tx_meta`) into the shared `chain-indexer`.
+    #[arg(long = "indexer-metadata-only", default_value_t = false)]
+    indexer_metadata_only: bool,
+    /// Port for the shared `chain-indexer` store.
+    #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
+    chain_indexer_port: u16,
+    /// Port for the shared `metadata-indexer` query/stream service.
+    #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
+    metadata_indexer_port: u16,
     #[arg(long, default_value_t = false)]
     profiling: bool,
     /// Instance type for the spammer (defaults to --instance-type).
@@ -183,6 +211,14 @@ pub(crate) struct SpammerConfig {
 
 const fn default_rounds_jitter() -> u32 {
     1
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IndexerMode {
+    #[default]
+    Full,
+    MetadataOnly,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -219,8 +255,9 @@ pub(crate) struct ValidatorConfig {
     max_pool_bytes: usize,
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
-    /// `--indexer` flag is enabled on the local deploy job. Primaries always
-    /// leave this unset; the validator runtime ignores it for primaries.
+    /// local or remote deploy job enables the shared `chain-indexer` stack.
+    /// Primaries always leave this unset; the validator runtime ignores it for
+    /// primaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indexer: Option<IndexerConfig>,
 }
@@ -228,17 +265,26 @@ pub(crate) struct ValidatorConfig {
 /// Indexer wiring serialized into a secondary validator's YAML.
 ///
 /// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
-/// local deploy currently only spins up a single exoware simulator and routes
-/// all three URLs to the same backend; routing-by-family in the indexer
-/// client keeps the data correct because key prefixes are disjoint (KV
-/// families occupy `0x10..=0x6F`, SQL table prefixes occupy `0x00..=0x0F`).
+/// shared `chain-indexer` store backs both full-data KV uploads and SQL
+/// metadata uploads; `mode` decides whether a secondary emits all indexed data
+/// or just the metadata tables.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
-    pub enabled: bool,
-    pub blocks_url: String,
-    pub transactions_url: String,
-    pub sql_url: String,
+    pub mode: IndexerMode,
+    pub chain_indexer_url: String,
     pub upload_buffer: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChainIndexerConfig {
+    pub port: u16,
+    pub data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MetadataIndexerConfig {
+    pub port: u16,
+    pub chain_indexer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -278,6 +324,18 @@ impl ClusterMaterial {
             .iter()
             .map(|pk| hex(&pk.encode()))
             .collect()
+    }
+}
+
+impl RemoteArgs {
+    pub(crate) const fn indexer_mode(&self) -> Option<IndexerMode> {
+        if self.indexer_metadata_only {
+            return Some(IndexerMode::MetadataOnly);
+        }
+        if self.indexer {
+            return Some(IndexerMode::Full);
+        }
+        None
     }
 }
 
@@ -465,5 +523,49 @@ mod tests {
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
         );
+    }
+
+    #[test]
+    fn remote_parses_metadata_only_indexer_mode() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--secondaries",
+            "1",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+            "--indexer-metadata-only",
+            "--chain-indexer-port",
+            "18090",
+            "--metadata-indexer-port",
+            "18091",
+        ])
+        .expect("remote invocation should parse");
+
+        let Command::Generate(generate) = cli.command;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+
+        assert!(remote.indexer_mode().is_some());
+        assert!(!remote.indexer);
+        assert!(remote.indexer_metadata_only);
+        assert_eq!(remote.chain_indexer_port, 18_090);
+        assert_eq!(remote.metadata_indexer_port, 18_091);
     }
 }

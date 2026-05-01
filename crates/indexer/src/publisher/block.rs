@@ -40,11 +40,11 @@ use tracing::warn;
 
 /// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
 ///
-/// Holds one sender per backing store. Cloning the reporter is cheap; the
-/// senders are reference-counted MPSC channels.
+/// Holds one sender per active backing store. Cloning the reporter is cheap;
+/// the senders are reference-counted MPSC channels.
 pub struct BlockReporter<H, P> {
-    blocks: mpsc::Sender<UploadBatch>,
-    transactions: mpsc::Sender<UploadBatch>,
+    blocks: Option<mpsc::Sender<UploadBatch>>,
+    transactions: Option<mpsc::Sender<UploadBatch>>,
     sql: mpsc::Sender<SqlBatch>,
     _marker: PhantomData<fn() -> (H, P)>,
 }
@@ -62,8 +62,18 @@ impl<H, P> BlockReporter<H, P> {
         sql: mpsc::Sender<SqlBatch>,
     ) -> Self {
         Self {
-            blocks,
-            transactions,
+            blocks: Some(blocks),
+            transactions: Some(transactions),
+            sql,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Build a reporter that uploads only SQL metadata rows.
+    pub const fn metadata_only(sql: mpsc::Sender<SqlBatch>) -> Self {
+        Self {
+            blocks: None,
+            transactions: None,
             sql,
             _marker: PhantomData,
         }
@@ -108,29 +118,29 @@ where
                 // after each uploader's clone has been acknowledged. If a
                 // batch is empty (e.g. a block with no transactions) the
                 // dispatcher fulfills its clone immediately.
-                let ack_blocks = ack.clone();
-                let ack_transactions = ack.clone();
-                let ack_sql = ack;
-
-                dispatch_batch(
-                    &self.blocks,
-                    UploadBatch {
-                        rows: blocks,
-                        ack: Some(ack_blocks),
-                    },
-                );
-                dispatch_batch(
-                    &self.transactions,
-                    UploadBatch {
-                        rows: transactions,
-                        ack: Some(ack_transactions),
-                    },
-                );
+                if let Some(blocks_tx) = &self.blocks {
+                    dispatch_batch(
+                        blocks_tx,
+                        UploadBatch {
+                            rows: blocks,
+                            ack: Some(ack.clone()),
+                        },
+                    );
+                }
+                if let Some(transactions_tx) = &self.transactions {
+                    dispatch_batch(
+                        transactions_tx,
+                        UploadBatch {
+                            rows: transactions,
+                            ack: Some(ack.clone()),
+                        },
+                    );
+                }
                 dispatch_sql_batch(
                     &self.sql,
                     SqlBatch {
                         rows: sql,
-                        ack: Some(ack_sql),
+                        ack: Some(ack),
                     },
                 );
             }

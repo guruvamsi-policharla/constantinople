@@ -411,3 +411,42 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
 
     drop(uploaders);
 }
+
+#[tokio::test]
+async fn metadata_only_block_reporter_writes_only_sql_rows() {
+    let stores = spawn_stores().await;
+    let (sql, _sql_join) =
+        constantinople_indexer::publisher::spawn_sql_uploader(stores.sql.clone(), 16);
+    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::metadata_only(sql);
+
+    let block = build_block(9, 2, 0x51A9);
+    let (ack, waiter) = Exact::handle();
+    reporter.report(Update::Block(block, ack)).await;
+    waiter.await.expect("uploader must acknowledge");
+
+    assert_eq!(count_all(&stores.blocks).await, 0);
+    assert_eq!(count_all(&stores.transactions).await, 0);
+
+    let ctx = SessionContext::new();
+    build_meta_schema(stores.sql.clone())
+        .expect("build schema")
+        .register_all(&ctx)
+        .expect("register schema");
+
+    let block_rows = ctx
+        .sql(&format!(
+            "SELECT {BLOCK_META_HEIGHT} FROM {BLOCK_META_TABLE} ORDER BY {BLOCK_META_HEIGHT}"
+        ))
+        .await
+        .expect("build query")
+        .collect()
+        .await
+        .expect("run query");
+    let height = block_rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("height should be u64")
+        .value(0);
+    assert_eq!(height, 9);
+}

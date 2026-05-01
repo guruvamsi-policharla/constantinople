@@ -85,9 +85,9 @@ cargo run --release --bin constantinople-spammer -- \
 
 ### Local Deployment with Indexer + Explorer
 
-Add `--indexer` (a flag on the `local` subcommand) to spin up the exoware
-simulator backing the indexer **and** the React explorer dev server alongside
-the validators:
+Add `--indexer` (a flag on the `local` subcommand) to spin up the shared
+`chain-indexer` store, the `metadata-indexer` query/stream service, and the
+React explorer dev server alongside the validators:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -104,11 +104,13 @@ indexer; primaries leave their `indexer:` block unset.
 
 The printed `mprocs` command list grows by two entries:
 
-- `cargo run -p constantinople-indexer --bin indexer -- --port 8090 --data-dir ./local/indexer-data`
-  — the simulator-backed indexer store. `--indexer-port` overrides the port.
-- `VITE_INDEXER_URL=http://127.0.0.1:8090 npm --prefix explorer run dev`
+- `cargo run -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
+  — the simulator-backed shared store. `--chain-indexer-port` overrides the port.
+- `cargo run -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
+  — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
+- `VITE_SQL_URL=http://127.0.0.1:8091 npm --prefix explorer run dev`
   — the [React explorer](../../explorer/README.md), which subscribes to the
-  indexer's `TX_BY_H` family and streams new transactions live.
+  metadata service and streams new finalized blocks live.
 
 End-to-end "spin everything up" with the spammer for live transaction flow:
 
@@ -130,7 +132,7 @@ arrive in real time.
 
 ## Remote Deployment
 
-`generate remote` writes the deployment bundle, but it does not build the validator binary. Use
+`generate remote` writes the deployment bundle, but it does not build the deployable binaries. Use
 `--output-dir ./deploy` if you want to use the bundled `just` targets unchanged.
 
 Generate the remote bundle:
@@ -245,6 +247,91 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer-instance-type c8g.large \
   ...
 ```
+
+### Remote Deployment with Indexer Stack
+
+Add `--indexer` to launch the shared remote indexer stack:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --secondaries 2 \
+  --output-dir ./deploy \
+  remote \
+  --indexer \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./docker/dashboard.json
+```
+
+This requires `--secondaries >= 1` because only secondaries upload to the
+shared `chain-indexer` store. Primaries still omit their `indexer:` block.
+
+The generated bundle now also includes:
+
+- `chain-indexer.yaml` — deployer config for the shared store instance.
+- `metadata-indexer.yaml` — deployer config for the metadata query/stream service.
+- two extra deployer instances in `config.yaml`: `chain-indexer` and `metadata-indexer`.
+
+Topology and defaults:
+
+- `chain-indexer` is a single shared simulator-backed store instance.
+- `metadata-indexer` is a single shared SQL query/stream service layered on that store.
+- both shared services land in the first remote region.
+- `chain-indexer` listens on port `8090` by default.
+- `metadata-indexer` listens on port `8091` by default.
+- even in metadata-only mode, the shared `chain-indexer` store is still required because the
+  metadata service reads from that backing store.
+
+The deployer opens both shared-service ports globally because `commonware-deployer`'s port list is
+deployment-wide rather than per-instance.
+
+Build every deployable binary before creating the deployment. For Graviton instances:
+
+```sh
+just graviton-binaries
+```
+
+For Intel instances:
+
+```sh
+just intel-binaries
+```
+
+Those aggregate targets now write:
+
+- `deploy/validator`
+- `deploy/spammer` when `--spammer` is enabled
+- `deploy/chain-indexer`
+- `deploy/metadata-indexer`
+
+### Remote Metadata-Only Mode
+
+Add `--indexer-metadata-only` instead of `--indexer` when secondaries should publish only the SQL
+metadata tables (`block_meta`, `tx_meta`) and skip the full KV block / transaction / certificate
+path:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --secondaries 2 \
+  --output-dir ./deploy \
+  remote \
+  --indexer-metadata-only \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./docker/dashboard.json
+```
+
+This is a real runtime split, not just a deploy-time flag: secondary validators only spawn the SQL
+metadata uploader in this mode. The shared `chain-indexer` and `metadata-indexer` services are
+still deployed because the metadata service reads from the shared store.
 
 ## Secondary Validators
 
