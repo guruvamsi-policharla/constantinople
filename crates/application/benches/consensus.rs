@@ -10,7 +10,7 @@ use commonware_cryptography::{
     ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::{Rayon, Sequential};
+use commonware_parallel::Rayon;
 use commonware_runtime::{
     Error as RuntimeError, Metrics as _, Storage as _, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
@@ -65,9 +65,10 @@ type TestStateDb = fixed::Db<
     Account,
     TestHasher,
     EightCap,
+    Rayon,
 >;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
-type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher>;
+type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
 type TestTransactionDatabase = Arc<AsyncRwLock<TestTransactionDb>>;
 type TestDatabases = (TestStateDatabase, TestTransactionDatabase);
 type TestBlock = SealedBlock<TestCommitment, TestPublicKey, TestHasher>;
@@ -372,11 +373,18 @@ struct Fixture {
 impl Fixture {
     async fn new(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
         let generated = GeneratedTransactions::new(transaction_count);
-        let databases = init_databases(runtime.clone(), prefix, &generated.accounts).await;
+        let strategy = bench_strategy(&runtime);
+        let databases = init_databases(
+            runtime.clone(),
+            prefix,
+            &generated.accounts,
+            strategy.clone(),
+        )
+        .await;
         let leader = generated.leader.clone();
         let parent = parent_block(leader.clone(), &databases).await;
         let context = block_context(leader.clone());
-        let app = new_application(runtime, leader, &databases).await;
+        let app = new_application(runtime, leader, &databases, strategy).await;
 
         Self {
             app,
@@ -493,12 +501,13 @@ async fn init_databases(
     runtime: RuntimeContext,
     prefix: &str,
     accounts: &[(AccountKey<TestPublicKey>, Account)],
+    strategy: Rayon,
 ) -> TestDatabases {
     let databases = TestDatabases::init(
         runtime.clone(),
         (
-            state_db_config(&runtime, prefix),
-            transaction_db_config(prefix),
+            state_db_config(&runtime, prefix, strategy.clone()),
+            transaction_db_config(prefix, strategy),
         ),
     )
     .await;
@@ -523,6 +532,7 @@ async fn new_application(
     runtime: RuntimeContext,
     leader: TestPublicKey,
     databases: &TestDatabases,
+    strategy: Rayon,
 ) -> TestApplication {
     let (_, transaction_target) = databases.committed_targets().await;
     let genesis_transactions_target =
@@ -533,11 +543,15 @@ async fn new_application(
 
     TestApplication::new(
         runtime.with_label("application"),
-        Rayon::with_pool(runtime.create_thread_pool(NZUsize!(8)).unwrap()),
+        strategy,
         leader,
         TRANSACTION_NAMESPACE,
         genesis_transactions_target,
     )
+}
+
+fn bench_strategy(runtime: &RuntimeContext) -> Rayon {
+    Rayon::with_pool(runtime.create_thread_pool(NZUsize!(8)).unwrap())
 }
 
 async fn parent_block(leader: TestPublicKey, databases: &TestDatabases) -> TestBlock {
@@ -564,7 +578,11 @@ const fn block_context(leader: TestPublicKey) -> TestConsensusContext {
     }
 }
 
-fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightCap> {
+fn state_db_config(
+    runtime: &RuntimeContext,
+    prefix: &str,
+    strategy: Rayon,
+) -> FixedConfig<EightCap, Rayon> {
     let page_cache = CacheRef::from_pooler(
         &runtime.with_label("state_page_cache"),
         PAGE_CACHE_PAGE_SIZE,
@@ -577,7 +595,7 @@ fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightC
             metadata_partition: format!("{prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
-            strategy: Sequential,
+            strategy,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -590,11 +608,11 @@ fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightC
     }
 }
 
-fn transaction_db_config(prefix: &str) -> keyless_fixed::CompactConfig {
+fn transaction_db_config(prefix: &str, strategy: Rayon) -> keyless_fixed::CompactConfig<Rayon> {
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{prefix}-transactions-merkle"),
-            strategy: Sequential,
+            strategy,
         },
         commit_codec_config: (),
     }

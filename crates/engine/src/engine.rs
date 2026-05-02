@@ -37,7 +37,7 @@ use commonware_glue::stateful::{
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
-use commonware_parallel::{Sequential, Strategy};
+use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
     buffer::paged::CacheRef, spawn_cell,
@@ -46,7 +46,6 @@ use commonware_storage::{
     archive::immutable,
     journal::contiguous::fixed::Config as FixedJournalConfig,
     merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
-    mmr,
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
@@ -191,9 +190,8 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H>,
-    transaction_resolver:
-        crate::compact_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, TransactionDb<E, H>, H>,
+    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, T>,
+    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, T>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
@@ -241,7 +239,7 @@ where
 
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey, T> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -253,7 +251,8 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey>> + Send + 'static {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey, T>> + Send + 'static
+    {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
@@ -278,7 +277,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, C::PublicKey, _, _, H>::new(
+            StateResolverActor::<_, C::PublicKey, _, _, H, T>::new(
                 context.with_label("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
@@ -294,29 +293,22 @@ where
                     max_serve_ops: NZU64!(4096),
                 },
             );
-        let (transaction_resolver, transaction_sync_resolver) = crate::compact_resolver::Actor::<
-            _,
-            C::PublicKey,
-            _,
-            _,
-            _,
-            TransactionDb<E, H>,
-            H,
-        >::new(
-            context.with_label("transaction_resolver"),
-            crate::compact_resolver::Config {
-                peer_provider: config.manager.clone(),
-                blocker: config.blocker.clone(),
-                database: None,
-                mailbox_size: MAILBOX_SIZE,
-                me: Some(config.signer.public_key()),
-                initial: STATE_SYNC_INITIAL,
-                timeout: STATE_SYNC_TIMEOUT,
-                fetch_retry_timeout: STATE_SYNC_RETRY,
-                priority_requests: false,
-                priority_responses: false,
-            },
-        );
+        let (transaction_resolver, transaction_sync_resolver) =
+            TransactionResolverActor::<_, C::PublicKey, _, _, H, T>::new(
+                context.with_label("transaction_resolver"),
+                crate::compact_resolver::Config {
+                    peer_provider: config.manager.clone(),
+                    blocker: config.blocker.clone(),
+                    database: None,
+                    mailbox_size: MAILBOX_SIZE,
+                    me: Some(config.signer.public_key()),
+                    initial: STATE_SYNC_INITIAL,
+                    timeout: STATE_SYNC_TIMEOUT,
+                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    priority_requests: false,
+                    priority_responses: false,
+                },
+            );
 
         let (finalizations_by_height, finalized_blocks) = futures::join!(
             init_finalizations_archive::<E, H, C::PublicKey, V>(
@@ -374,15 +366,16 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
-        let transaction_db_config = transaction_db_config(&config.partition_prefix);
-        let genesis_transaction_db = TransactionDb::<E, H>::init(
+        let transaction_db_config =
+            transaction_db_config(&config.partition_prefix, config.strategy.clone());
+        let genesis_transaction_db = TransactionDb::<E, H, T>::init(
             context.with_label("genesis_transactions"),
             transaction_db_config.clone(),
         )
         .await
         .expect("transaction history db must initialize for genesis target");
         let genesis_transactions_target =
-            <TransactionDb<E, H> as ManagedDb<E>>::sync_target(&genesis_transaction_db).await;
+            <TransactionDb<E, H, T> as ManagedDb<E>>::sync_target(&genesis_transaction_db).await;
 
         let application = Application::new(
             context.with_label("application"),
@@ -396,7 +389,11 @@ where
             StatefulConfig {
                 app: application,
                 db_config: (
-                    state_db_config(&config.partition_prefix, &storage_page_cache),
+                    state_db_config(
+                        &config.partition_prefix,
+                        &storage_page_cache,
+                        config.strategy.clone(),
+                    ),
                     transaction_db_config,
                 ),
                 input_provider: config.input,
@@ -653,14 +650,21 @@ where
     archive
 }
 
-fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig<EightCap> {
+fn state_db_config<T>(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    strategy: T,
+) -> FixedConfig<EightCap, T>
+where
+    T: Strategy,
+{
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
-            strategy: Sequential,
+            strategy,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -673,11 +677,14 @@ fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig
     }
 }
 
-fn transaction_db_config(partition_prefix: &str) -> keyless_fixed::CompactConfig {
+fn transaction_db_config<T>(partition_prefix: &str, strategy: T) -> keyless_fixed::CompactConfig<T>
+where
+    T: Strategy,
+{
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{partition_prefix}-transactions-merkle"),
-            strategy: Sequential,
+            strategy,
         },
         commit_codec_config: (),
     }

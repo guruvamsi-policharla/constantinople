@@ -346,7 +346,7 @@ where
     type SigningScheme = S;
     type Context = Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, P, EightCap>;
+    type Databases = Databases<E, H, P, EightCap, St>;
     type InputProvider = I;
 
     /// Returns the sync targets required to fetch the block's state.

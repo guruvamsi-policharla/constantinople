@@ -1,10 +1,7 @@
 //! Block verification pipeline helpers.
 
 use super::{
-    db::{
-        StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
-        finalize_execution,
-    },
+    db::{MerkleizedDatabases, StateBatch, TransactionBatch, apply_changeset, finalize_execution},
     execution::{BlockExecution, ExecutionTimings, finalize_child_execution},
     utils::load_accounts,
 };
@@ -225,8 +222,8 @@ where
     AccountKey::from_bytes(bytes.freeze())
 }
 
-async fn load_transfer_state<E, H, P>(
-    batch: &StateBatch<E, H, P, EightCap>,
+async fn load_transfer_state<E, H, P, St>(
+    batch: &StateBatch<E, H, P, EightCap, St>,
     transfers: &[PreparedTransfer<P, H>],
 ) -> core::result::Result<
     Option<crate::processor::state::State<P>>,
@@ -236,6 +233,7 @@ where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
+    St: Strategy,
 {
     let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
@@ -267,14 +265,15 @@ where
     )
 }
 
-fn apply_transfer_digests<E, H, P>(
-    batch: TransactionBatch<E, H>,
+fn apply_transfer_digests<E, H, P, St>(
+    batch: TransactionBatch<E, H, St>,
     transfers: &[PreparedTransfer<P, H>],
-) -> TransactionBatch<E, H>
+) -> TransactionBatch<E, H, St>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
+    St: Strategy,
 {
     transfers
         .iter()
@@ -283,12 +282,12 @@ where
 
 /// Executes and merkleizes a block body for verification.
 pub(super) async fn execute_block<E, C, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap>,
-    transaction_batch: TransactionBatch<E, H>,
+    state_batches: StateBatch<E, H, P, EightCap, St>,
+    transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     parent: &SealedBlock<C, P, H>,
     prepared: &Prepared<P, H>,
-) -> Result<BlockExecution<E, H, P>>
+) -> Result<BlockExecution<E, H, P, St>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -327,15 +326,12 @@ where
 
 /// Executes and merkleizes a certified block body.
 pub(super) async fn apply_block<E, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap>,
-    transaction_batch: TransactionBatch<E, H>,
+    state_batches: StateBatch<E, H, P, EightCap, St>,
+    transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     transactions_floor: mmr::Location,
     prepared: &Prepared<P, H>,
-) -> Result<(
-    StateMerkleized<E, H, P, EightCap>,
-    TransactionMerkleized<E, H>,
-)>
+) -> Result<MerkleizedDatabases<E, H, P, St>>
 where
     E: Storage + Clock + Metrics,
     P: PublicKey,
@@ -363,15 +359,16 @@ pub(super) fn reject(height: u64, reason: &'static str) {
 }
 
 /// Returns whether execution output matches the proposed header.
-pub(super) fn commitments_match<E, C, P, H>(
+pub(super) fn commitments_match<E, C, P, H, St>(
     header: &Header<C, H::Digest, P>,
-    execution: &BlockExecution<E, H, P>,
+    execution: &BlockExecution<E, H, P, St>,
 ) -> bool
 where
     E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    St: Strategy,
 {
     if execution.state.root() != header.state_root {
         warn!(
