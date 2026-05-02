@@ -10,8 +10,8 @@ use axum::{
 };
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
+use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
-use commonware_utils::from_hex;
 use constantinople_primitives::{Account, SignedTransaction, verify_transaction_chunks};
 use rand_core::OsRng;
 use std::sync::Arc;

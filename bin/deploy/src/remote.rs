@@ -10,7 +10,7 @@ use crate::{
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
-use commonware_utils::hex;
+use commonware_formatting::hex;
 use std::{
     fs,
     path::{Path, PathBuf},

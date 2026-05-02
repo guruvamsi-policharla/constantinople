@@ -21,6 +21,7 @@ constantinople-mempool.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography = { workspace = true, features = ["sha2-asm"] }
 commonware-deployer.workspace = true
+commonware-formatting.workspace = true
 commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 commonware-utils.workspace = true

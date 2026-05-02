@@ -582,7 +582,6 @@ impl<F: Family, D: Digest> Handler<F, D> {
 }
 
 impl<F: Family, D: Digest> commonware_resolver::Consumer for Handler<F, D> {
-    type Failure = ();
     type Key = Request<F, D>;
     type Value = bytes::Bytes;
 
@@ -598,8 +597,6 @@ impl<F: Family, D: Digest> commonware_resolver::Consumer for Handler<F, D> {
             )
             .await
     }
-
-    async fn failed(&mut self, _: Self::Key, _: Self::Failure) {}
 }
 
 impl<F: Family, D: Digest> p2p::Producer for Handler<F, D> {

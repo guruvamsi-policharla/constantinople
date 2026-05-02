@@ -6,7 +6,7 @@ use crate::{
     ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
-use commonware_utils::hex;
+use commonware_formatting::hex;
 use std::{
     fs,
     path::{Path, PathBuf},

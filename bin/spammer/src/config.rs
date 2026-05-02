@@ -7,7 +7,7 @@
 
 use commonware_cryptography::ed25519;
 use commonware_deployer::aws::Hosts;
-use commonware_utils::from_hex;
+use commonware_formatting::from_hex;
 use constantinople_mempool::webserver::client::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
@@ -146,7 +146,7 @@ mod tests {
     fn validator_host_accepted() {
         use commonware_codec::Encode;
         use commonware_cryptography::Signer;
-        use commonware_utils::hex;
+        use commonware_formatting::hex;
 
         let key = ed25519::PrivateKey::from_seed(0);
         let name = hex(&key.public_key().encode());
@@ -177,7 +177,7 @@ validators:
     fn hosts_filter_excludes_secondaries_when_allowed_set_given() {
         use commonware_codec::Encode;
         use commonware_cryptography::Signer;
-        use commonware_utils::hex;
+        use commonware_formatting::hex;
 
         let primary = ed25519::PrivateKey::from_seed(0).public_key();
         let secondary = ed25519::PrivateKey::from_seed(1_000_000).public_key();

@@ -10,8 +10,9 @@ use commonware_cryptography::{
     ed25519,
 };
 use commonware_deployer::aws::Hosts;
+use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::{NZU32, from_hex, hex};
+use commonware_utils::NZU32;
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr, path::Path};
 
@@ -408,7 +409,8 @@ mod tests {
         },
         ed25519,
     };
-    use commonware_utils::{N3f1, TryCollect, hex};
+    use commonware_formatting::hex;
+    use commonware_utils::{N3f1, TryCollect};
     use std::{
         collections::BTreeMap,
         fs,

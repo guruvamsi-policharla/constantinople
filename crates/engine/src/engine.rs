@@ -37,9 +37,9 @@ use commonware_glue::stateful::{
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
-use commonware_parallel::{Strategy, ThreadPool};
+use commonware_parallel::{Sequential, Strategy};
 use commonware_runtime::{
-    BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage, ThreadPooler,
+    BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
@@ -175,7 +175,7 @@ where
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, T, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
+    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -222,7 +222,7 @@ where
 
 impl<E, C, M, B, H, V, L, T, I, BV, O> Engine<E, C, M, B, H, V, L, T, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network + ThreadPooler,
+    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -270,7 +270,6 @@ where
             PAGE_CACHE_PAGE_SIZE,
             PAGE_CACHE_CAPACITY,
         );
-        let merkle_thread_pool = qmdb_merkle_thread_pool(&context, &config.strategy);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
         let scheme =
@@ -375,8 +374,7 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
-        let transaction_db_config =
-            transaction_db_config(&config.partition_prefix, merkle_thread_pool.as_ref());
+        let transaction_db_config = transaction_db_config(&config.partition_prefix);
         let genesis_transaction_db = TransactionDb::<E, H>::init(
             context.with_label("genesis_transactions"),
             transaction_db_config.clone(),
@@ -398,11 +396,7 @@ where
             StatefulConfig {
                 app: application,
                 db_config: (
-                    state_db_config(
-                        &config.partition_prefix,
-                        &storage_page_cache,
-                        merkle_thread_pool.as_ref(),
-                    ),
+                    state_db_config(&config.partition_prefix, &storage_page_cache),
                     transaction_db_config,
                 ),
                 input_provider: config.input,
@@ -659,37 +653,14 @@ where
     archive
 }
 
-fn qmdb_merkle_thread_pool<E, T>(context: &E, strategy: &T) -> Option<ThreadPool>
-where
-    E: ThreadPooler,
-    T: Strategy,
-{
-    let parallelism = strategy.parallelism_hint();
-    if parallelism <= 1 {
-        return None;
-    }
-
-    let concurrency = NonZero::new(parallelism).expect("parallelism hint must be non-zero");
-    Some(
-        context
-            .with_label("qmdb_merkle")
-            .create_thread_pool(concurrency)
-            .expect("failed to create QMDB merkleization thread pool"),
-    )
-}
-
-fn state_db_config(
-    partition_prefix: &str,
-    page_cache: &CacheRef,
-    thread_pool: Option<&ThreadPool>,
-) -> FixedConfig<EightCap> {
+fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig<EightCap> {
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
-            thread_pool: thread_pool.cloned(),
+            strategy: Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -702,14 +673,11 @@ fn state_db_config(
     }
 }
 
-fn transaction_db_config(
-    partition_prefix: &str,
-    thread_pool: Option<&ThreadPool>,
-) -> keyless_fixed::CompactConfig {
+fn transaction_db_config(partition_prefix: &str) -> keyless_fixed::CompactConfig {
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{partition_prefix}-transactions-merkle"),
-            thread_pool: thread_pool.cloned(),
+            strategy: Sequential,
         },
         commit_codec_config: (),
     }

@@ -10,7 +10,7 @@ use commonware_cryptography::{
     ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Rayon;
+use commonware_parallel::{Rayon, Sequential};
 use commonware_runtime::{
     Error as RuntimeError, Metrics as _, Storage as _, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
@@ -577,7 +577,7 @@ fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightC
             metadata_partition: format!("{prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
-            thread_pool: None,
+            strategy: Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -594,7 +594,7 @@ fn transaction_db_config(prefix: &str) -> keyless_fixed::CompactConfig {
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{prefix}-transactions-merkle"),
-            thread_pool: None,
+            strategy: Sequential,
         },
         commit_codec_config: (),
     }

@@ -126,7 +126,7 @@ where
 mod test {
     use super::*;
     use commonware_cryptography::{Hasher, sha256};
-    use commonware_utils::hex;
+    use commonware_formatting::hex;
 
     #[derive(core::fmt::Debug, Clone, PartialEq, Eq)]
     #[repr(transparent)]

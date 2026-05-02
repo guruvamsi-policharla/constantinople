@@ -3,7 +3,8 @@
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::PublicKey;
-use commonware_utils::{Array, Span, hex};
+use commonware_formatting::hex;
+use commonware_utils::{Array, Span};
 use core::{marker::PhantomData, ops::Deref};
 use derive_more::{Debug, Display};
 

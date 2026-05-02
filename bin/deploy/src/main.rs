@@ -13,8 +13,9 @@ use commonware_cryptography::{
     },
     ed25519,
 };
+use commonware_formatting::hex;
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, TryCollect, hex};
+use commonware_utils::{N3f1, TryCollect};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{

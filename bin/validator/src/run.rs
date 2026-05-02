@@ -16,6 +16,7 @@ use commonware_cryptography::{
     ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
 };
+use commonware_formatting::hex;
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
@@ -23,7 +24,7 @@ use commonware_runtime::{
     Metrics as _, Quota, Runner as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
-use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
+use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
