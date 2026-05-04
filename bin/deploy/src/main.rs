@@ -99,12 +99,11 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
-    /// Maximum nonce rounds the spammer signs per submitted batch. `1`
-    /// (the default) keeps the original lockstep behavior; values > 1
-    /// randomize each submission's `num_rounds` in `1..=N`, which gives the
-    /// indexer a less monotonous block-size stream to display.
-    #[arg(long, default_value_t = 1)]
-    spammer_rounds_jitter: u32,
+    /// Fractional account-count jitter per spammer batch.
+    ///
+    /// `0.2` submits `spammer_accounts..=spammer_accounts + 20%` txs.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    spammer_accounts_jitter: f64,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -203,15 +202,21 @@ pub(crate) struct SpammerConfig {
     /// the spammer target only primaries.
     #[serde(default)]
     pub primary_validators: Vec<String>,
-    /// Maximum nonce rounds per submitted batch. Mirrors
-    /// `constantinople-spammer --rounds-jitter`. Defaults to 1 to preserve
-    /// the original lockstep behavior on older config files.
-    #[serde(default = "default_rounds_jitter")]
-    pub rounds_jitter: u32,
+    /// Fractional account-count jitter per submitted batch.
+    ///
+    /// `0.2` submits `accounts..=accounts + floor(accounts * 0.2)` txs.
+    #[serde(default)]
+    pub accounts_jitter: f64,
 }
 
-const fn default_rounds_jitter() -> u32 {
-    1
+fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid jitter: {error}"))?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("jitter must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,5 +573,42 @@ mod tests {
         assert!(remote.indexer_metadata_only);
         assert_eq!(remote.chain_indexer_port, 18_090);
         assert_eq!(remote.metadata_indexer_port, 18_091);
+    }
+
+    #[test]
+    fn parses_fractional_spammer_accounts_jitter() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-accounts-jitter",
+            "0.25",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command;
+        assert_eq!(generate.spammer_accounts_jitter, 0.25);
+    }
+
+    #[test]
+    fn rejects_spammer_accounts_jitter_above_one() {
+        let error = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-accounts-jitter",
+            "1.1",
+            "local",
+        ])
+        .expect_err("jitter above one should fail");
+
+        assert!(error.to_string().contains("jitter must be between 0 and 1"));
     }
 }

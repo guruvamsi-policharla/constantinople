@@ -4,9 +4,9 @@
 //! validator mempool endpoints in a continuous loop.
 //!
 //! Each validator gets its own independent set of accounts and runs a
-//! sequential submission loop: sign one round, submit, wait for full
-//! finalization, then sign and submit the next round. This guarantees
-//! nonce ordering and eliminates cascading failures.
+//! sequential submission loop: sign one batch, submit, wait for full
+//! finalization, then sign and submit the next batch. This guarantees nonce
+//! ordering and eliminates cascading failures.
 
 mod accounts;
 mod cli;
@@ -21,7 +21,7 @@ use commonware_runtime::{Metrics as _, Runner as _, ThreadPooler as _, tokio::te
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
-use signer::sign_rounds;
+use signer::sign_batch;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
@@ -33,7 +33,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (accounts_count, value, seed_offset, http_port, primary_validators, rounds_jitter) =
+    let (accounts_count, value, seed_offset, http_port, primary_validators, accounts_jitter) =
         if let Some(config_path) = &cli.config {
             let cfg = config::load_config(config_path);
             (
@@ -42,7 +42,7 @@ fn main() {
                 cfg.seed_offset,
                 cfg.http_port,
                 cfg.primary_validators,
-                cfg.rounds_jitter,
+                cfg.accounts_jitter,
             )
         } else {
             (
@@ -51,10 +51,13 @@ fn main() {
                 cli.seed_offset,
                 cli.http_port,
                 Vec::new(),
-                cli.rounds_jitter,
+                cli.accounts_jitter,
             )
         };
-    assert!(rounds_jitter >= 1, "--rounds-jitter must be >= 1");
+    assert!(
+        (0.0..=1.0).contains(&accounts_jitter),
+        "--accounts-jitter must be between 0 and 1"
+    );
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -111,6 +114,7 @@ fn main() {
             accounts_per_validator = accounts_count,
             value = value.get(),
             seed_offset,
+            accounts_jitter,
             "starting spammer (continuous mode)"
         );
 
@@ -129,19 +133,18 @@ fn main() {
                 // `seed_offset` keeps the jitter stream reproducible across
                 // runs that use the same seed.
                 let mut rng = JitterRng::new(seed_offset.wrapping_add(i as u64).wrapping_add(1));
-                let mut round = 0;
+                let mut nonces = vec![0; accounts.len()];
+                let mut cursor = 0;
                 loop {
-                    // Pick a per-batch round count in `1..=rounds_jitter`.
-                    // With jitter == 1 this is always 1 (the original
-                    // single-round behavior).
-                    let num_rounds = if rounds_jitter <= 1 {
-                        1
-                    } else {
-                        rng.range(1, rounds_jitter)
-                    };
-                    let batch =
-                        sign_rounds(&strategy, &accounts, value, round, u64::from(num_rounds));
-                    round += u64::from(num_rounds);
+                    let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
+                    let batch = sign_batch(
+                        &strategy,
+                        &accounts,
+                        value,
+                        &mut nonces,
+                        &mut cursor,
+                        batch_size,
+                    );
 
                     // Submit and block until every tx is finalized.
                     submitter.submit_until_finalized(batch).await;
@@ -178,7 +181,19 @@ fn main() {
     });
 }
 
-/// Tiny inline xorshift64 used to jitter per-batch round counts. We don't pull
+fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
+    let extra = max_extra_accounts(accounts, accounts_jitter);
+    if extra == 0 {
+        return accounts;
+    }
+    accounts.saturating_add(rng.range(0, extra))
+}
+
+fn max_extra_accounts(accounts: usize, accounts_jitter: f64) -> usize {
+    (accounts as f64 * accounts_jitter).floor() as usize
+}
+
+/// Tiny inline xorshift64 used to jitter per-batch sizes. We don't pull
 /// `rand` in here because we only need a few bits per submission and the
 /// statistical quality of xorshift is more than sufficient for visual block
 /// size variance.
@@ -208,16 +223,16 @@ impl JitterRng {
     }
 
     /// Uniform integer in `lo..=hi` (inclusive). Caller must pass `lo <= hi`.
-    fn range(&mut self, lo: u32, hi: u32) -> u32 {
+    fn range(&mut self, lo: usize, hi: usize) -> usize {
         debug_assert!(lo <= hi);
-        let span = u64::from(hi - lo) + 1;
-        lo + (self.next_u64() % span) as u32
+        let span = (hi - lo) as u64 + 1;
+        lo + (self.next_u64() % span) as usize
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::JitterRng;
+    use super::{JitterRng, jittered_batch_size, max_extra_accounts};
 
     /// `range` must hit both endpoints over enough draws and never escape them.
     #[test]
@@ -246,5 +261,34 @@ mod tests {
         for _ in 0..32 {
             assert_eq!(rng.range(3, 3), 3);
         }
+    }
+
+    #[test]
+    fn max_extra_accounts_uses_fractional_jitter() {
+        assert_eq!(max_extra_accounts(100, 0.0), 0);
+        assert_eq!(max_extra_accounts(100, 0.25), 25);
+        assert_eq!(max_extra_accounts(3, 0.5), 1);
+        assert_eq!(max_extra_accounts(10, 1.0), 10);
+    }
+
+    #[test]
+    fn jittered_batch_size_only_adds_transactions() {
+        let mut rng = JitterRng::new(42);
+        let mut saw_base = false;
+        let mut saw_max = false;
+
+        for _ in 0..2_000 {
+            let size = jittered_batch_size(10, 0.5, &mut rng);
+            assert!((10..=15).contains(&size));
+            if size == 10 {
+                saw_base = true;
+            }
+            if size == 15 {
+                saw_max = true;
+            }
+        }
+
+        assert!(saw_base, "should sample the base account count");
+        assert!(saw_max, "should sample the upper jitter bound");
     }
 }

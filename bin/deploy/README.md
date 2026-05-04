@@ -61,16 +61,16 @@ cargo run --bin constantinople-deploy -- generate \
 The spammer waits 10 seconds for validators to start, then continuously submits ring transfers.
 Each validator receives transactions from its own independent set of accounts.
 
-Add `--spammer-rounds-jitter N` (default `1`, no jitter) to randomize each submitter's batch
-size in `accounts..=accounts*N`. With `N>1` blocks no longer pin to a flat
-`accounts`-per-block size, which gives the indexer histogram (see
+Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
+batch size in `accounts..=accounts + floor(accounts*J)`. With `J>0` blocks no longer pin to
+a flat `accounts`-per-block size, which gives the indexer histogram (see
 [Local Deployment with Indexer + Explorer](#local-deployment-with-indexer--explorer)) a
 visibly varying throughput stream:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 --secondaries 1 --output-dir ./local \
-  --spammer --spammer-rounds-jitter 4 \
+  --spammer --spammer-accounts-jitter 0.25 \
   local --indexer
 ```
 

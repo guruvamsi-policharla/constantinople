@@ -24,34 +24,37 @@ fn sign_one(
     )
 }
 
-/// Signs a range of rounds for a set of accounts using the given parallel
-/// [`Strategy`].
+/// Signs a variable-size batch while preserving per-account nonce order.
 ///
-/// Account `i` sends `value` to account `(i + 1) % N`. The nonce for every
-/// account in round `r` equals `r` (accounts start at nonce 0 and send
-/// exactly once per round).
-///
-/// Rounds `start_round..start_round + num_rounds` are signed.
-/// Returns a flat `Vec` of all signed transactions across those rounds.
-pub fn sign_rounds<St: Strategy>(
+/// Senders are selected by walking the account ring from `cursor`. Each
+/// selected account uses and increments its own nonce, so callers can vary
+/// `count` per submission without creating nonce gaps.
+pub fn sign_batch<St: Strategy>(
     strategy: &St,
     accounts: &[SpamAccount],
     value: NonZeroU64,
-    start_round: u64,
-    num_rounds: u64,
+    nonces: &mut [u64],
+    cursor: &mut usize,
+    count: usize,
 ) -> Vec<Tx> {
+    assert_eq!(accounts.len(), nonces.len(), "nonces must match accounts");
+    assert!(!accounts.is_empty(), "need at least one account");
+    assert!(count > 0, "need at least one transaction");
+
     let n = accounts.len();
+    let mut work = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sender_index = *cursor;
+        let nonce = nonces[sender_index];
+        nonces[sender_index] = nonce + 1;
+        *cursor = (*cursor + 1) % n;
+        work.push((sender_index, nonce));
+    }
 
-    // Build work items: (sender_index, round) pairs.
-    let work: Vec<(usize, u64)> = (start_round..start_round + num_rounds)
-        .flat_map(|round| (0..n).map(move |i| (i, round)))
-        .collect();
-
-    // Sign in parallel across the rayon pool.
-    strategy.map_collect_vec(work, |(i, round)| {
+    strategy.map_collect_vec(work, |(i, nonce)| {
         let sender = &accounts[i];
         let recipient = &accounts[(i + 1) % n].public_key;
-        sign_one(sender, recipient, value, round)
+        sign_one(sender, recipient, value, nonce)
     })
 }
 
@@ -65,7 +68,9 @@ mod tests {
     fn sign_produces_correct_count() {
         let accounts = generate_accounts(5, 1000);
         let value = NonZeroU64::new(1).unwrap();
-        let txs = sign_rounds(&Sequential, &accounts, value, 0, 3);
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+        let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 15);
         assert_eq!(txs.len(), 5 * 3);
     }
 
@@ -73,10 +78,12 @@ mod tests {
     fn single_round_produces_one_tx_per_account() {
         let accounts = generate_accounts(10, 1000);
         let value = NonZeroU64::new(1).unwrap();
-        let txs = sign_rounds(&Sequential, &accounts, value, 42, 1);
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+        let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 10);
         assert_eq!(txs.len(), 10);
         for tx in &txs {
-            assert_eq!(tx.value().nonce, 42);
+            assert_eq!(tx.value().nonce, 0);
         }
     }
 
@@ -84,7 +91,9 @@ mod tests {
     fn nonces_are_correct() {
         let accounts = generate_accounts(3, 1000);
         let value = NonZeroU64::new(1).unwrap();
-        let txs = sign_rounds(&Sequential, &accounts, value, 0, 4);
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+        let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 12);
         for (idx, tx) in txs.iter().enumerate() {
             let round = (idx / 3) as u64;
             assert_eq!(tx.value().nonce, round);
@@ -99,7 +108,9 @@ mod tests {
 
         let accounts = generate_accounts(5, 1000);
         let value = NonZeroU64::new(1).unwrap();
-        let txs = sign_rounds(&Sequential, &accounts, value, 0, 2);
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+        let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 10);
 
         // Encode as the client would.
         let body = txs.as_slice().encode();
@@ -124,5 +135,28 @@ mod tests {
             ),
             "batch signature verification should pass"
         );
+    }
+
+    #[test]
+    fn variable_batch_preserves_per_account_nonces() {
+        let accounts = generate_accounts(4, 1000);
+        let value = NonZeroU64::new(1).unwrap();
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+
+        let first = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 6);
+        let second = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 3);
+
+        assert_eq!(first.len(), 6);
+        assert_eq!(second.len(), 3);
+        assert_eq!(cursor, 1);
+        assert_eq!(nonces, vec![3, 2, 2, 2]);
+
+        let observed: Vec<_> = first
+            .iter()
+            .chain(second.iter())
+            .map(|tx| tx.value().nonce)
+            .collect();
+        assert_eq!(observed, vec![0, 0, 0, 0, 1, 1, 1, 1, 2]);
     }
 }

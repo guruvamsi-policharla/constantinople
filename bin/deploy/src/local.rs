@@ -293,12 +293,12 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
              --accounts {} \
              --value {} \
              --seed-offset {} \
-             --rounds-jitter {}",
+             --accounts-jitter {}",
             peers_path.display(),
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
-            args.spammer_rounds_jitter,
+            args.spammer_accounts_jitter,
         ));
     }
 
@@ -327,7 +327,7 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
-            spammer_rounds_jitter: 1,
+            spammer_accounts_jitter: 0.0,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -372,16 +372,16 @@ mod tests {
         assert!(commands[2].contains("--accounts 10"));
         assert!(commands[2].contains("--value 1"));
         assert!(commands[2].contains("--seed-offset 1000"));
-        assert!(commands[2].contains("--rounds-jitter 1"));
+        assert!(commands[2].contains("--accounts-jitter 0"));
     }
 
     #[test]
-    fn local_run_commands_propagate_rounds_jitter_to_spammer() {
+    fn local_run_commands_propagate_accounts_jitter_to_spammer() {
         let mut args = test_args(true);
-        args.spammer_rounds_jitter = 4;
+        args.spammer_accounts_jitter = 0.25;
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
-        assert!(commands[2].contains("--rounds-jitter 4"));
+        assert!(commands[2].contains("--accounts-jitter 0.25"));
     }
 
     #[test]

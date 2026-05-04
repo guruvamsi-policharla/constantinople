@@ -43,13 +43,22 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     pub rayon_threads: usize,
 
-    /// Maximum number of nonce rounds signed per submission. When greater
-    /// than 1 the spammer picks a random `num_rounds` in `1..=rounds_jitter`
-    /// for each batch, so block sizes vary instead of staying flat at
-    /// `accounts` per block. Default `1` preserves the original
-    /// "one round per submission" behavior.
-    #[arg(long, default_value_t = 1)]
-    pub rounds_jitter: u32,
+    /// Fractional account-count jitter per submitted batch.
+    ///
+    /// `0.2` submits a random batch size in
+    /// `accounts..=accounts + 20%`. Must be in `0..=1`.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    pub accounts_jitter: f64,
+}
+
+fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid jitter: {error}"))?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("jitter must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -73,6 +82,34 @@ mod tests {
         assert!(cli.hosts.is_none());
         assert!(cli.config.is_none());
         assert_eq!(cli.accounts, 20);
+    }
+
+    #[test]
+    fn parses_fractional_accounts_jitter() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--peers",
+            "peers.yaml",
+            "--accounts-jitter",
+            "0.25",
+        ])
+        .expect("local invocation should parse");
+
+        assert_eq!(cli.accounts_jitter, 0.25);
+    }
+
+    #[test]
+    fn rejects_accounts_jitter_above_one() {
+        let error = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--peers",
+            "peers.yaml",
+            "--accounts-jitter",
+            "1.1",
+        ])
+        .expect_err("jitter above one should fail");
+
+        assert!(error.to_string().contains("jitter must be between 0 and 1"));
     }
 
     #[test]
