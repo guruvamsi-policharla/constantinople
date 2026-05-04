@@ -13,7 +13,9 @@ use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
-use constantinople_primitives::{AccountKey, Header, SealedBlock, SignedTransaction};
+use constantinople_primitives::{
+    AccountKey, Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
+};
 use hashbrown::HashSet;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
@@ -151,6 +153,29 @@ where
         )
         .then_some(started_at.elapsed().as_millis())
         .ok_or(INVALID_SIGNATURE);
+        let _ = result_tx.send(result);
+    });
+
+    result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
+}
+
+/// Preloads transaction decoding and seal hashes on the hash strategy.
+pub(super) async fn preload_transactions<E, P, H, St>(
+    runtime: E,
+    strategy: St,
+    prepared: Arc<Prepared<P, H>>,
+) -> Result<()>
+where
+    E: Spawner,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy + Send + Sync + 'static,
+{
+    let (result_tx, result_rx) = futures::channel::oneshot::channel();
+    let _handle = runtime.shared(true).spawn(move |_| async move {
+        let result = preload_transaction_chunks(&strategy, prepared.transactions.clone())
+            .map(|_| ())
+            .ok_or(MALFORMED_TRANSACTION);
         let _ = result_tx.send(result);
     });
 

@@ -299,15 +299,15 @@ where
     verifier.verify(rng)
 }
 
-/// Splits lazily-encoded transactions into chunks, verifies each chunk in
-/// parallel using batch signature verification, and returns the decoded
-/// transactions in their original order.
+/// Splits lazily-encoded transactions into chunks and verifies each chunk.
 ///
-/// Forcing each [`Lazy`] happens inside the worker, so transaction decoding
-/// and seal hashing are performed on the strategy's threads. Returns `None`
-/// if any chunk contains an invalid or undecodable transaction.
-pub fn verify_transaction_chunks<P, H, BV, St>(
-    strategy: &St,
+/// The hash strategy first forces each [`Lazy`] to decode and compute its seal
+/// digest. The signature strategy then runs batch signature verification over
+/// the warmed transactions. Returns `None` if any chunk contains an invalid or
+/// undecodable transaction.
+pub fn verify_transaction_chunks<P, H, BV, SigSt, HashSt>(
+    signature_strategy: &SigSt,
+    hash_strategy: &HashSt,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
@@ -316,13 +316,18 @@ where
     P: PublicKey,
     H: Hasher,
     BV: BatchVerifier<PublicKey = P>,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     if transactions.is_empty() {
         return Some(Vec::new());
     }
 
-    let chunk_count = strategy.parallelism_hint().min(transactions.len());
+    let transactions = preload_transaction_chunks(hash_strategy, transactions)?;
+
+    let chunk_count = signature_strategy
+        .parallelism_hint()
+        .min(transactions.len());
     let chunk_size = transactions.len().div_ceil(chunk_count);
 
     let mut remaining = transactions;
@@ -336,7 +341,7 @@ where
         remaining = rest;
     }
 
-    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
+    let verified_chunks = signature_strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
         let mut chunk_rng = StdRng::from_seed(rng_seed);
         if !verify_transaction_batch::<P, H, BV>(namespace, &mut chunk_rng, &chunk) {
             return None;

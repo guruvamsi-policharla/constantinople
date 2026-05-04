@@ -29,22 +29,28 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
-pub(super) struct AppState<C, P, H, St>
+pub(super) struct AppState<C, P, H, SigSt, HashSt>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     pub mailbox: Mailbox<C, P, H>,
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
-    pub strategy: St,
+    pub signature_strategy: SigSt,
+    pub hash_strategy: HashSt,
     pub account_reader: AccountReaderCell<P>,
 }
 
+type SharedState<C, P, H, SigSt, HashSt> = Arc<AppState<C, P, H, SigSt, HashSt>>;
+
 /// Builds the axum [`Router`] for the mempool HTTP API.
-pub(super) fn router<C, P, H, BV, St>(state: Arc<AppState<C, P, H, St>>) -> Router
+pub(super) fn router<C, P, H, BV, SigSt, HashSt>(
+    state: SharedState<C, P, H, SigSt, HashSt>,
+) -> Router
 where
     C: Digest + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
@@ -52,13 +58,20 @@ where
     H::Digest: Send + Sync,
     P::Signature: Send + Sync,
     BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-    St: Strategy + Send + Sync + 'static,
+    SigSt: Strategy + Send + Sync + 'static,
+    HashSt: Strategy + Send + Sync + 'static,
 {
     let max_request_bytes = max_request_bytes(state.max_batch_bytes);
 
     Router::new()
-        .route("/transactions", post(submit_batch::<C, P, H, BV, St>))
-        .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
+        .route(
+            "/transactions",
+            post(submit_batch::<C, P, H, BV, SigSt, HashSt>),
+        )
+        .route(
+            "/account/{public_key}",
+            get(fetch_account::<C, P, H, SigSt, HashSt>),
+        )
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
 }
@@ -96,8 +109,8 @@ where
 ///   or any signature is invalid.
 /// - `413 Payload Too Large` if the batch exceeds `max_propose_bytes`.
 /// - `503 Service Unavailable` if the pool is full.
-async fn submit_batch<C, P, H, BV, St>(
-    State(state): State<Arc<AppState<C, P, H, St>>>,
+async fn submit_batch<C, P, H, BV, SigSt, HashSt>(
+    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
     body: Bytes,
 ) -> (StatusCode, String)
 where
@@ -105,7 +118,8 @@ where
     P: PublicKey,
     H: Hasher,
     BV: BatchVerifier<PublicKey = P> + Send + 'static,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     if body.len() > max_request_bytes(state.max_batch_bytes) {
         return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
@@ -126,12 +140,19 @@ where
         return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
     }
 
-    // Phase 2: Verify signatures in parallel on the rayon pool.
-    let strategy = state.strategy.clone();
+    // Phase 2: Hash and verify signatures in parallel on separate pools.
+    let signature_strategy = state.signature_strategy.clone();
+    let hash_strategy = state.hash_strategy.clone();
     let namespace = state.namespace;
     let signed_lazy = signed.into_iter().map(Lazy::new).collect::<Vec<_>>();
     let verified = match tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<P, H, BV, _>(&strategy, namespace, &mut OsRng, signed_lazy)
+        verify_transaction_chunks::<P, H, BV, _, _>(
+            &signature_strategy,
+            &hash_strategy,
+            namespace,
+            &mut OsRng,
+            signed_lazy,
+        )
     })
     .await
     {
@@ -163,15 +184,16 @@ where
 /// - `404 Not Found` if the account has not been written.
 /// - `400 Bad Request` if the path is not a valid public key hex string.
 /// - `503 Service Unavailable` if the state database has not been attached yet.
-async fn fetch_account<C, P, H, St>(
-    State(state): State<Arc<AppState<C, P, H, St>>>,
+async fn fetch_account<C, P, H, SigSt, HashSt>(
+    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
     Path(public_key): Path<String>,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     let Some(bytes) = from_hex(&public_key) else {
         return (StatusCode::BAD_REQUEST, String::new());
@@ -239,13 +261,19 @@ mod tests {
             mailbox: super::super::mailbox::Mailbox::new(sender),
             namespace: b"mempool-http-test",
             max_batch_bytes,
-            strategy: Sequential,
+            signature_strategy: Sequential,
+            hash_strategy: Sequential,
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
-        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, ed25519::Batch, Sequential>(
-            state,
-        )
+        router::<
+            sha256::Digest,
+            ed25519::PublicKey,
+            sha256::Sha256,
+            ed25519::Batch,
+            Sequential,
+            Sequential,
+        >(state)
     }
 
     #[test]

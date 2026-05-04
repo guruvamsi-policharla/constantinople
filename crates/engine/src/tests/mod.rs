@@ -279,6 +279,7 @@ impl EngineDefinition for TestEngineDefinition {
                     RoundRobin<TestHasher>,
                     _,
                     _,
+                    _,
                     Ed25519Batch,
                     crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
                 >::new(
@@ -293,7 +294,8 @@ impl EngineDefinition for TestEngineDefinition {
                         input,
                         partition_prefix,
                         freezer_table_initial_size: 1024,
-                        strategy: Sequential,
+                        signature_strategy: Sequential,
+                        hash_strategy: Sequential,
                         startup,
                         sync_config: SyncEngineConfig {
                             fetch_batch_size: NZU64!(16),

@@ -58,11 +58,12 @@ pub use utils::{load_lazy_state, load_state};
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-pub struct Application<H, C, S, P, I, B, St>
+pub struct Application<H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
 {
-    strategy: St,
+    signature_strategy: SigSt,
+    hash_strategy: HashSt,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
@@ -70,15 +71,17 @@ where
     _marker: PhantomData<(H, C, S, I, B)>,
 }
 
-impl<H, C, S, P, I, B, St> Clone for Application<H, C, S, P, I, B, St>
+impl<H, C, S, P, I, B, SigSt, HashSt> Clone for Application<H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
     P: Clone,
-    St: Clone,
+    SigSt: Clone,
+    HashSt: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            strategy: self.strategy.clone(),
+            signature_strategy: self.signature_strategy.clone(),
+            hash_strategy: self.hash_strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             genesis_transactions_target: self.genesis_transactions_target.clone(),
@@ -88,13 +91,14 @@ where
     }
 }
 
-impl<H, C, S, P, I, B, St> Application<H, C, S, P, I, B, St>
+impl<H, C, S, P, I, B, SigSt, HashSt> Application<H, C, S, P, I, B, SigSt, HashSt>
 where
     C: Digest,
     H: Hasher,
     P: PublicKey,
     B: BatchVerifier<PublicKey = P>,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     /// Creates an application.
     ///
@@ -103,7 +107,8 @@ where
     /// verification, and application.
     pub fn new(
         context: impl Metrics,
-        strategy: St,
+        signature_strategy: SigSt,
+        hash_strategy: HashSt,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
         genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
@@ -114,7 +119,8 @@ where
         );
 
         Self {
-            strategy,
+            signature_strategy,
+            hash_strategy,
             genesis_leader,
             transaction_namespace,
             genesis_transactions_target,
@@ -137,7 +143,8 @@ where
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-        St: Strategy + Clone + Send + Sync + 'static,
+        SigSt: Strategy + Clone + Send + Sync + 'static,
+        HashSt: Strategy + Clone + Send + Sync + 'static,
     {
         let propose_started_at = Instant::now();
 
@@ -226,7 +233,8 @@ where
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-        St: Strategy + Clone + Send + Sync + 'static,
+        SigSt: Strategy + Clone + Send + Sync + 'static,
+        HashSt: Strategy + Clone + Send + Sync + 'static,
     {
         let verify_started_at = Instant::now();
         let Block { header, body } = block.into_inner();
@@ -247,16 +255,26 @@ where
         let prepare_ms = prepare_started_at.elapsed().as_millis();
 
         let (state_batches, transaction_batch) = batches;
-        let signature = verification::verify_signatures::<E, P, H, B, St>(
+        let preload = verification::preload_transactions::<E, P, H, HashSt>(
             runtime.clone(),
-            self.strategy.clone(),
+            self.hash_strategy.clone(),
+            Arc::clone(&prepared),
+        );
+        if let Err(reason) = preload.await {
+            verification::reject(header.height, reason);
+            return None;
+        }
+
+        let signature = verification::verify_signatures::<E, P, H, B, SigSt>(
+            runtime.clone(),
+            self.signature_strategy.clone(),
             self.transaction_namespace,
             Arc::clone(&prepared),
         );
         let execution = verification::execute_block(
             state_batches,
             transaction_batch,
-            &self.strategy,
+            &self.hash_strategy,
             parent,
             prepared.as_ref(),
         );
@@ -307,12 +325,22 @@ where
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-        St: Strategy + Clone + Send + Sync + 'static,
+        SigSt: Strategy + Clone + Send + Sync + 'static,
+        HashSt: Strategy + Clone + Send + Sync + 'static,
     {
         let prepared = Arc::new(verification::prepare_transactions(block.body.clone()));
-        let signature = verification::verify_signatures::<E, P, H, B, St>(
+        let preload = verification::preload_transactions::<E, P, H, HashSt>(
+            runtime.clone(),
+            self.hash_strategy.clone(),
+            Arc::clone(&prepared),
+        );
+        preload
+            .await
+            .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+
+        let signature = verification::verify_signatures::<E, P, H, B, SigSt>(
             runtime,
-            self.strategy.clone(),
+            self.signature_strategy.clone(),
             self.transaction_namespace,
             Arc::clone(&prepared),
         );
@@ -320,7 +348,7 @@ where
         let execution = verification::apply_block(
             state_batches,
             transaction_batch,
-            &self.strategy,
+            &self.hash_strategy,
             mmr::Location::new(block.header.transactions_range.start()),
             prepared.as_ref(),
         );
@@ -332,7 +360,8 @@ where
     }
 }
 
-impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, B, SigSt, HashSt> CApplication<E>
+    for Application<H, C, S, P, I, B, SigSt, HashSt>
 where
     E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
     H: Hasher,
@@ -341,12 +370,13 @@ where
     P: PublicKey,
     I: TransactionSource<C, P, H> + Sync,
     B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-    St: Strategy + Clone + Send + Sync + 'static,
+    SigSt: Strategy + Clone + Send + Sync + 'static,
+    HashSt: Strategy + Clone + Send + Sync + 'static,
 {
     type SigningScheme = S;
     type Context = Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, P, EightCap, St>;
+    type Databases = Databases<E, H, P, EightCap, HashSt>;
     type InputProvider = I;
 
     /// Returns the sync targets required to fetch the block's state.

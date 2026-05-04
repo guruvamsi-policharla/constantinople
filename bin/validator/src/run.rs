@@ -188,10 +188,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let strategy = context
+        let signature_strategy = context
             .clone()
             .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create parallel strategy");
+            .expect("failed to create signature verification strategy");
+        let hash_strategy = context
+            .clone()
+            .create_strategy(NZUsize!(rayon_threads))
+            .expect("failed to create hashing strategy");
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
@@ -273,7 +277,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes: MAX_PROPOSE_BYTES,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: 3,
-                strategy: strategy.clone(),
+                signature_strategy: signature_strategy.clone(),
+                hash_strategy: hash_strategy.clone(),
             },
             mempool_mailbox.clone(),
             mempool_receiver,
@@ -319,6 +324,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             MinSig,
             RoundRobin<Sha256>,
             Rayon,
+            Rayon,
             _,
             Batch,
             EngineCertReporter,
@@ -334,7 +340,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
                 freezer_table_initial_size: 1024,
-                strategy,
+                signature_strategy,
+                hash_strategy,
                 startup,
                 sync_config: production_sync_config(),
                 genesis_leader: decoded.genesis_leader,

@@ -177,8 +177,8 @@ mod tests {
         let lazy_txs = transactions.into_iter().map(Lazy::new).collect();
 
         let verified =
-            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _>(
-                &strategy, NAMESPACE, &mut rng, lazy_txs,
+            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _, _>(
+                &strategy, &strategy, NAMESPACE, &mut rng, lazy_txs,
             )
             .expect("valid chunked verification should succeed");
         let verified_digests = verified
@@ -205,8 +205,8 @@ mod tests {
         let lazy_txs = transactions.into_iter().map(Lazy::new).collect();
 
         let verified =
-            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _>(
-                &strategy, NAMESPACE, &mut rng, lazy_txs,
+            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _, _>(
+                &strategy, &strategy, NAMESPACE, &mut rng, lazy_txs,
             );
 
         assert!(verified.is_none());
@@ -241,12 +241,14 @@ mod tests {
                 .expect("decode should defer sender validation");
         let mut rng = StdRng::seed_from_u64(37);
 
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            sha256::Sha256,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, vec![Lazy::new(malformed)]);
+        let verified =
+            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _, _>(
+                &strategy,
+                &strategy,
+                NAMESPACE,
+                &mut rng,
+                vec![Lazy::new(malformed)],
+            );
 
         assert!(verified.is_none());
     }

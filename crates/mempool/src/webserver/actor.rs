@@ -46,7 +46,7 @@ pub enum TxStatus {
 }
 
 /// Mempool actor configuration.
-pub struct Config<St: Strategy> {
+pub struct Config<SigSt: Strategy, HashSt: Strategy> {
     /// Maximum total bytes the pool will hold.
     pub max_pool_bytes: usize,
     /// Maximum bytes returned in a single `propose` call, and the
@@ -58,7 +58,9 @@ pub struct Config<St: Strategy> {
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
     /// Parallel execution strategy for batch signature verification.
-    pub strategy: St,
+    pub signature_strategy: SigSt,
+    /// Parallel execution strategy for transaction decoding and seal hashing.
+    pub hash_strategy: HashSt,
 }
 
 /// A batch of transactions waiting in the pool.
@@ -114,13 +116,14 @@ where
 /// Create via [`Actor::new`], which consumes the receiver half of a mailbox
 /// created by [`Mailbox::channel`](super::Mailbox::channel). Call
 /// [`Actor::start`] to spawn the event loop and HTTP server on the runtime.
-pub struct Actor<E, C, P, H, St>
+pub struct Actor<E, C, P, H, SigSt, HashSt>
 where
     E: Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     context: ContextCell<E>,
     mailbox: Mailbox<C, P, H>,
@@ -131,18 +134,20 @@ where
     max_propose_bytes: usize,
     namespace: &'static [u8],
     drop_grace_blocks: u64,
-    strategy: St,
+    signature_strategy: SigSt,
+    hash_strategy: HashSt,
     account_reader: AccountReaderCell<P>,
 }
 
-impl<E, C, P, H, St> Actor<E, C, P, H, St>
+impl<E, C, P, H, SigSt, HashSt> Actor<E, C, P, H, SigSt, HashSt>
 where
     E: Spawner + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
     H::Digest: Hash,
-    St: Strategy,
+    SigSt: Strategy,
+    HashSt: Strategy,
 {
     /// Creates a new mempool actor.
     ///
@@ -153,7 +158,7 @@ where
     /// empty.
     pub fn new(
         context: E,
-        config: Config<St>,
+        config: Config<SigSt, HashSt>,
         mailbox: Mailbox<C, P, H>,
         receiver: ActorReceiver<C, P, H>,
         account_reader: AccountReaderCell<P>,
@@ -168,7 +173,8 @@ where
             max_propose_bytes: config.max_propose_bytes,
             namespace: config.namespace,
             drop_grace_blocks: config.drop_grace_blocks,
-            strategy: config.strategy,
+            signature_strategy: config.signature_strategy,
+            hash_strategy: config.hash_strategy,
             account_reader,
         }
     }
@@ -198,7 +204,8 @@ where
             max_propose_bytes,
             namespace,
             drop_grace_blocks,
-            strategy,
+            signature_strategy,
+            hash_strategy,
             account_reader,
         } = self;
 
@@ -206,10 +213,11 @@ where
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
-            strategy,
+            signature_strategy,
+            hash_strategy,
             account_reader,
         });
-        let app = http::router::<C, P, H, BV, St>(app_state);
+        let app = http::router::<C, P, H, BV, SigSt, HashSt>(app_state);
         let _http_handle = context.as_present().with_label("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });

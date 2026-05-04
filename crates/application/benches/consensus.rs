@@ -57,6 +57,7 @@ type TestApplication = Application<
     TestTransactionSource,
     ed25519::Batch,
     Rayon,
+    Rayon,
 >;
 type TestStateDb = fixed::Db<
     mmr::Family,
@@ -373,18 +374,26 @@ struct Fixture {
 impl Fixture {
     async fn new(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
         let generated = GeneratedTransactions::new(transaction_count);
-        let strategy = bench_strategy(&runtime);
+        let signature_strategy = bench_strategy(&runtime);
+        let hash_strategy = bench_strategy(&runtime);
         let databases = init_databases(
             runtime.clone(),
             prefix,
             &generated.accounts,
-            strategy.clone(),
+            hash_strategy.clone(),
         )
         .await;
         let leader = generated.leader.clone();
         let parent = parent_block(leader.clone(), &databases).await;
         let context = block_context(leader.clone());
-        let app = new_application(runtime, leader, &databases, strategy).await;
+        let app = new_application(
+            runtime,
+            leader,
+            &databases,
+            signature_strategy,
+            hash_strategy,
+        )
+        .await;
 
         Self {
             app,
@@ -532,7 +541,8 @@ async fn new_application(
     runtime: RuntimeContext,
     leader: TestPublicKey,
     databases: &TestDatabases,
-    strategy: Rayon,
+    signature_strategy: Rayon,
+    hash_strategy: Rayon,
 ) -> TestApplication {
     let (_, transaction_target) = databases.committed_targets().await;
     let genesis_transactions_target =
@@ -543,7 +553,8 @@ async fn new_application(
 
     TestApplication::new(
         runtime.with_label("application"),
-        strategy,
+        signature_strategy,
+        hash_strategy,
         leader,
         TRANSACTION_NAMESPACE,
         genesis_transactions_target,
