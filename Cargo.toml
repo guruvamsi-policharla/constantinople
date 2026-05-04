@@ -14,6 +14,7 @@ resolver = "2"
 members = [
   "crates/application",
   "crates/engine",
+  "crates/explorer-crypto",
   "crates/indexer",
   "crates/mempool",
   "crates/primitives",
@@ -60,7 +61,7 @@ commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", b
 commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
 
 # Exoware
 exoware-sdk = "2026.4.1"

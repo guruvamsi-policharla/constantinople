@@ -19,7 +19,7 @@ commonware-codec.workspace = true
 commonware-formatting.workspace = true
 commonware-utils.workspace = true
 commonware-deployer.workspace = true
-commonware-cryptography.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 clap = { workspace = true, features = ["derive"] }

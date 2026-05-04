@@ -22,7 +22,7 @@ commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 commonware-utils.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 axum.workspace = true
@@ -35,6 +35,7 @@ rand_core.workspace = true
 serde_json.workspace = true
 derive_more = { workspace = true, features = ["display"] }
 futures.workspace = true
+tower-http = { version = "0.6", features = ["cors"] }
 
 [features]
 mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
@@ -42,7 +43,7 @@ mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
 [dev-dependencies]
 # Commonware
 commonware-math.workspace = true
-commonware-cryptography.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 rand.workspace = true

@@ -1589,6 +1589,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-explorer-crypto"
+version = "0.0.0"
+dependencies = [
+ "commonware-codec 2026.4.0 (git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue)",
+ "commonware-cryptography",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "constantinople-indexer"
 version = "0.1.0"
 dependencies = [
@@ -1644,6 +1653,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tower-http 0.6.8",
  "tracing",
 ]
 

@@ -5,7 +5,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
@@ -15,6 +15,7 @@ use commonware_parallel::Strategy;
 use constantinople_primitives::{Account, SignedTransaction, verify_transaction_chunks};
 use rand_core::OsRng;
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 
 /// Maximum bytes needed to encode the batch-length prefix.
 ///
@@ -62,6 +63,10 @@ where
     HashSt: Strategy + Send + Sync + 'static,
 {
     let max_request_bytes = max_request_bytes(state.max_batch_bytes);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([CONTENT_TYPE]);
 
     Router::new()
         .route(
@@ -73,6 +78,7 @@ where
             get(fetch_account::<C, P, H, SigSt, HashSt>),
         )
         .layer(DefaultBodyLimit::max(max_request_bytes))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -242,7 +248,7 @@ mod tests {
     use super::{AppState, router};
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode, header},
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{ed25519, sha256};
@@ -304,5 +310,25 @@ mod tests {
         let response = result.expect("malformed prefixes must not panic");
         let response = response.expect("router should return a response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn router_allows_explorer_account_preflight() {
+        let app = test_router(4 * 1024 * 1024);
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/account/00")
+            .header(header::ORIGIN, "http://127.0.0.1:5173")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = block_on(app.oneshot(request)).expect("router should return a response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&header::HeaderValue::from_static("*")),
+        );
     }
 }

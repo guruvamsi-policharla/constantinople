@@ -1,5 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+    encodeSignedTransaction,
+    encodeTransactionBatch,
+    parsePublicKeyHex,
+    parseU64,
+} from './codec';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
+import { fetchAccount, submitTransactions, type AccountView, type TxStatus } from './mempool';
+import {
+    clearSession,
+    createWallet,
+    signInWithPasskey,
+    type ActiveWallet,
+} from './wallet';
 
 /** Most recent batches to keep in the live feed. Old entries fall off the table. */
 const MAX_ROWS = 200;
@@ -27,8 +40,21 @@ type Status =
 // `--metadata-indexer-port` in `bin/deploy/src/local.rs`; override via
 // `VITE_SQL_URL` for non-default deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
+const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
+const LOCAL_HISTORY_KEY = 'constantinople.submitted-transactions.v1';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
+const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
+
+interface SubmittedTransaction {
+    readonly digest: string;
+    readonly to: string;
+    readonly value: string;
+    readonly nonce: string;
+    readonly submittedAt: number;
+    readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
+    readonly detail: string;
+}
 
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
@@ -39,6 +65,16 @@ export default function App() {
     const [totalTxObserved, setTotalTxObserved] = useState(0);
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const lastSequenceRef = useRef<bigint | null>(null);
+    const [wallet, setWallet] = useState<ActiveWallet | null>(null);
+    const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
+    const [account, setAccount] = useState<AccountView | null>(null);
+    const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
+    const [toKey, setToKey] = useState('');
+    const [value, setValue] = useState('1');
+    const [nonce, setNonce] = useState('0');
+    const [submitMessage, setSubmitMessage] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [history, setHistory] = useState<SubmittedTransaction[]>(() => readHistory());
 
     useEffect(() => {
         const controller = new AbortController();
@@ -69,6 +105,127 @@ export default function App() {
         };
     }, []);
 
+    useEffect(() => {
+        writeHistory(history);
+    }, [history]);
+
+    useEffect(() => {
+        if (!wallet) {
+            setAccount(null);
+            setAccountMessage('account metadata unavailable');
+            return;
+        }
+
+        let cancelled = false;
+        setAccountMessage('loading account metadata');
+
+        fetchAccount(mempoolUrl, wallet.publicKeyHex)
+            .then((nextAccount) => {
+                if (cancelled) return;
+                setAccount(nextAccount);
+                const nextNonce = nextAccount?.nonce ?? 0;
+                setNonce(String(nextNonce));
+                setAccountMessage(
+                    nextAccount
+                        ? 'committed account loaded'
+                        : 'no committed account yet; default balance applies',
+                );
+            })
+            .catch((error) => {
+                if (cancelled) return;
+                setAccount(null);
+                setAccountMessage(error instanceof Error ? error.message : String(error));
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [wallet]);
+
+    const refreshAccount = async () => {
+        if (!wallet) return;
+        setAccountMessage('loading account metadata');
+        try {
+            const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
+            setAccount(nextAccount);
+            setNonce(String(nextAccount?.nonce ?? 0));
+            setAccountMessage(
+                nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
+            );
+        } catch (error) {
+            setAccountMessage(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const handleCreateWallet = async () => {
+        setWalletMessage('opening passkey prompt');
+        try {
+            const nextWallet = await createWallet();
+            setWallet(nextWallet);
+            setWalletMessage('wallet created');
+        } catch (error) {
+            setWalletMessage(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const handleSignIn = async () => {
+        setWalletMessage('opening passkey prompt');
+        try {
+            const nextWallet = await signInWithPasskey();
+            setWallet(nextWallet);
+            setWalletMessage('signed in');
+        } catch (error) {
+            setWalletMessage(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const handleSignOut = () => {
+        clearSession();
+        setWallet(null);
+        setWalletMessage('signed out');
+    };
+
+    const submitTransfer = async () => {
+        if (!wallet || isSubmitting) return;
+
+        setIsSubmitting(true);
+        setSubmitMessage('forming transaction');
+        try {
+            const parsedToKey = parsePublicKeyHex(toKey);
+            const parsedValue = parseU64(value, 'value');
+            const parsedNonce = parseU64(nonce, 'nonce');
+            const encoded = await encodeSignedTransaction(
+                {
+                    senderPublicKey: wallet.publicKey,
+                    toPublicKey: parsedToKey,
+                    value: parsedValue,
+                    nonce: parsedNonce,
+                },
+                wallet.sign,
+            );
+            const pending: SubmittedTransaction = {
+                digest: encoded.digestHex,
+                to: toKey.trim().replace(/^0x/i, '').toLowerCase(),
+                value: parsedValue.toString(),
+                nonce: parsedNonce.toString(),
+                submittedAt: Date.now(),
+                status: 'pending',
+                detail: 'submitted to mempool',
+            };
+            setHistory((current) => prependTransaction(pending, current));
+            setSubmitMessage('waiting for finalization');
+
+            const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
+            setHistory((current) => updateTransactionStatus(encoded.digestHex, txStatus, current));
+            setSubmitMessage(formatTxStatus(txStatus));
+            await refreshAccount();
+        } catch (error) {
+            setSubmitMessage(error instanceof Error ? error.message : String(error));
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
     return (
         <div className="app">
             <div className="app__container">
@@ -83,6 +240,27 @@ export default function App() {
                     blocksObserved={blocksObserved}
                     totalTxObserved={totalTxObserved}
                 />
+                <WalletPanel
+                    wallet={wallet}
+                    walletMessage={walletMessage}
+                    account={account}
+                    accountMessage={accountMessage}
+                    mempoolUrl={mempoolUrl}
+                    toKey={toKey}
+                    value={value}
+                    nonce={nonce}
+                    submitMessage={submitMessage}
+                    isSubmitting={isSubmitting}
+                    onCreateWallet={handleCreateWallet}
+                    onSignIn={handleSignIn}
+                    onSignOut={handleSignOut}
+                    onRefreshAccount={refreshAccount}
+                    onToKeyChange={setToKey}
+                    onValueChange={setValue}
+                    onNonceChange={setNonce}
+                    onSubmit={submitTransfer}
+                />
+                <TransactionHistory transactions={history} />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
                     <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
@@ -92,12 +270,246 @@ export default function App() {
     );
 }
 
+function WalletPanel({
+    wallet,
+    walletMessage,
+    account,
+    accountMessage,
+    mempoolUrl,
+    toKey,
+    value,
+    nonce,
+    submitMessage,
+    isSubmitting,
+    onCreateWallet,
+    onSignIn,
+    onSignOut,
+    onRefreshAccount,
+    onToKeyChange,
+    onValueChange,
+    onNonceChange,
+    onSubmit,
+}: {
+    wallet: ActiveWallet | null;
+    walletMessage: string;
+    account: AccountView | null;
+    accountMessage: string;
+    mempoolUrl: string;
+    toKey: string;
+    value: string;
+    nonce: string;
+    submitMessage: string;
+    isSubmitting: boolean;
+    onCreateWallet: () => void;
+    onSignIn: () => void;
+    onSignOut: () => void;
+    onRefreshAccount: () => void;
+    onToKeyChange: (value: string) => void;
+    onValueChange: (value: string) => void;
+    onNonceChange: (value: string) => void;
+    onSubmit: () => void;
+}) {
+    const balance = account?.balance ?? 100;
+    const accountNonce = account?.nonce ?? 0;
+
+    return (
+        <section className="wallet">
+            <div className="wallet__header">
+                <div>
+                    <div className="wallet__label">wallet</div>
+                    <div className="wallet__status">{walletMessage}</div>
+                </div>
+                <div className="wallet__actions">
+                    {!wallet && <button onClick={onSignIn}>sign in</button>}
+                    {!wallet && <button onClick={onCreateWallet}>new passkey</button>}
+                    {wallet && <button onClick={onRefreshAccount}>refresh</button>}
+                    {wallet && <button onClick={onSignOut}>sign out</button>}
+                </div>
+            </div>
+            <div className="wallet__grid">
+                <div className="wallet__cell span-2">
+                    <span>account</span>
+                    <strong>{wallet?.publicKeyHex ?? 'not authenticated'}</strong>
+                </div>
+                <div className="wallet__cell">
+                    <span>balance</span>
+                    <strong>{balance.toLocaleString()}</strong>
+                </div>
+                <div className="wallet__cell">
+                    <span>nonce</span>
+                    <strong>{accountNonce.toLocaleString()}</strong>
+                </div>
+                <div className="wallet__cell span-2">
+                    <span>mempool</span>
+                    <strong>{mempoolUrl}</strong>
+                </div>
+                <div className="wallet__cell span-2">
+                    <span>metadata</span>
+                    <strong>{accountMessage}</strong>
+                </div>
+            </div>
+            <form
+                className="transfer"
+                onSubmit={(event) => {
+                    event.preventDefault();
+                    onSubmit();
+                }}
+            >
+                <label>
+                    <span>to_key</span>
+                    <input
+                        value={toKey}
+                        onChange={(event) => onToKeyChange(event.target.value)}
+                        placeholder="64 hex chars"
+                        spellCheck={false}
+                        disabled={!wallet || isSubmitting}
+                    />
+                </label>
+                <label>
+                    <span>n</span>
+                    <input
+                        value={value}
+                        onChange={(event) => onValueChange(event.target.value)}
+                        inputMode="numeric"
+                        disabled={!wallet || isSubmitting}
+                    />
+                </label>
+                <label>
+                    <span>nonce</span>
+                    <input
+                        value={nonce}
+                        onChange={(event) => onNonceChange(event.target.value)}
+                        inputMode="numeric"
+                        disabled={!wallet || isSubmitting}
+                    />
+                </label>
+                <button disabled={!wallet || isSubmitting} type="submit">
+                    {isSubmitting ? 'submitting' : 'submit'}
+                </button>
+            </form>
+            {submitMessage && <div className="wallet__status">{submitMessage}</div>}
+        </section>
+    );
+}
+
+function TransactionHistory({ transactions }: { transactions: SubmittedTransaction[] }) {
+    const formatter = useMemo(
+        () =>
+            new Intl.DateTimeFormat(undefined, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            }),
+        [],
+    );
+
+    if (transactions.length === 0) {
+        return <section className="tx-history empty">no submitted transactions for this browser</section>;
+    }
+
+    return (
+        <section className="tx-history">
+            <div className="tx-history__title">submitted transactions</div>
+            <table className="tx-table">
+                <thead>
+                    <tr>
+                        <th>digest</th>
+                        <th>to</th>
+                        <th>n</th>
+                        <th>nonce</th>
+                        <th>status</th>
+                        <th>time</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {transactions.map((tx) => (
+                        <tr key={tx.digest}>
+                            <td>{shortHex(tx.digest)}</td>
+                            <td>{shortHex(tx.to)}</td>
+                            <td>{tx.value}</td>
+                            <td>{tx.nonce}</td>
+                            <td>{tx.detail}</td>
+                            <td>{formatter.format(tx.submittedAt)}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </section>
+    );
+}
+
 function prependBounded(block: ObservedBlock, current: ObservedBlock[]): ObservedBlock[] {
     const next = [block, ...current];
     if (next.length > MAX_ROWS) {
         next.length = MAX_ROWS;
     }
     return next;
+}
+
+function prependTransaction(
+    transaction: SubmittedTransaction,
+    current: SubmittedTransaction[],
+): SubmittedTransaction[] {
+    return [transaction, ...current.filter((item) => item.digest !== transaction.digest)].slice(0, 100);
+}
+
+function updateTransactionStatus(
+    digest: string,
+    status: TxStatus,
+    current: SubmittedTransaction[],
+): SubmittedTransaction[] {
+    return current.map((tx) => {
+        if (tx.digest !== digest) return tx;
+        return {
+            ...tx,
+            status: status.status,
+            detail: formatTxStatus(status),
+        };
+    });
+}
+
+function formatTxStatus(status: TxStatus): string {
+    if (status.status === 'finalized') {
+        return `finalized at ${status.height}`;
+    }
+    if (status.status === 'partially_finalized') {
+        return `partial at ${status.height}`;
+    }
+    return status.status;
+}
+
+function shortHex(value: string): string {
+    return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
+}
+
+function readHistory(): SubmittedTransaction[] {
+    const raw = window.localStorage.getItem(LOCAL_HISTORY_KEY);
+    if (!raw) return [];
+
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.filter(isSubmittedTransaction) : [];
+    } catch {
+        return [];
+    }
+}
+
+function writeHistory(history: SubmittedTransaction[]) {
+    window.localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
+}
+
+function isSubmittedTransaction(value: unknown): value is SubmittedTransaction {
+    return (
+        typeof value === 'object' &&
+        value !== null &&
+        'digest' in value &&
+        'to' in value &&
+        'value' in value &&
+        'nonce' in value &&
+        'submittedAt' in value &&
+        'status' in value &&
+        'detail' in value
+    );
 }
 
 function StatusBadge({ status, url }: { status: Status; url: string }) {

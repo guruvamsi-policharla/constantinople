@@ -24,7 +24,7 @@ commonware-runtime.workspace = true
 commonware-storage.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 rand.workspace = true
@@ -43,7 +43,7 @@ constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
-commonware-cryptography.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 rand.workspace = true
