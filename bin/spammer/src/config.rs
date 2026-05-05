@@ -22,6 +22,11 @@ pub struct SpammerConfig {
     /// Relayer URL used for normal transaction submission.
     #[serde(default)]
     pub relayer_url: Option<String>,
+    /// Independent nonce-ordered streams to run when submitting through a relayer.
+    ///
+    /// `0` means infer from `primary_validators`, falling back to one stream.
+    #[serde(default)]
+    pub relayer_submitters: usize,
     /// Hex-encoded ed25519 public keys of primary validators. Used to filter
     /// hosts.yaml so secondaries are not spammed. Empty means accept any
     /// hex-named validator host (local/CLI-only fallback).
@@ -120,6 +125,7 @@ mod tests {
             seed_offset: 2000,
             http_port: 9090,
             relayer_url: Some("http://relayer:8080".to_string()),
+            relayer_submitters: 4,
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
         };
@@ -130,6 +136,7 @@ mod tests {
         assert_eq!(parsed.seed_offset, config.seed_offset);
         assert_eq!(parsed.http_port, config.http_port);
         assert_eq!(parsed.relayer_url, config.relayer_url);
+        assert_eq!(parsed.relayer_submitters, config.relayer_submitters);
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
     }

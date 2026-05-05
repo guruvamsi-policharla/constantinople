@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::sync::{RwLock, mpsc};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 1_500;
@@ -157,7 +157,7 @@ enum ForwardResult {
     Transient,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct IngestResponse {
     digests: Vec<String>,
 }
@@ -241,6 +241,7 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
     drop(tx);
 
     let mut deterministic = None;
+    let mut transient_failures = 0;
     let mut acknowledged = Vec::new();
     let mut digests = Vec::new();
     let timeout = tokio::time::sleep(state.ack_timeout);
@@ -256,7 +257,7 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
                     break;
                 }
                 ForwardResult::Deterministic(status) => deterministic = Some(status),
-                ForwardResult::Transient => {}
+                ForwardResult::Transient => transient_failures += 1,
             },
             else => break,
         }
@@ -264,6 +265,12 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
 
     if acknowledged.is_empty() {
         let status = deterministic.unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+        warn!(
+            batch_id,
+            status = status.as_u16(),
+            transient_failures,
+            "relayer submission failed before acknowledgement"
+        );
         return (status, String::new());
     }
 
@@ -364,7 +371,7 @@ async fn forward_to_leader(http: reqwest::Client, leader: Leader, body: Bytes) -
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        warn!(
+                        debug!(
                             leader = %leader.public_key,
                             %error,
                             attempt,
@@ -378,7 +385,7 @@ async fn forward_to_leader(http: reqwest::Client, leader: Leader, body: Bytes) -
                 let ack = match serde_json::from_slice::<IngestResponse>(&bytes) {
                     Ok(ack) => ack,
                     Err(error) => {
-                        warn!(
+                        debug!(
                             leader = %leader.public_key,
                             %error,
                             attempt,
@@ -400,13 +407,13 @@ async fn forward_to_leader(http: reqwest::Client, leader: Leader, body: Bytes) -
             {
                 return ForwardResult::Deterministic(response.status());
             }
-            Ok(response) => warn!(
+            Ok(response) => debug!(
                 leader = %leader.public_key,
                 status = response.status().as_u16(),
                 attempt,
                 "leader ingest failed"
             ),
-            Err(error) => warn!(
+            Err(error) => debug!(
                 leader = %leader.public_key,
                 %error,
                 attempt,
@@ -699,7 +706,19 @@ const fn default_max_tracked_batches() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchStatus, Leader, leader_targets, merge_terminal_statuses};
+    use super::{
+        AppState, BatchStatus, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_MAX_BATCH_BYTES,
+        DEFAULT_MAX_TRACKED_BATCHES, DEFAULT_ROUND_POLL_MS, Leader, TrackedBatches, leader_targets,
+        merge_terminal_statuses,
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::RwLock;
 
     fn leader(key: &str) -> Leader {
         Leader {
@@ -733,6 +752,35 @@ mod tests {
         let targets = leader_targets(&leaders, 5, 0);
 
         assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn default_fanout_includes_multiple_leaders() {
+        let state = AppState {
+            leaders: Arc::new(vec![leader("00"), leader("01"), leader("02"), leader("03")]),
+            leader_fanout: 3,
+            ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS),
+            round_poll: Duration::from_millis(DEFAULT_ROUND_POLL_MS),
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            batches: Arc::new(RwLock::new(TrackedBatches::new(
+                DEFAULT_MAX_TRACKED_BATCHES,
+            ))),
+            observed_round: Arc::new(AtomicU64::new(0)),
+            http: reqwest::Client::new(),
+            listen: "127.0.0.1:0".parse().expect("listen address parses"),
+        };
+
+        let next_round = state.observed_round.load(Ordering::Relaxed).wrapping_add(1);
+        let targets = leader_targets(&state.leaders, state.leader_fanout, next_round);
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(
+            targets
+                .into_iter()
+                .map(|leader| leader.public_key)
+                .collect::<Vec<_>>(),
+            vec!["01", "02", "03"],
+        );
     }
 
     #[test]

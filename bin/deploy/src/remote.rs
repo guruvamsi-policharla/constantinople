@@ -277,6 +277,9 @@ fn remote_spammer_config(
         http_port: remote.http_port,
         relayer_url: relayer_enabled(args)
             .then(|| format!("http://{RELAYER_HOST}:{}", remote.http_port)),
+        relayer_submitters: relayer_enabled(args)
+            .then_some(args.validators as usize)
+            .unwrap_or(0),
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
     }
@@ -317,6 +320,7 @@ fn build_deployer_config(
             binary: validator_binary.to_string(),
             config: validator.config_name.clone(),
             profiling: remote.profiling,
+            storage_iops: Some(16000),
         })
         .collect();
 
@@ -332,6 +336,7 @@ fn build_deployer_config(
             binary: validator_binary.to_string(),
             config: secondary.config_name.clone(),
             profiling: remote.profiling,
+            storage_iops: Some(16000),
         });
     }
 
@@ -345,6 +350,7 @@ fn build_deployer_config(
             binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
+            storage_iops: Some(16000),
         });
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
@@ -355,6 +361,7 @@ fn build_deployer_config(
             binary: METADATA_INDEXER_BINARY_FILE.to_string(),
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
+            storage_iops: Some(16000),
         });
     }
 
@@ -371,6 +378,7 @@ fn build_deployer_config(
             binary: SPAMMER_BINARY_FILE.to_string(),
             config: SPAMMER_CONFIG_FILE.to_string(),
             profiling: false,
+            storage_iops: Some(16000),
         });
     }
 
@@ -384,6 +392,7 @@ fn build_deployer_config(
             binary: RELAYER_BINARY_FILE.to_string(),
             config: RELAYER_CONFIG_FILE.to_string(),
             profiling: false,
+            storage_iops: Some(16000),
         });
     }
 
@@ -394,6 +403,7 @@ fn build_deployer_config(
             storage_size: remote.monitoring_storage_size,
             storage_class: STORAGE_CLASS.to_string(),
             dashboard: dashboard.to_string(),
+            storage_iops: Some(6400),
         },
         instances,
         ports: port_configs(remote),
@@ -614,7 +624,9 @@ mod tests {
         let relayed = remote_spammer_config(&args, &remote, &material);
 
         assert_eq!(direct.relayer_url, None);
+        assert_eq!(direct.relayer_submitters, 0);
         assert_eq!(relayed.relayer_url, Some("http://relayer:8080".to_string()));
+        assert_eq!(relayed.relayer_submitters, args.validators as usize);
     }
 
     #[test]

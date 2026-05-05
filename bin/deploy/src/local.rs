@@ -345,8 +345,9 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
     if args.spammer {
         let network_source = if relayer_enabled(args) {
             format!(
-                "--relayer-url http://127.0.0.1:{}",
+                "--relayer-url http://127.0.0.1:{} --relayer-submitters {}",
                 local.base_http_port + args.validators as u16 + args.secondaries as u16,
+                args.validators,
             )
         } else {
             format!("--peers {}", peers_path.display())
@@ -459,6 +460,7 @@ mod tests {
         assert!(commands[2].contains("constantinople-relayer"));
         assert!(commands[3].contains("constantinople-spammer"));
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
+        assert!(commands[3].contains("--relayer-submitters 2"));
         assert!(!commands[3].contains("--peers"));
     }
 

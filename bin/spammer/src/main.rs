@@ -39,16 +39,23 @@ fn main() {
         seed_offset,
         http_port,
         relayer_url,
+        relayer_submitters,
         primary_validators,
         accounts_jitter,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
+        let relayer_submitters = if cfg.relayer_submitters == 0 {
+            cfg.primary_validators.len().max(1)
+        } else {
+            cfg.relayer_submitters
+        };
         (
             cfg.accounts,
             cfg.value,
             cfg.seed_offset,
             cfg.http_port,
             cfg.relayer_url.or_else(|| cli.relayer_url.clone()),
+            relayer_submitters,
             cfg.primary_validators,
             cfg.accounts_jitter,
         )
@@ -59,6 +66,7 @@ fn main() {
             cli.seed_offset,
             cli.http_port,
             cli.relayer_url.clone(),
+            cli.relayer_submitters.max(1),
             Vec::new(),
             cli.accounts_jitter,
         )
@@ -105,6 +113,7 @@ fn main() {
                 value,
                 seed_offset,
                 accounts_jitter,
+                relayer_submitters,
                 strategy,
             )
             .await;
@@ -213,10 +222,11 @@ async fn run_relayer_mode(
     value: NonZeroU64,
     seed_offset: u64,
     accounts_jitter: f64,
-    strategy: impl commonware_parallel::Strategy + 'static,
+    relayer_submitters: usize,
+    strategy: impl commonware_parallel::Strategy + Clone + 'static,
 ) {
-    let accounts = generate_accounts(accounts_count, seed_offset);
     info!(
+        submitters = relayer_submitters,
         accounts = accounts_count,
         value = value.get(),
         seed_offset,
@@ -226,31 +236,38 @@ async fn run_relayer_mode(
     );
 
     let stats = Arc::new(Stats::new());
-    let submitter = RelayerSubmitter::new(relayer_url, stats.clone());
     let start = Instant::now();
 
-    tokio::spawn(async move {
-        let mut rng = JitterRng::new(seed_offset.wrapping_add(1));
-        let mut nonces = vec![0; accounts.len()];
-        let mut cursor = 0;
-        loop {
-            let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
-            let batch = sign_batch(
-                &strategy,
-                &accounts,
-                value,
-                &mut nonces,
-                &mut cursor,
-                batch_size,
-            );
-            submitter.submit_until_accepted(batch).await;
-        }
-    });
+    for index in 0..relayer_submitters {
+        let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
+        let accounts = generate_accounts(accounts_count, account_offset);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone());
+        let strategy = strategy.clone();
+        tokio::spawn(async move {
+            let mut rng = JitterRng::new(account_offset.wrapping_add(1));
+            let mut nonces = vec![0; accounts.len()];
+            let mut cursor = 0;
+            loop {
+                let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
+                let batch = sign_batch(
+                    &strategy,
+                    &accounts,
+                    value,
+                    &mut nonces,
+                    &mut cursor,
+                    batch_size,
+                );
+                submitter.submit_until_finalized(batch).await;
+            }
+        });
+    }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         interval.tick().await;
         let finalized = stats.finalized.load(Ordering::Relaxed);
+        let filtered = stats.filtered.load(Ordering::Relaxed);
+        let dropped = stats.dropped.load(Ordering::Relaxed);
         let errors = stats.errors.load(Ordering::Relaxed);
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 {
@@ -259,7 +276,9 @@ async fn run_relayer_mode(
             0.0
         };
         info!(
-            accepted = finalized,
+            finalized,
+            filtered,
+            dropped,
             errors,
             tps = format!("{tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),

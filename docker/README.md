@@ -45,6 +45,18 @@ To build the Intel validator binary, run:
 just validator-intel-binary
 ```
 
+To build the relayer binary for Graviton, run:
+
+```sh
+just relayer-graviton-binary
+```
+
+To build the relayer binary for Intel, run:
+
+```sh
+just relayer-intel-binary
+```
+
 To build the shared indexer binaries for Graviton, run:
 
 ```sh
@@ -65,6 +77,8 @@ just metadata-indexer-intel-binary
 * `deploy/validator-debug`
 * `deploy/spammer`
 * `deploy/spammer-debug`
+* `deploy/relayer`
+* `deploy/relayer-debug`
 * `deploy/chain-indexer`
 * `deploy/chain-indexer-debug`
 * `deploy/metadata-indexer`

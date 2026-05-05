@@ -107,8 +107,9 @@ relayer listens on the next local HTTP port after validators and secondaries
 leader window.
 
 When both `--spammer` and `--relayer` are set, the generated spammer command uses
-`--relayer-url`. Without `--relayer`, the spammer uses `--peers` and submits directly to primary
-validators.
+`--relayer-url` and `--relayer-submitters <validators>`, preserving the same number of independent
+nonce-ordered streams as direct mode. Without `--relayer`, the spammer uses `--peers` and submits
+directly to primary validators.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -266,8 +267,8 @@ the configured HTTP port and forwards transaction batches to the next leader win
 validators. It is optional; `--spammer` does not create a relayer unless `--relayer` is also set.
 
 When `--spammer --relayer` are used together, `spammer.yaml` includes
-`relayer_url: http://relayer:<http_port>`. With `--spammer` alone, `relayer_url` is omitted and
-the spammer submits directly to primary validators.
+`relayer_url: http://relayer:<http_port>` and `relayer_submitters: <validators>`. With
+`--spammer` alone, `relayer_url` is omitted and the spammer submits directly to primary validators.
 
 Build both binaries before creating the deployment. For Graviton instances:
 

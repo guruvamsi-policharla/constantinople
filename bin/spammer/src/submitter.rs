@@ -48,7 +48,8 @@ pub struct ValidatorSubmitter {
     validator_index: usize,
 }
 
-/// Submits batches through a relayer and advances on fast acknowledgement.
+/// Submits batches through a relayer and waits for finalization before
+/// advancing nonces.
 pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,
@@ -57,11 +58,32 @@ pub struct RelayerSubmitter {
 
 #[derive(Debug, serde::Deserialize)]
 struct RelayerSubmitResponse {
-    #[allow(dead_code)]
     batch_id: String,
+    #[allow(dead_code)]
     digests: Vec<String>,
     #[allow(dead_code)]
     acknowledged_leaders: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RelayerBatchStatus {
+    Accepted {
+        #[allow(dead_code)]
+        digests: Vec<String>,
+    },
+    Finalized {
+        height: u64,
+        included: Vec<String>,
+    },
+    PartiallyFinalized {
+        height: u64,
+        included: Vec<String>,
+        filtered: Vec<String>,
+    },
+    Dropped {
+        filtered: Vec<String>,
+    },
 }
 
 impl RelayerSubmitter {
@@ -73,19 +95,68 @@ impl RelayerSubmitter {
         }
     }
 
-    /// Submits the batch and returns after the relayer acknowledges it.
-    pub async fn submit_until_accepted(&self, batch: Vec<Tx>) {
+    /// Submits the batch through the relayer and waits until every transaction
+    /// is finalized.
+    pub async fn submit_until_finalized(&self, batch: Vec<Tx>) {
+        let mut pending = batch;
         let mut backoff = INITIAL_BACKOFF;
-        let body = batch.encode();
 
-        loop {
+        while !pending.is_empty() {
+            let body = pending.encode();
             match self.submit_encoded(body.clone()).await {
-                Ok(response) => {
-                    self.stats
-                        .finalized
-                        .fetch_add(response.digests.len() as u64, Ordering::Relaxed);
-                    return;
-                }
+                Ok(response) => match self.poll_status(&response.batch_id).await {
+                    Ok(RelayerBatchStatus::Accepted { .. }) => {}
+                    Ok(RelayerBatchStatus::Finalized { height, included }) => {
+                        self.stats
+                            .finalized
+                            .fetch_add(included.len() as u64, Ordering::Relaxed);
+                        debug!(height, count = included.len(), "relayed batch finalized");
+                        return;
+                    }
+                    Ok(RelayerBatchStatus::PartiallyFinalized {
+                        height,
+                        included,
+                        filtered,
+                    }) => {
+                        self.stats
+                            .finalized
+                            .fetch_add(included.len() as u64, Ordering::Relaxed);
+                        self.stats
+                            .filtered
+                            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                        info!(
+                            height,
+                            included = included.len(),
+                            filtered = filtered.len(),
+                            "relayed batch partially finalized, resubmitting filtered"
+                        );
+                        pending = extract_filtered(&pending, &filtered);
+                        backoff = INITIAL_BACKOFF;
+                    }
+                    Ok(RelayerBatchStatus::Dropped { filtered }) => {
+                        self.stats
+                            .dropped
+                            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                        let filtered = extract_filtered(&pending, &filtered);
+                        if !filtered.is_empty() {
+                            pending = filtered;
+                        }
+                        debug!(
+                            pending = pending.len(),
+                            "relayed batch dropped, resubmitting"
+                        );
+                    }
+                    Err(error) => {
+                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            error = %error,
+                            backoff_ms = backoff.as_millis(),
+                            "relayer status error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                },
                 Err(error) => {
                     self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     warn!(
@@ -124,6 +195,40 @@ impl RelayerSubmitter {
             500 => Err(SubmitError::InternalServerError),
             503 => Err(SubmitError::ServiceUnavailable),
             other => Err(SubmitError::Unexpected(other)),
+        }
+    }
+
+    async fn poll_status(
+        &self,
+        batch_id: &str,
+    ) -> Result<RelayerBatchStatus, constantinople_mempool::webserver::client::SubmitError> {
+        use constantinople_mempool::webserver::client::SubmitError;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let response = self
+                .http
+                .get(format!("{}/transactions/{batch_id}", self.url))
+                .send()
+                .await?;
+
+            match response.status().as_u16() {
+                200 => {
+                    let bytes = response.bytes().await?;
+                    let status: RelayerBatchStatus =
+                        serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)?;
+                    if matches!(status, RelayerBatchStatus::Accepted { .. }) {
+                        continue;
+                    }
+                    return Ok(status);
+                }
+                404 => continue,
+                400 => return Err(SubmitError::BadRequest),
+                413 => return Err(SubmitError::PayloadTooLarge),
+                500 => return Err(SubmitError::InternalServerError),
+                503 => continue,
+                other => return Err(SubmitError::Unexpected(other)),
+            }
         }
     }
 }

@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["peers", "hosts"])]
     pub relayer_url: Option<String>,
 
+    /// Independent nonce-ordered streams to run in relayer mode.
+    #[arg(long, default_value_t = 1)]
+    pub relayer_submitters: usize,
+
     /// Number of spam accounts per validator in the ring transfer.
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
@@ -97,8 +101,23 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.relayer_url, Some("http://127.0.0.1:8084".to_string()));
+        assert_eq!(cli.relayer_submitters, 1);
         assert!(cli.peers.is_none());
         assert!(cli.hosts.is_none());
+    }
+
+    #[test]
+    fn parses_relayer_submitters() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--relayer-submitters",
+            "4",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.relayer_submitters, 4);
     }
 
     #[test]

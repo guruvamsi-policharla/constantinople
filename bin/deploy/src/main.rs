@@ -27,7 +27,7 @@ use std::{
 use tracing::Level;
 use tracing_subscriber::fmt;
 
-const STORAGE_CLASS: &str = "gp3";
+const STORAGE_CLASS: &str = "io2";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
@@ -205,6 +205,9 @@ pub(crate) struct SpammerConfig {
     /// Relayer URL used for normal transaction submission.
     #[serde(default)]
     pub relayer_url: Option<String>,
+    /// Independent nonce-ordered streams to run when submitting through a relayer.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub relayer_submitters: usize,
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
     ///
     /// In `--hosts` mode the spammer cannot distinguish primaries from
@@ -372,6 +375,10 @@ impl RemoteArgs {
 
 pub(crate) const fn relayer_enabled(args: &GenerateArgs) -> bool {
     args.relayer
+}
+
+const fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn main() {
