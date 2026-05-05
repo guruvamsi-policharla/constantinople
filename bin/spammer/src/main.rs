@@ -26,34 +26,43 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
-use submitter::{Stats, ValidatorSubmitter};
+use submitter::{RelayerSubmitter, Stats, ValidatorSubmitter};
 use tracing::info;
 
 fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (accounts_count, value, seed_offset, http_port, primary_validators, accounts_jitter) =
-        if let Some(config_path) = &cli.config {
-            let cfg = config::load_config(config_path);
-            (
-                cfg.accounts,
-                cfg.value,
-                cfg.seed_offset,
-                cfg.http_port,
-                cfg.primary_validators,
-                cfg.accounts_jitter,
-            )
-        } else {
-            (
-                cli.accounts,
-                cli.value,
-                cli.seed_offset,
-                cli.http_port,
-                Vec::new(),
-                cli.accounts_jitter,
-            )
-        };
+    let (
+        accounts_count,
+        value,
+        seed_offset,
+        http_port,
+        relayer_url,
+        primary_validators,
+        accounts_jitter,
+    ) = if let Some(config_path) = &cli.config {
+        let cfg = config::load_config(config_path);
+        (
+            cfg.accounts,
+            cfg.value,
+            cfg.seed_offset,
+            cfg.http_port,
+            cfg.relayer_url.or_else(|| cli.relayer_url.clone()),
+            cfg.primary_validators,
+            cfg.accounts_jitter,
+        )
+    } else {
+        (
+            cli.accounts,
+            cli.value,
+            cli.seed_offset,
+            cli.http_port,
+            cli.relayer_url.clone(),
+            Vec::new(),
+            cli.accounts_jitter,
+        )
+    };
     assert!(
         (0.0..=1.0).contains(&accounts_jitter),
         "--accounts-jitter must be between 0 and 1"
@@ -89,7 +98,24 @@ fn main() {
             .create_strategy(NZUsize!(cli.rayon_threads))
             .expect("failed to create parallel strategy");
 
-        // Discover validator endpoints.
+        if let Some(relayer_url) = relayer_url {
+            run_relayer_mode(
+                relayer_url,
+                accounts_count,
+                value,
+                seed_offset,
+                accounts_jitter,
+                strategy,
+            )
+            .await;
+            return;
+        }
+        assert!(
+            cli.peers.is_some() || cli.hosts.is_some(),
+            "provide --relayer-url, --peers, or --hosts"
+        );
+
+        // Discover validator endpoints for explicit legacy/debug mode.
         let clients = if let Some(peers_path) = &cli.peers {
             config::clients_from_peers(peers_path)
         } else {
@@ -179,6 +205,67 @@ fn main() {
             );
         }
     });
+}
+
+async fn run_relayer_mode(
+    relayer_url: String,
+    accounts_count: u32,
+    value: NonZeroU64,
+    seed_offset: u64,
+    accounts_jitter: f64,
+    strategy: impl commonware_parallel::Strategy + 'static,
+) {
+    let accounts = generate_accounts(accounts_count, seed_offset);
+    info!(
+        accounts = accounts_count,
+        value = value.get(),
+        seed_offset,
+        accounts_jitter,
+        %relayer_url,
+        "starting spammer relayer mode"
+    );
+
+    let stats = Arc::new(Stats::new());
+    let submitter = RelayerSubmitter::new(relayer_url, stats.clone());
+    let start = Instant::now();
+
+    tokio::spawn(async move {
+        let mut rng = JitterRng::new(seed_offset.wrapping_add(1));
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+        loop {
+            let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
+            let batch = sign_batch(
+                &strategy,
+                &accounts,
+                value,
+                &mut nonces,
+                &mut cursor,
+                batch_size,
+            );
+            submitter.submit_until_accepted(batch).await;
+        }
+    });
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let finalized = stats.finalized.load(Ordering::Relaxed);
+        let errors = stats.errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let tps = if elapsed > 0.0 {
+            finalized as f64 / elapsed
+        } else {
+            0.0
+        };
+        info!(
+            accepted = finalized,
+            errors,
+            tps = format!("{tps:.0}"),
+            elapsed_s = format!("{elapsed:.1}"),
+            "progress"
+        );
+    }
 }
 
 fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {

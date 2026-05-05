@@ -6,7 +6,14 @@ import {
     parseU64,
 } from './codec';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
-import { fetchAccount, submitTransactions, type AccountView, type TxStatus } from './mempool';
+import {
+    fetchAccount,
+    fetchTransactionStatus,
+    submitTransactions,
+    type AccountView,
+    type SubmitResponse,
+    type TxStatus,
+} from './mempool';
 import {
     clearSession,
     createWallet,
@@ -58,7 +65,7 @@ interface SubmittedTransaction {
     readonly nonce: string;
     readonly submittedAt: number;
     readonly finalizedInMs: number | null;
-    readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
+    readonly status: 'pending' | 'accepted' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
 }
 
@@ -286,9 +293,20 @@ export default function App() {
                 detail: 'submitted to mempool',
             };
             setHistory((current) => prependTransaction(pending, current));
-            setSubmitMessage('waiting for finalization');
+            setSubmitMessage('submitting');
 
-            const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
+            const submitResponse = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
+            let txStatus: TxStatus;
+            if ('batch_id' in submitResponse) {
+                const accepted: TxStatus = { status: 'accepted', digests: submitResponse.digests };
+                setHistory((current) =>
+                    updateTransactionStatus(encoded.digestHex, accepted, 'accepted by relayer', current),
+                );
+                setSubmitMessage('accepted by relayer');
+                txStatus = await pollTransactionStatus(mempoolUrl, submitResponse);
+            } else {
+                txStatus = submitResponse;
+            }
             const detail = formatTxStatus(txStatus, encoded.digestHex);
             setHistory((current) => updateTransactionStatus(encoded.digestHex, txStatus, detail, current));
             setSubmitMessage(detail);
@@ -710,12 +728,26 @@ function updateTransactionStatus(
             ...tx,
             status: status.status,
             detail,
-            finalizedInMs: Date.now() - tx.submittedAt,
+            finalizedInMs: status.status === 'accepted' ? null : Date.now() - tx.submittedAt,
         };
     });
 }
 
+async function pollTransactionStatus(baseUrl: string, submission: SubmitResponse): Promise<TxStatus> {
+    for (;;) {
+        await sleep(1_000);
+        const status = await fetchTransactionStatus(baseUrl, submission.batch_id);
+        if (status === null || status.status === 'accepted') {
+            continue;
+        }
+        return status;
+    }
+}
+
 function formatTxStatus(status: TxStatus, digest: string): string {
+    if (status.status === 'accepted') {
+        return 'accepted';
+    }
     if (status.status === 'finalized') {
         return `finalized at ${status.height}`;
     }
@@ -726,6 +758,10 @@ function formatTxStatus(status: TxStatus, digest: string): string {
         return `partial at ${status.height}: filtered ${status.filtered.map(shortHex).join(', ')}`;
     }
     return status.status;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function shortHex(value: string): string {

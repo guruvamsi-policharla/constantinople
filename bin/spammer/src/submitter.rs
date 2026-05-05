@@ -5,6 +5,7 @@
 //! finalized. This guarantees nonce ordering.
 
 use crate::signer::Tx;
+use commonware_codec::Encode;
 use constantinople_mempool::webserver::{TxStatus, client::Client};
 use std::{
     collections::HashSet,
@@ -45,6 +46,86 @@ pub struct ValidatorSubmitter {
     client: Arc<Client>,
     stats: Arc<Stats>,
     validator_index: usize,
+}
+
+/// Submits batches through a relayer and advances on fast acknowledgement.
+pub struct RelayerSubmitter {
+    url: String,
+    http: reqwest::Client,
+    stats: Arc<Stats>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RelayerSubmitResponse {
+    #[allow(dead_code)]
+    batch_id: String,
+    digests: Vec<String>,
+    #[allow(dead_code)]
+    acknowledged_leaders: Vec<String>,
+}
+
+impl RelayerSubmitter {
+    pub fn new(url: String, stats: Arc<Stats>) -> Self {
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+            stats,
+        }
+    }
+
+    /// Submits the batch and returns after the relayer acknowledges it.
+    pub async fn submit_until_accepted(&self, batch: Vec<Tx>) {
+        let mut backoff = INITIAL_BACKOFF;
+        let body = batch.encode();
+
+        loop {
+            match self.submit_encoded(body.clone()).await {
+                Ok(response) => {
+                    self.stats
+                        .finalized
+                        .fetch_add(response.digests.len() as u64, Ordering::Relaxed);
+                    return;
+                }
+                Err(error) => {
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %error,
+                        backoff_ms = backoff.as_millis(),
+                        "relayer submit error, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    async fn submit_encoded(
+        &self,
+        body: bytes::Bytes,
+    ) -> Result<RelayerSubmitResponse, constantinople_mempool::webserver::client::SubmitError> {
+        use constantinople_mempool::webserver::client::SubmitError;
+
+        let response = self
+            .http
+            .post(format!("{}/transactions", self.url))
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+
+        match response.status().as_u16() {
+            202 => {
+                let bytes = response.bytes().await?;
+                serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
+            }
+            400 => Err(SubmitError::BadRequest),
+            413 => Err(SubmitError::PayloadTooLarge),
+            500 => Err(SubmitError::InternalServerError),
+            503 => Err(SubmitError::ServiceUnavailable),
+            other => Err(SubmitError::Unexpected(other)),
+        }
+    }
 }
 
 impl ValidatorSubmitter {

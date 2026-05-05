@@ -35,7 +35,7 @@ commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 
 # Other
 axum.workspace = true
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }

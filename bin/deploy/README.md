@@ -61,6 +61,9 @@ cargo run --bin constantinople-deploy -- generate \
 The spammer waits 10 seconds for validators to start, then continuously submits ring transfers.
 Each validator receives transactions from its own independent set of accounts.
 
+By default, `--spammer` submits directly to primary validator mempool endpoints. Add `--relayer`
+as well if the spammer should submit through the transaction relayer instead.
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
@@ -83,6 +86,29 @@ cargo run --release --bin constantinople-spammer -- \
   --value 1 \
   --accounts-jitter 0.25
 ```
+
+### Local Deployment with Relayer
+
+Add `--relayer` to include the transaction relayer in the generated local bundle:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --output-dir ./local \
+  --relayer \
+  local \
+  --base-port 3000 \
+  --base-http-port 8080
+```
+
+This writes `relayer.yaml` and adds `constantinople-relayer` to the printed `mprocs` command. The
+relayer listens on the next local HTTP port after validators and secondaries
+(`base_http_port + validators + secondaries`) and forwards each submitted batch to the next
+leader window.
+
+When both `--spammer` and `--relayer` are set, the generated spammer command uses
+`--relayer-url`. Without `--relayer`, the spammer uses `--peers` and submits directly to primary
+validators.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -112,6 +138,9 @@ The printed `mprocs` command list grows by two entries:
 - `VITE_SQL_URL=http://127.0.0.1:8091 npm --prefix explorer run dev`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service and streams new finalized blocks live.
+
+If `--relayer` is also enabled, the explorer command receives `VITE_MEMPOOL_URL` pointing at the
+local relayer. Otherwise it uses its default direct mempool URL.
 
 End-to-end "spin everything up" with the spammer for live transaction flow:
 
@@ -208,6 +237,37 @@ cargo run --bin constantinople-deploy -- generate \
 ```
 
 This additionally writes `spammer.yaml` and adds a spammer instance to the deployer config.
+By default, the spammer targets primary validator HTTP endpoints discovered from `hosts.yaml`.
+Add `--relayer` to route the spammer through the relayer.
+
+### Remote Deployment with Relayer
+
+Add `--relayer` to include a relayer instance in the remote deployment:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --output-dir ./deploy \
+  --worker-threads 4 \
+  --rayon-threads 4 \
+  --relayer \
+  remote \
+  --http-cidr 0.0.0.0/0 \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./docker/dashboard.json
+```
+
+This writes `relayer.yaml` and adds a `relayer` instance to `config.yaml`. The relayer listens on
+the configured HTTP port and forwards transaction batches to the next leader window among primary
+validators. It is optional; `--spammer` does not create a relayer unless `--relayer` is also set.
+
+When `--spammer --relayer` are used together, `spammer.yaml` includes
+`relayer_url: http://relayer:<http_port>`. With `--spammer` alone, `relayer_url` is omitted and
+the spammer submits directly to primary validators.
 
 Build both binaries before creating the deployment. For Graviton instances:
 
@@ -221,8 +281,8 @@ For Intel instances:
 just intel-binaries
 ```
 
-These targets write `deploy/validator`, `deploy/validator-debug`, `deploy/spammer`, and
-`deploy/spammer-debug`.
+These targets write `deploy/validator`, `deploy/validator-debug`, `deploy/spammer`,
+`deploy/spammer-debug`, `deploy/relayer`, and `deploy/relayer-debug`.
 
 Then create the deployment as usual:
 
@@ -306,6 +366,7 @@ Those aggregate targets now write:
 
 - `deploy/validator`
 - `deploy/spammer` when `--spammer` is enabled
+- `deploy/relayer` when `--relayer` is enabled
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
 

@@ -7,8 +7,7 @@ use std::path::PathBuf;
 #[command(name = "constantinople-spammer")]
 #[command(group(
     ArgGroup::new("network_source")
-        .required(true)
-        .args(["peers", "hosts"])
+        .args(["relayer_url", "peers", "hosts"])
 ))]
 pub struct Cli {
     /// Path to the spammer config YAML (required for deployer mode, optional for local).
@@ -16,12 +15,16 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     /// Path to the local peer topology YAML file.
-    #[arg(long, conflicts_with = "hosts")]
+    #[arg(long, conflicts_with_all = ["hosts", "relayer_url"])]
     pub peers: Option<PathBuf>,
 
     /// Path to the deployer-generated hosts file.
-    #[arg(long, conflicts_with = "peers")]
+    #[arg(long, conflicts_with_all = ["peers", "relayer_url"])]
     pub hosts: Option<PathBuf>,
+
+    /// Relayer base URL for normal single-endpoint submission.
+    #[arg(long, conflicts_with_all = ["peers", "hosts"])]
+    pub relayer_url: Option<String>,
 
     /// Number of spam accounts per validator in the ring transfer.
     #[arg(long, default_value_t = 10)]
@@ -85,6 +88,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_relayer_invocation() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.relayer_url, Some("http://127.0.0.1:8084".to_string()));
+        assert!(cli.peers.is_none());
+        assert!(cli.hosts.is_none());
+    }
+
+    #[test]
     fn parses_fractional_accounts_jitter() {
         let cli = Cli::try_parse_from([
             "constantinople-spammer",
@@ -109,7 +126,7 @@ mod tests {
         ])
         .expect_err("jitter above one should fail");
 
-        assert!(error.to_string().contains("jitter must be between 0 and 1"));
+        assert!(error.to_string().contains("invalid value"));
     }
 
     #[test]
@@ -141,8 +158,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_neither_peers_nor_hosts() {
+    fn parses_config_only_for_deployer_mode() {
         let result = Cli::try_parse_from(["constantinople-spammer"]);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }

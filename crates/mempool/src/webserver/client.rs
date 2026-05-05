@@ -7,7 +7,7 @@ use constantinople_primitives::SignedTransaction;
 use derive_more::Display;
 use serde::Deserialize;
 
-/// Error returned by [`Client::submit`].
+/// Error returned by mempool submission calls.
 #[derive(Debug, Display)]
 pub enum SubmitError {
     /// One or more transactions failed to decode or had an invalid signature.
@@ -92,6 +92,44 @@ impl Client {
         }
     }
 
+    /// Submits a batch and returns after validator verification plus enqueue.
+    ///
+    /// The batch is encoded as a commonware-codec length-prefixed vector and
+    /// sent to `POST /transactions/ingest`.
+    pub async fn ingest<P, H>(
+        &self,
+        transactions: &[SignedTransaction<P, H>],
+    ) -> Result<IngestView, SubmitError>
+    where
+        P: PublicKey,
+        H: Hasher,
+    {
+        self.ingest_encoded(transactions.encode()).await
+    }
+
+    /// Submits an already codec-encoded batch to the fast ingest endpoint.
+    pub async fn ingest_encoded(&self, body: bytes::Bytes) -> Result<IngestView, SubmitError> {
+        let response = self
+            .http
+            .post(format!("{}/transactions/ingest", self.url))
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+
+        match response.status().as_u16() {
+            202 => {
+                let bytes = response.bytes().await?;
+                serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
+            }
+            400 => Err(SubmitError::BadRequest),
+            413 => Err(SubmitError::PayloadTooLarge),
+            500 => Err(SubmitError::InternalServerError),
+            503 => Err(SubmitError::ServiceUnavailable),
+            other => Err(SubmitError::Unexpected(other)),
+        }
+    }
+
     /// Fetches the committed account for `public_key`.
     ///
     /// Returns `Ok(Some(account))` when the account has been written, `Ok(None)`
@@ -128,4 +166,10 @@ impl Client {
 pub struct AccountView {
     pub balance: u64,
     pub nonce: u64,
+}
+
+/// Fast-ingest acknowledgement returned by validators.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestView {
+    pub digests: Vec<String>,
 }

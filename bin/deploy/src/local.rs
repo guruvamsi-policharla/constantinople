@@ -1,9 +1,10 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
     DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
-    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig, ValidatorConfig,
-    absolute_path, default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig, RELAYER_CONFIG_FILE,
+    RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path, default_bootstrappers,
+    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
+    generate_local_cluster_material, relayer_enabled, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -31,7 +32,9 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
 
-    let material = generate_local_cluster_material(args.validators, args.secondaries);
+    let relayer_enabled = relayer_enabled(args);
+    let relayer_secondaries = args.secondaries + u32::from(relayer_enabled);
+    let material = generate_local_cluster_material(args.validators, relayer_secondaries);
     let validators = build_validators(args, local, &output_dir, &material);
     let secondaries = build_secondaries(args, local, &output_dir, &material);
     let peers = PeersConfig {
@@ -51,6 +54,10 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     for secondary in &secondaries {
         write_yaml_config(&secondary.config_file, &secondary.config);
+    }
+    if relayer_enabled {
+        let relayer_config = local_relayer_config(args, local, &material);
+        write_yaml_config(&output_dir.join(RELAYER_CONFIG_FILE), &relayer_config);
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
@@ -200,6 +207,39 @@ fn build_secondaries(
     secondaries
 }
 
+fn local_relayer_config(
+    args: &GenerateArgs,
+    local: &LocalArgs,
+    material: &ClusterMaterial,
+) -> RelayerConfig {
+    let relayer_offset = args.validators as u16 + args.secondaries as u16;
+    let relayer_http_port = local
+        .base_http_port
+        .checked_add(relayer_offset)
+        .expect("relayer http port overflow");
+    let leaders = material
+        .primary_hex()
+        .into_iter()
+        .enumerate()
+        .map(|(index, public_key)| RelayerLeaderConfig {
+            public_key,
+            url: format!(
+                "http://127.0.0.1:{}",
+                local
+                    .base_http_port
+                    .checked_add(index as u16)
+                    .expect("validator http port overflow")
+            ),
+        })
+        .collect();
+
+    RelayerConfig {
+        listen: format!("0.0.0.0:{relayer_http_port}"),
+        leader_fanout: None,
+        leaders,
+    }
+}
+
 /// Build the indexer wiring written into every secondary's YAML when the
 /// local deploy is started with `--indexer`. All three URLs point at the same
 /// simulator; routing-by-family in the indexer client keeps writes correct
@@ -254,6 +294,14 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
         ));
     }
 
+    if relayer_enabled(args) {
+        let path = output_dir.join(RELAYER_CONFIG_FILE);
+        commands.push(format!(
+            "cargo run --bin constantinople-relayer -- --config {}",
+            path.display()
+        ));
+    }
+
     if local.indexer {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
@@ -280,21 +328,36 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
         // so a non-default port still works. The raw `chain-indexer` URL is
         // intentionally not forwarded — the UI only consumes the metadata
         // service today.
+        let relayer_env = if relayer_enabled(args) {
+            format!(
+                " VITE_MEMPOOL_URL=http://127.0.0.1:{}",
+                local.base_http_port + args.validators as u16 + args.secondaries as u16,
+            )
+        } else {
+            String::new()
+        };
         commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} npm --prefix explorer run dev",
-            local.metadata_indexer_port,
+            "VITE_SQL_URL=http://127.0.0.1:{}{} npm --prefix explorer run dev",
+            local.metadata_indexer_port, relayer_env,
         ));
     }
 
     if args.spammer {
+        let network_source = if relayer_enabled(args) {
+            format!(
+                "--relayer-url http://127.0.0.1:{}",
+                local.base_http_port + args.validators as u16 + args.secondaries as u16,
+            )
+        } else {
+            format!("--peers {}", peers_path.display())
+        };
         commands.push(format!(
             "sleep 10 && cargo run --release --bin constantinople-spammer -- \
-             --peers {} \
+             {network_source} \
              --accounts {} \
              --value {} \
              --seed-offset {} \
              --accounts-jitter {}",
-            peers_path.display(),
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -324,6 +387,7 @@ mod tests {
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
             spammer,
+            relayer: false,
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
@@ -368,11 +432,34 @@ mod tests {
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-spammer"));
-        assert!(commands[2].contains("--peers"));
+        assert!(commands[2].contains("--peers /tmp/configs/peers.yaml"));
         assert!(commands[2].contains("--accounts 10"));
         assert!(commands[2].contains("--value 1"));
         assert!(commands[2].contains("--seed-offset 1000"));
         assert!(commands[2].contains("--accounts-jitter 0"));
+    }
+
+    #[test]
+    fn local_run_commands_include_optional_relayer_when_enabled() {
+        let mut args = test_args(false);
+        args.relayer = true;
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        assert_eq!(commands.len(), 3);
+        assert!(commands[2].contains("constantinople-relayer"));
+    }
+
+    #[test]
+    fn local_spammer_uses_relayer_when_both_are_enabled() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        assert_eq!(commands.len(), 4);
+        assert!(commands[2].contains("constantinople-relayer"));
+        assert!(commands[3].contains("constantinople-spammer"));
+        assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
+        assert!(!commands[3].contains("--peers"));
     }
 
     #[test]

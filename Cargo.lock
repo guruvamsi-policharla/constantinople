@@ -1676,9 +1676,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-relayer"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "commonware-cryptography",
+ "commonware-formatting",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tower",
+ "tower-http 0.6.8",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "constantinople-spammer"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "commonware-codec 2026.4.0 (git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue)",
  "commonware-cryptography",
@@ -1689,7 +1710,9 @@ dependencies = [
  "commonware-utils",
  "constantinople-mempool",
  "constantinople-primitives",
+ "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",

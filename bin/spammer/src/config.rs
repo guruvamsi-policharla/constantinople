@@ -19,6 +19,9 @@ pub struct SpammerConfig {
     pub value: u64,
     pub seed_offset: u64,
     pub http_port: u16,
+    /// Relayer URL used for normal transaction submission.
+    #[serde(default)]
+    pub relayer_url: Option<String>,
     /// Hex-encoded ed25519 public keys of primary validators. Used to filter
     /// hosts.yaml so secondaries are not spammed. Empty means accept any
     /// hex-named validator host (local/CLI-only fallback).
@@ -116,6 +119,7 @@ mod tests {
             value: 5,
             seed_offset: 2000,
             http_port: 9090,
+            relayer_url: Some("http://relayer:8080".to_string()),
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
         };
@@ -125,6 +129,7 @@ mod tests {
         assert_eq!(parsed.value, config.value);
         assert_eq!(parsed.seed_offset, config.seed_offset);
         assert_eq!(parsed.http_port, config.http_port);
+        assert_eq!(parsed.relayer_url, config.relayer_url);
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
     }

@@ -5,7 +5,8 @@
 //! consensus layer via the [`Mailbox`].
 
 use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
-use commonware_consensus::marshal::Update;
+use commonware_codec::EncodeSize;
+use commonware_consensus::{marshal::Update, types::Round};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
@@ -13,13 +14,15 @@ use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::VerifiedTransaction;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     hash::Hash,
     sync::{Arc, OnceLock},
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
+
+const MAX_STATUS_ENTRIES: usize = 1_000_000;
 
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
@@ -45,6 +48,24 @@ pub enum TxStatus {
     Dropped,
 }
 
+/// Latest known status for a submitted batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BatchStatus {
+    /// The batch is accepted by this validator but has not resolved yet.
+    Accepted { digests: Vec<String> },
+    /// The batch's block was finalized.
+    Finalized { height: u64, included: Vec<String> },
+    /// The batch's block was finalized, but some transactions were filtered.
+    PartiallyFinalized {
+        height: u64,
+        included: Vec<String>,
+        filtered: Vec<String>,
+    },
+    /// The batch was proposed but its block was not finalized.
+    Dropped { filtered: Vec<String> },
+}
+
 /// Mempool actor configuration.
 pub struct Config<SigSt: Strategy, HashSt: Strategy> {
     /// Maximum total bytes the pool will hold.
@@ -67,16 +88,26 @@ pub struct Config<SigSt: Strategy, HashSt: Strategy> {
 struct PoolEntry<P: PublicKey, H: Hasher> {
     transactions: Vec<VerifiedTransaction<P, H>>,
     total_bytes: usize,
-    waiter: oneshot::Sender<TxStatus>,
 }
 
-/// A set of batches that were proposed together at a given height.
-struct Proposed<H: Hasher> {
+/// A batch proposed at a given height.
+struct ProposedBatch<H: Hasher> {
     height: u64,
     digests: Vec<H::Digest>,
-    waiters: Vec<oneshot::Sender<TxStatus>>,
 }
 
+#[derive(Clone, Copy)]
+enum DigestOutcome {
+    Finalized { height: u64 },
+    Dropped,
+}
+
+pub(super) enum IngestStatus {
+    Accepted,
+    Dropped,
+}
+
+#[cfg(test)]
 fn status_for_finalized_block<D>(
     height: u64,
     digests: &[D],
@@ -109,6 +140,272 @@ where
         included,
         filtered,
     })
+}
+
+fn batch_status_from_outcomes<D>(
+    digests: &[D],
+    outcomes: &HashMap<D, DigestOutcome>,
+) -> Option<BatchStatus>
+where
+    D: Copy + Display + Eq + Hash,
+{
+    let mut included = Vec::new();
+    let mut filtered = Vec::new();
+    let mut finalized_height = 0;
+
+    for digest in digests {
+        match outcomes.get(digest) {
+            Some(DigestOutcome::Finalized { height }) => {
+                finalized_height = finalized_height.max(*height);
+                included.push(digest.to_string());
+            }
+            Some(DigestOutcome::Dropped) => filtered.push(digest.to_string()),
+            None => return None,
+        }
+    }
+
+    if included.is_empty() {
+        return Some(BatchStatus::Dropped { filtered });
+    }
+
+    if filtered.is_empty() {
+        return Some(BatchStatus::Finalized {
+            height: finalized_height,
+            included,
+        });
+    }
+
+    Some(BatchStatus::PartiallyFinalized {
+        height: finalized_height,
+        included,
+        filtered,
+    })
+}
+
+fn tx_status_from_batch(status: &BatchStatus) -> Option<TxStatus> {
+    match status {
+        BatchStatus::Accepted { .. } => None,
+        BatchStatus::Finalized { height, .. } => Some(TxStatus::Finalized { height: *height }),
+        BatchStatus::PartiallyFinalized {
+            height,
+            included,
+            filtered,
+        } => Some(TxStatus::PartiallyFinalized {
+            height: *height,
+            included: included.clone(),
+            filtered: filtered.clone(),
+        }),
+        BatchStatus::Dropped { .. } => Some(TxStatus::Dropped),
+    }
+}
+
+fn accepted_status<D>(digests: &[D]) -> BatchStatus
+where
+    D: Display,
+{
+    BatchStatus::Accepted {
+        digests: digests.iter().map(ToString::to_string).collect(),
+    }
+}
+
+fn remember_status(
+    statuses: &mut HashMap<String, BatchStatus>,
+    status_order: &mut VecDeque<String>,
+    batch_id: String,
+    status: BatchStatus,
+) -> Vec<String> {
+    if !statuses.contains_key(&batch_id) {
+        status_order.push_back(batch_id.clone());
+    }
+    statuses.insert(batch_id, status);
+
+    let mut expired = Vec::new();
+    while statuses.len() > MAX_STATUS_ENTRIES {
+        let Some(expired_batch_id) = status_order.pop_front() else {
+            break;
+        };
+        statuses.remove(&expired_batch_id);
+        expired.push(expired_batch_id);
+    }
+    expired
+}
+
+fn send_pending_waiters(
+    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    batch_id: &str,
+    status: &BatchStatus,
+) {
+    let Some(status) = tx_status_from_batch(status) else {
+        return;
+    };
+    let Some(waiters) = pending_waiters.remove(batch_id) else {
+        return;
+    };
+    for waiter in waiters {
+        let _ = waiter.send(status.clone());
+    }
+}
+
+fn watch_batch<D>(batch_id: &str, digests: &[D], watchers: &mut HashMap<D, Vec<String>>)
+where
+    D: Copy + Eq + Hash,
+{
+    let mut seen = HashSet::new();
+    for digest in digests {
+        if !seen.insert(*digest) {
+            continue;
+        }
+        watchers
+            .entry(*digest)
+            .or_default()
+            .push(batch_id.to_string());
+    }
+}
+
+fn forget_batch<D>(
+    batch_id: &str,
+    batch_digests: &mut HashMap<String, Vec<D>>,
+    watchers: &mut HashMap<D, Vec<String>>,
+    outcomes: &mut HashMap<D, DigestOutcome>,
+    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+) where
+    D: Copy + Eq + Hash,
+{
+    pending_waiters.remove(batch_id);
+    let Some(digests) = batch_digests.remove(batch_id) else {
+        return;
+    };
+
+    let mut seen = HashSet::new();
+    for digest in digests {
+        if !seen.insert(digest) {
+            continue;
+        }
+        let Some(batch_ids) = watchers.get_mut(&digest) else {
+            continue;
+        };
+        batch_ids.retain(|known| known != batch_id);
+        if batch_ids.is_empty() {
+            watchers.remove(&digest);
+            outcomes.remove(&digest);
+        }
+    }
+}
+
+fn forget_expired_batches<D>(
+    expired: Vec<String>,
+    batch_digests: &mut HashMap<String, Vec<D>>,
+    watchers: &mut HashMap<D, Vec<String>>,
+    outcomes: &mut HashMap<D, DigestOutcome>,
+    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+) where
+    D: Copy + Eq + Hash,
+{
+    for batch_id in expired {
+        forget_batch(
+            &batch_id,
+            batch_digests,
+            watchers,
+            outcomes,
+            pending_waiters,
+        );
+    }
+}
+
+fn watched_batches_for<D>(digests: &[D], watchers: &HashMap<D, Vec<String>>) -> HashSet<String>
+where
+    D: Copy + Eq + Hash,
+{
+    let mut affected = HashSet::new();
+    for digest in digests {
+        let Some(batch_ids) = watchers.get(digest) else {
+            continue;
+        };
+        affected.extend(batch_ids.iter().cloned());
+    }
+    affected
+}
+
+fn resolve_batch_if_terminal<D>(
+    batch_id: &str,
+    statuses: &mut HashMap<String, BatchStatus>,
+    status_order: &mut VecDeque<String>,
+    batch_digests: &mut HashMap<String, Vec<D>>,
+    digest_watchers: &mut HashMap<D, Vec<String>>,
+    digest_outcomes: &mut HashMap<D, DigestOutcome>,
+    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+) where
+    D: Copy + Display + Eq + Hash,
+{
+    let Some(digests) = batch_digests.get(batch_id) else {
+        return;
+    };
+    let Some(status) = batch_status_from_outcomes(digests, digest_outcomes) else {
+        return;
+    };
+
+    let expired = remember_status(statuses, status_order, batch_id.to_string(), status);
+    if let Some(status) = statuses.get(batch_id) {
+        send_pending_waiters(pending_waiters, batch_id, status);
+    }
+    forget_batch(
+        batch_id,
+        batch_digests,
+        digest_watchers,
+        digest_outcomes,
+        pending_waiters,
+    );
+    forget_expired_batches(
+        expired,
+        batch_digests,
+        digest_watchers,
+        digest_outcomes,
+        pending_waiters,
+    );
+}
+
+fn new_transactions<P, H>(
+    transactions: Vec<VerifiedTransaction<P, H>>,
+    known_digests: &mut HashSet<H::Digest>,
+) -> Vec<VerifiedTransaction<P, H>>
+where
+    P: PublicKey,
+    H: Hasher,
+    H::Digest: Copy + Eq + Hash,
+{
+    let mut accepted = Vec::with_capacity(transactions.len());
+    for transaction in transactions {
+        if !known_digests.insert(*transaction.message_digest()) {
+            continue;
+        }
+        accepted.push(transaction);
+    }
+    accepted
+}
+
+fn remove_known_digests<P, H>(
+    transactions: &[VerifiedTransaction<P, H>],
+    known_digests: &mut HashSet<H::Digest>,
+) where
+    P: PublicKey,
+    H: Hasher,
+    H::Digest: Eq + Hash,
+{
+    for transaction in transactions {
+        known_digests.remove(transaction.message_digest());
+    }
+}
+
+fn total_bytes_for<P, H>(transactions: &[VerifiedTransaction<P, H>]) -> usize
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    transactions.iter().map(EncodeSize::encode_size).sum()
+}
+
+const fn rotation_round(round: Round) -> u64 {
+    round.epoch().get().wrapping_add(round.view().get())
 }
 
 /// The mempool actor.
@@ -145,7 +442,7 @@ where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    H::Digest: Hash,
+    H::Digest: Eq + Hash,
     SigSt: Strategy,
     HashSt: Strategy,
 {
@@ -222,31 +519,94 @@ where
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut proposed: VecDeque<Proposed<H>> = VecDeque::new();
+        let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
+        let mut statuses: HashMap<String, BatchStatus> = HashMap::new();
+        let mut status_order = VecDeque::new();
+        let mut batch_digests: HashMap<String, Vec<H::Digest>> = HashMap::new();
+        let mut digest_watchers: HashMap<H::Digest, Vec<String>> = HashMap::new();
+        let mut digest_outcomes: HashMap<H::Digest, DigestOutcome> = HashMap::new();
+        let mut pending_waiters: HashMap<String, Vec<oneshot::Sender<TxStatus>>> = HashMap::new();
+        let mut known_digests: HashSet<H::Digest> = HashSet::new();
+        let mut highest_consensus_round = 0;
 
         while let Some(message) = rx.recv().await {
             match message {
                 Message::Submit {
+                    batch_id,
+                    digests,
                     transactions,
                     total_bytes,
                     result,
+                    ingest_result,
                 } => {
-                    if pool_bytes + total_bytes <= max_pool_bytes {
+                    if let Some(status) = statuses.get(&batch_id) {
+                        if let Some(ingest_result) = ingest_result {
+                            let _ = ingest_result.send(IngestStatus::Accepted);
+                        }
+                        if let Some(result) = result {
+                            if let Some(status) = tx_status_from_batch(status) {
+                                let _ = result.send(status);
+                            } else {
+                                pending_waiters.entry(batch_id).or_default().push(result);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let transactions = new_transactions(transactions, &mut known_digests);
+                    let total_bytes = total_bytes_for(&transactions).min(total_bytes);
+                    if !transactions.is_empty() && pool_bytes + total_bytes > max_pool_bytes {
+                        remove_known_digests(&transactions, &mut known_digests);
+                        if let Some(result) = result {
+                            let _ = result.send(TxStatus::Dropped);
+                        }
+                        if let Some(ingest_result) = ingest_result {
+                            let _ = ingest_result.send(IngestStatus::Dropped);
+                        }
+                        continue;
+                    }
+
+                    let expired = remember_status(
+                        &mut statuses,
+                        &mut status_order,
+                        batch_id.clone(),
+                        accepted_status(&digests),
+                    );
+                    batch_digests.insert(batch_id.clone(), digests.clone());
+                    watch_batch(&batch_id, &digests, &mut digest_watchers);
+                    forget_expired_batches(
+                        expired,
+                        &mut batch_digests,
+                        &mut digest_watchers,
+                        &mut digest_outcomes,
+                        &mut pending_waiters,
+                    );
+                    if let Some(result) = result {
+                        pending_waiters
+                            .entry(batch_id.clone())
+                            .or_default()
+                            .push(result);
+                    }
+                    if let Some(ingest_result) = ingest_result {
+                        let _ = ingest_result.send(IngestStatus::Accepted);
+                    }
+                    if !transactions.is_empty() {
                         pool_bytes += total_bytes;
                         pool.push_back(PoolEntry {
                             transactions,
                             total_bytes,
-                            waiter: result,
                         });
-                    } else {
-                        let _ = result.send(TxStatus::Dropped);
                     }
+                }
+                Message::QueryStatus { batch_id, response } => {
+                    let _ = response.send(statuses.get(&batch_id).cloned());
+                }
+                Message::QueryConsensusRound { response } => {
+                    let _ = response.send(highest_consensus_round);
                 }
                 Message::Propose { height, response } => {
                     let mut batch_txs = Vec::new();
                     let mut batch_bytes = 0;
-                    let mut batch_digests = Vec::new();
-                    let mut batch_waiters = Vec::new();
 
                     while let Some(entry) = pool.front() {
                         if batch_bytes + entry.total_bytes > max_propose_bytes
@@ -257,23 +617,18 @@ where
                         let entry = pool.pop_front().expect("front was Some");
                         pool_bytes -= entry.total_bytes;
                         batch_bytes += entry.total_bytes;
+                        let mut digests = Vec::with_capacity(entry.transactions.len());
                         for tx in &entry.transactions {
-                            batch_digests.push(*tx.message_digest());
+                            digests.push(*tx.message_digest());
                         }
+                        proposed.push_back(ProposedBatch { height, digests });
                         batch_txs.extend(entry.transactions);
-                        batch_waiters.push(entry.waiter);
-                    }
-
-                    if !batch_waiters.is_empty() {
-                        proposed.push_back(Proposed {
-                            height,
-                            digests: batch_digests,
-                            waiters: batch_waiters,
-                        });
                     }
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
+                    highest_consensus_round =
+                        highest_consensus_round.max(rotation_round(block.header.context.round));
                     let height = block.header.height;
                     let finalized: HashSet<H::Digest> = block
                         .body
@@ -282,16 +637,48 @@ where
                         .collect();
 
                     let mut remaining = VecDeque::new();
-                    for mut batch in proposed.drain(..) {
-                        if let Some(status) =
-                            status_for_finalized_block(height, &batch.digests, &finalized)
+                    for batch in proposed.drain(..) {
+                        let affected = watched_batches_for(&batch.digests, &digest_watchers);
+                        if batch
+                            .digests
+                            .iter()
+                            .any(|digest| finalized.contains(digest))
                         {
-                            for waiter in batch.waiters.drain(..) {
-                                let _ = waiter.send(status.clone());
+                            for digest in &batch.digests {
+                                if finalized.contains(digest) {
+                                    digest_outcomes
+                                        .insert(*digest, DigestOutcome::Finalized { height });
+                                } else {
+                                    digest_outcomes.insert(*digest, DigestOutcome::Dropped);
+                                }
+                                known_digests.remove(digest);
+                            }
+                            for batch_id in affected {
+                                resolve_batch_if_terminal(
+                                    &batch_id,
+                                    &mut statuses,
+                                    &mut status_order,
+                                    &mut batch_digests,
+                                    &mut digest_watchers,
+                                    &mut digest_outcomes,
+                                    &mut pending_waiters,
+                                );
                             }
                         } else if height >= batch.height + drop_grace_blocks {
-                            for waiter in batch.waiters.drain(..) {
-                                let _ = waiter.send(TxStatus::Dropped);
+                            for digest in &batch.digests {
+                                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
+                                known_digests.remove(digest);
+                            }
+                            for batch_id in affected {
+                                resolve_batch_if_terminal(
+                                    &batch_id,
+                                    &mut statuses,
+                                    &mut status_order,
+                                    &mut batch_digests,
+                                    &mut digest_watchers,
+                                    &mut digest_outcomes,
+                                    &mut pending_waiters,
+                                );
                             }
                         } else {
                             remaining.push_back(batch);
@@ -301,7 +688,9 @@ where
 
                     acknowledgement.acknowledge();
                 }
-                Message::Report(Update::Tip(..)) => {}
+                Message::Report(Update::Tip(round, ..)) => {
+                    highest_consensus_round = highest_consensus_round.max(rotation_round(round));
+                }
             }
         }
         warn!("mempool actor stopped: all senders dropped");
@@ -310,11 +699,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{TxStatus, status_for_finalized_block};
-    use commonware_cryptography::sha256;
+    use super::{
+        BatchStatus, DigestOutcome, TxStatus, batch_status_from_outcomes, new_transactions,
+        status_for_finalized_block,
+    };
+    use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
+    use constantinople_primitives::{Signable as _, TRANSACTION_NAMESPACE, Transaction};
+    use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -348,5 +742,65 @@ mod tests {
         let status = status_for_finalized_block(11, &digests, &finalized);
 
         assert_eq!(status, Some(TxStatus::Finalized { height: 11 }));
+    }
+
+    #[test]
+    fn new_transactions_filters_duplicate_digests() {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let recipient = ed25519::PrivateKey::from_seed(2).public_key();
+        let transaction = Transaction::new(
+            signer.public_key(),
+            recipient,
+            NonZeroU64::new(1).expect("non-zero"),
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        let duplicate = transaction.clone();
+        let mut known = HashSet::new();
+
+        let accepted = new_transactions(vec![transaction, duplicate], &mut known);
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn batch_status_waits_for_duplicate_digest_outcomes() {
+        let mut rng = StdRng::from_seed([11; 32]);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
+        let digests = vec![first, second];
+        let outcomes = HashMap::from([(first, DigestOutcome::Finalized { height: 7 })]);
+
+        let status = batch_status_from_outcomes(&digests, &outcomes);
+
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn batch_status_reports_partially_finalized_duplicate_batch() {
+        let mut rng = StdRng::from_seed([13; 32]);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
+        let digests = vec![first, second];
+        let outcomes = HashMap::from([
+            (first, DigestOutcome::Finalized { height: 7 }),
+            (second, DigestOutcome::Dropped),
+        ]);
+
+        let status = batch_status_from_outcomes(&digests, &outcomes);
+
+        assert_eq!(
+            status,
+            Some(BatchStatus::PartiallyFinalized {
+                height: 7,
+                included: vec![first.to_string()],
+                filtered: vec![second.to_string()],
+            }),
+        );
     }
 }

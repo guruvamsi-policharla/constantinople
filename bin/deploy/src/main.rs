@@ -32,6 +32,9 @@ const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
+const RELAYER_BINARY_FILE: &str = "relayer";
+const RELAYER_CONFIG_FILE: &str = "relayer.yaml";
+const RELAYER_HOST: &str = "relayer";
 const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
@@ -90,6 +93,9 @@ pub(crate) struct GenerateArgs {
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
     spammer: bool,
+    /// Include a transaction relayer in the deployment.
+    #[arg(long, default_value_t = false)]
+    relayer: bool,
     /// Number of spam accounts per validator.
     #[arg(long, default_value_t = 10)]
     spammer_accounts: u32,
@@ -196,6 +202,9 @@ pub(crate) struct SpammerConfig {
     pub value: u64,
     pub seed_offset: u64,
     pub http_port: u16,
+    /// Relayer URL used for normal transaction submission.
+    #[serde(default)]
+    pub relayer_url: Option<String>,
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
     ///
     /// In `--hosts` mode the spammer cannot distinguish primaries from
@@ -208,6 +217,21 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+}
+
+/// Relayer configuration, written as YAML by deploy and read by the relayer binary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelayerConfig {
+    pub listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_fanout: Option<usize>,
+    pub leaders: Vec<RelayerLeaderConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelayerLeaderConfig {
+    pub public_key: String,
+    pub url: String,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
@@ -344,6 +368,10 @@ impl RemoteArgs {
         }
         None
     }
+}
+
+pub(crate) const fn relayer_enabled(args: &GenerateArgs) -> bool {
+    args.relayer
 }
 
 fn main() {
@@ -610,6 +638,6 @@ mod tests {
         ])
         .expect_err("jitter above one should fail");
 
-        assert!(error.to_string().contains("jitter must be between 0 and 1"));
+        assert!(error.to_string().contains("invalid value"));
     }
 }

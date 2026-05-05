@@ -1,6 +1,6 @@
 //! Mailbox for the mempool webserver actor.
 
-use super::actor::TxStatus;
+use super::actor::{BatchStatus, IngestStatus, TxStatus};
 use crate::TransactionSource;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -27,10 +27,20 @@ where
 {
     /// A batch of verified transactions submitted by an HTTP handler.
     Submit {
+        batch_id: String,
+        digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<P, H>>,
         total_bytes: usize,
-        result: oneshot::Sender<TxStatus>,
+        result: Option<oneshot::Sender<TxStatus>>,
+        ingest_result: Option<oneshot::Sender<IngestStatus>>,
     },
+    /// HTTP asks for the latest known batch status.
+    QueryStatus {
+        batch_id: String,
+        response: oneshot::Sender<Option<BatchStatus>>,
+    },
+    /// HTTP asks for the highest locally observed consensus round.
+    QueryConsensusRound { response: oneshot::Sender<u64> },
     /// Consensus requests transactions for the next proposal.
     Propose {
         height: u64,
@@ -90,18 +100,63 @@ where
     /// Returns `None` if the channel is full.
     pub fn try_submit(
         &self,
+        batch_id: String,
+        digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<P, H>>,
         total_bytes: usize,
     ) -> Option<oneshot::Receiver<TxStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
             .try_send(Message::Submit {
+                batch_id,
+                digests,
                 transactions,
                 total_bytes,
-                result: result_tx,
+                result: Some(result_tx),
+                ingest_result: None,
             })
             .ok()
             .map(|()| result_rx)
+    }
+
+    /// Fast batch ingestion for relayers.
+    ///
+    /// Returns a receiver that resolves once the actor accepts or rejects the
+    /// batch for proposal. Returns `None` if the channel is full.
+    pub(super) fn try_ingest(
+        &self,
+        batch_id: String,
+        digests: Vec<H::Digest>,
+        transactions: Vec<VerifiedTransaction<P, H>>,
+        total_bytes: usize,
+    ) -> Option<oneshot::Receiver<IngestStatus>> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.sender
+            .try_send(Message::Submit {
+                batch_id,
+                digests,
+                transactions,
+                total_bytes,
+                result: None,
+                ingest_result: Some(result_tx),
+            })
+            .ok()
+            .map(|()| result_rx)
+    }
+
+    /// Returns the latest known status for a submitted batch.
+    pub async fn query_status(&self, batch_id: String) -> Option<BatchStatus> {
+        self.sender
+            .request(|response| Message::QueryStatus { batch_id, response })
+            .await
+            .flatten()
+    }
+
+    /// Returns the highest finalized consensus round observed by this mempool.
+    pub async fn query_consensus_round(&self) -> Option<u64> {
+        self.sender
+            .request(|response| Message::QueryConsensusRound { response })
+            .await
     }
 }
 

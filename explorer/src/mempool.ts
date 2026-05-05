@@ -6,6 +6,7 @@ export interface AccountView {
 }
 
 export type TxStatus =
+    | { readonly status: 'accepted'; readonly digests: string[] }
     | { readonly status: 'finalized'; readonly height: number }
     | {
           readonly status: 'partially_finalized';
@@ -13,7 +14,13 @@ export type TxStatus =
           readonly included: string[];
           readonly filtered: string[];
       }
-    | { readonly status: 'dropped' };
+    | { readonly status: 'dropped'; readonly filtered: string[] };
+
+export interface SubmitResponse {
+    readonly batch_id: string;
+    readonly digests: string[];
+    readonly acknowledged_leaders: string[];
+}
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);
@@ -30,7 +37,7 @@ export async function submitTransactions(
     baseUrl: string,
     batch: Uint8Array,
     signal?: AbortSignal,
-): Promise<TxStatus> {
+): Promise<SubmitResponse | TxStatus> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions`, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
@@ -42,6 +49,17 @@ export async function submitTransactions(
         const detail = await response.text();
         const suffix = detail ? `: ${detail}` : '';
         throw new Error(`transaction submission failed with HTTP ${response.status}${suffix}`);
+    }
+    return response.json();
+}
+
+export async function fetchTransactionStatus(baseUrl: string, batchId: string): Promise<TxStatus | null> {
+    const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions/${batchId}`);
+    if (response.status === 404) {
+        return null;
+    }
+    if (!response.ok) {
+        throw new Error(`transaction status failed with HTTP ${response.status}`);
     }
     return response.json();
 }

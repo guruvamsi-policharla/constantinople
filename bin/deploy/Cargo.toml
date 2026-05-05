@@ -22,7 +22,7 @@ commonware-deployer.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "std"] }
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true
 rand_core.workspace = true
