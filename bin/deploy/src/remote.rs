@@ -322,7 +322,7 @@ fn build_deployer_config(
             binary: validator_binary.to_string(),
             config: validator.config_name.clone(),
             profiling: remote.profiling,
-            storage_iops: Some(16000),
+            storage_iops: None,
         })
         .collect();
 
@@ -338,7 +338,7 @@ fn build_deployer_config(
             binary: validator_binary.to_string(),
             config: secondary.config_name.clone(),
             profiling: remote.profiling,
-            storage_iops: Some(16000),
+            storage_iops: None,
         });
     }
 
@@ -352,7 +352,7 @@ fn build_deployer_config(
             binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
-            storage_iops: Some(16000),
+            storage_iops: None,
         });
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
@@ -363,7 +363,7 @@ fn build_deployer_config(
             binary: METADATA_INDEXER_BINARY_FILE.to_string(),
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
-            storage_iops: Some(16000),
+            storage_iops: None,
         });
     }
 
@@ -380,7 +380,7 @@ fn build_deployer_config(
             binary: SPAMMER_BINARY_FILE.to_string(),
             config: SPAMMER_CONFIG_FILE.to_string(),
             profiling: false,
-            storage_iops: Some(16000),
+            storage_iops: None,
         });
     }
 
@@ -394,7 +394,7 @@ fn build_deployer_config(
             binary: RELAYER_BINARY_FILE.to_string(),
             config: RELAYER_CONFIG_FILE.to_string(),
             profiling: false,
-            storage_iops: Some(16000),
+            storage_iops: None,
         });
     }
 
@@ -405,7 +405,7 @@ fn build_deployer_config(
             storage_size: remote.monitoring_storage_size,
             storage_class: STORAGE_CLASS.to_string(),
             dashboard: dashboard.to_string(),
-            storage_iops: Some(6400),
+            storage_iops: None,
         },
         instances,
         ports: port_configs(remote),

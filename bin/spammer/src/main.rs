@@ -3,10 +3,10 @@
 //! Generates deterministic accounts and submits ring-transfer transactions to
 //! validator mempool endpoints in a continuous loop.
 //!
-//! Each validator gets its own independent set of accounts and runs a
-//! sequential submission loop: sign one batch, submit, wait for full
-//! finalization, then sign and submit the next batch. This guarantees nonce
-//! ordering and eliminates cascading failures.
+//! Each target gets its own independent set of accounts and runs a sequential
+//! submission loop: sign one batch, submit, wait for full finalization, then
+//! sign and submit the next batch. This guarantees nonce ordering and
+//! eliminates cascading failures.
 
 mod accounts;
 mod cli;
@@ -111,17 +111,16 @@ fn main() {
             .expect("failed to create parallel strategy");
 
         if let Some(relayer_url) = relayer_url {
-            run_relayer_mode(
+            let config = RelayerModeConfig {
                 relayer_url,
                 accounts_count,
                 value,
                 seed_offset,
                 accounts_jitter,
                 relayer_submitters,
-                primary_validators,
-                strategy,
-            )
-            .await;
+                relayer_targets: primary_validators,
+            };
+            run_relayer_mode(config, strategy).await;
             return;
         }
         assert!(
@@ -221,7 +220,7 @@ fn main() {
     });
 }
 
-async fn run_relayer_mode(
+struct RelayerModeConfig {
     relayer_url: String,
     accounts_count: u32,
     value: NonZeroU64,
@@ -229,8 +228,22 @@ async fn run_relayer_mode(
     accounts_jitter: f64,
     relayer_submitters: usize,
     relayer_targets: Vec<String>,
+}
+
+async fn run_relayer_mode(
+    config: RelayerModeConfig,
     strategy: impl commonware_parallel::Strategy + 'static,
 ) {
+    let RelayerModeConfig {
+        relayer_url,
+        accounts_count,
+        value,
+        seed_offset,
+        accounts_jitter,
+        relayer_submitters,
+        relayer_targets,
+    } = config;
+
     info!(
         submitters = relayer_submitters,
         accounts = accounts_count,
@@ -247,9 +260,7 @@ async fn run_relayer_mode(
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
-        let target = relayer_targets
-            .get(index % relayer_targets.len().max(1))
-            .cloned();
+        let target = relayer_target_for(&relayer_targets, index);
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
         let strategy = strategy.clone();
         tokio::spawn(async move {
@@ -308,6 +319,14 @@ fn max_extra_accounts(accounts: usize, accounts_jitter: f64) -> usize {
     (accounts as f64 * accounts_jitter).floor() as usize
 }
 
+fn relayer_target_for(targets: &[String], index: usize) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
+
+    targets.get(index % targets.len()).cloned()
+}
+
 /// Tiny inline xorshift64 used to jitter per-batch sizes. We don't pull
 /// `rand` in here because we only need a few bits per submission and the
 /// statistical quality of xorshift is more than sufficient for visual block
@@ -347,7 +366,7 @@ impl JitterRng {
 
 #[cfg(test)]
 mod tests {
-    use super::{JitterRng, jittered_batch_size, max_extra_accounts};
+    use super::{JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for};
 
     /// `range` must hit both endpoints over enough draws and never escape them.
     #[test]
@@ -405,5 +424,24 @@ mod tests {
 
         assert!(saw_base, "should sample the base account count");
         assert!(saw_max, "should sample the upper jitter bound");
+    }
+
+    #[test]
+    fn relayer_targets_are_selected_by_submitter_index() {
+        let targets = vec!["primary-0".to_string(), "primary-1".to_string()];
+
+        assert_eq!(
+            relayer_target_for(&targets, 0).as_deref(),
+            Some("primary-0")
+        );
+        assert_eq!(
+            relayer_target_for(&targets, 1).as_deref(),
+            Some("primary-1")
+        );
+        assert_eq!(
+            relayer_target_for(&targets, 2).as_deref(),
+            Some("primary-0")
+        );
+        assert!(relayer_target_for(&[], 0).is_none());
     }
 }
