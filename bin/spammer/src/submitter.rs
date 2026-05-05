@@ -63,6 +63,8 @@ struct RelayerSubmitResponse {
     digests: Vec<String>,
     #[allow(dead_code)]
     acknowledged_leaders: Vec<String>,
+    #[allow(dead_code)]
+    targeted_leaders: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

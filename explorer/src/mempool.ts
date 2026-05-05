@@ -20,6 +20,7 @@ export interface SubmitResponse {
     readonly batch_id: string;
     readonly digests: string[];
     readonly acknowledged_leaders: string[];
+    readonly targeted_leaders: string[];
 }
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {

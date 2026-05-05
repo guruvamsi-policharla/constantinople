@@ -31,6 +31,7 @@ const DEFAULT_ROUND_POLL_MS: u64 = 200;
 const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_TRACKED_BATCHES: usize = 1_000_000;
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
+const UNHEALTHY_FAILURES: u32 = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-relayer")]
@@ -78,6 +79,7 @@ struct AppState {
     round_poll: Duration,
     max_batch_bytes: usize,
     batches: Arc<RwLock<TrackedBatches>>,
+    leader_health: Arc<RwLock<HashMap<String, LeaderHealth>>>,
     observed_round: Arc<AtomicU64>,
     http: reqwest::Client,
     listen: SocketAddr,
@@ -88,11 +90,40 @@ struct SubmitResponse {
     batch_id: String,
     digests: Vec<String>,
     acknowledged_leaders: Vec<String>,
+    targeted_leaders: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct BatchRecord {
     acknowledged_leaders: Vec<String>,
+    targeted_leaders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeaderHealth {
+    consecutive_failures: u32,
+    healthy: bool,
+}
+
+impl LeaderHealth {
+    const fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            healthy: true,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.healthy = true;
+    }
+
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= UNHEALTHY_FAILURES {
+            self.healthy = false;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -154,7 +185,9 @@ enum ForwardResult {
         digests: Vec<String>,
     },
     Deterministic(StatusCode),
-    Transient,
+    Transient {
+        leader: Leader,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -222,11 +255,16 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
     }
 
     let batch_id = sha256::Sha256::hash(&body).to_string();
-    let next_round = state.observed_round.load(Ordering::Relaxed).wrapping_add(1);
-    let targets = leader_targets(&state.leaders, state.leader_fanout, next_round);
+    let observed_round = state.observed_round.load(Ordering::Relaxed);
+    let health = state.leader_health.read().await.clone();
+    let targets = leader_targets(&state.leaders, &health, state.leader_fanout, observed_round);
     if targets.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     }
+    let targeted_leaders = targets
+        .iter()
+        .map(|leader| leader.public_key.clone())
+        .collect::<Vec<_>>();
 
     let (tx, mut rx) = mpsc::channel(targets.len());
     for leader in targets {
@@ -252,12 +290,16 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
             _ = &mut timeout => break,
             Some(result) = rx.recv() => match result {
                 ForwardResult::Accepted { leader, digests: accepted_digests } => {
+                    record_leader_success(&state, &leader.public_key).await;
                     acknowledged.push(leader);
                     digests = accepted_digests;
                     break;
                 }
                 ForwardResult::Deterministic(status) => deterministic = Some(status),
-                ForwardResult::Transient => transient_failures += 1,
+                ForwardResult::Transient { leader } => {
+                    record_leader_failure(&state, &leader.public_key).await;
+                    transient_failures += 1;
+                }
             },
             else => break,
         }
@@ -278,8 +320,15 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
         .iter()
         .map(|leader| leader.public_key.clone())
         .collect::<Vec<_>>();
-    record_batch(&state, batch_id.clone(), acknowledged_leaders.clone()).await;
+    record_batch(
+        &state,
+        batch_id.clone(),
+        acknowledged_leaders.clone(),
+        targeted_leaders.clone(),
+    )
+    .await;
     tokio::spawn(collect_late_acknowledgements(
+        state.leader_health.clone(),
         state.batches.clone(),
         batch_id.clone(),
         rx,
@@ -288,6 +337,7 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
         batch_id,
         digests,
         acknowledged_leaders,
+        targeted_leaders,
     };
     (
         StatusCode::ACCEPTED,
@@ -423,37 +473,50 @@ async fn forward_to_leader(http: reqwest::Client, leader: Leader, body: Bytes) -
         tokio::time::sleep(backoff).await;
         backoff *= 2;
     }
-    ForwardResult::Transient
+    ForwardResult::Transient { leader }
 }
 
-async fn record_batch(state: &AppState, batch_id: String, acknowledged_leaders: Vec<String>) {
+async fn record_batch(
+    state: &AppState,
+    batch_id: String,
+    acknowledged_leaders: Vec<String>,
+    targeted_leaders: Vec<String>,
+) {
     let record = BatchRecord {
         acknowledged_leaders,
+        targeted_leaders,
     };
     state.batches.write().await.remember(batch_id, record);
 }
 
 async fn collect_late_acknowledgements(
+    leader_health: Arc<RwLock<HashMap<String, LeaderHealth>>>,
     batches: Arc<RwLock<TrackedBatches>>,
     batch_id: String,
     mut rx: mpsc::Receiver<ForwardResult>,
 ) {
     while let Some(result) = rx.recv().await {
-        let ForwardResult::Accepted { leader, .. } = result else {
-            continue;
+        match result {
+            ForwardResult::Accepted { leader, .. } => {
+                record_leader_success_map(&leader_health, &leader.public_key).await;
+                let mut batches = batches.write().await;
+                let Some(record) = batches.records.get_mut(&batch_id) else {
+                    return;
+                };
+                if record
+                    .acknowledged_leaders
+                    .iter()
+                    .any(|existing| existing == &leader.public_key)
+                {
+                    continue;
+                }
+                record.acknowledged_leaders.push(leader.public_key);
+            }
+            ForwardResult::Transient { leader } => {
+                record_leader_failure_map(&leader_health, &leader.public_key).await;
+            }
+            ForwardResult::Deterministic(_) => {}
         };
-        let mut batches = batches.write().await;
-        let Some(record) = batches.records.get_mut(&batch_id) else {
-            return;
-        };
-        if record
-            .acknowledged_leaders
-            .iter()
-            .any(|existing| existing == &leader.public_key)
-        {
-            continue;
-        }
-        record.acknowledged_leaders.push(leader.public_key);
     }
 }
 
@@ -464,7 +527,7 @@ async fn fetch_leader_status(
 ) -> Option<BatchStatus> {
     let mut accepted = None;
     let mut terminal = Vec::new();
-    for leader_id in &record.acknowledged_leaders {
+    for leader_id in status_leaders(record) {
         let Some(leader) = leader_by_id(&state.leaders, leader_id) else {
             continue;
         };
@@ -479,7 +542,22 @@ async fn fetch_leader_status(
             }
         }
     }
-    merge_terminal_statuses(&terminal).or(accepted)
+    accepted.or_else(|| merge_terminal_statuses(&terminal))
+}
+
+fn status_leaders(record: &BatchRecord) -> Vec<&String> {
+    let mut seen = HashSet::new();
+    let mut leaders = Vec::new();
+    for leader in record
+        .targeted_leaders
+        .iter()
+        .chain(record.acknowledged_leaders.iter())
+    {
+        if seen.insert(leader) {
+            leaders.push(leader);
+        }
+    }
+    leaders
 }
 
 fn merge_terminal_statuses(statuses: &[BatchStatus]) -> Option<BatchStatus> {
@@ -574,6 +652,7 @@ async fn poll_consensus_rounds(state: AppState) {
             let Some(round) = fetch_consensus_round(&state.http, leader).await else {
                 continue;
             };
+            record_leader_success(&state, &leader.public_key).await;
             let mut current = state.observed_round.load(Ordering::Relaxed);
             while round > current {
                 match state.observed_round.compare_exchange_weak(
@@ -588,6 +667,36 @@ async fn poll_consensus_rounds(state: AppState) {
             }
         }
     }
+}
+
+async fn record_leader_success(state: &AppState, leader_id: &str) {
+    record_leader_success_map(&state.leader_health, leader_id).await;
+}
+
+async fn record_leader_failure(state: &AppState, leader_id: &str) {
+    record_leader_failure_map(&state.leader_health, leader_id).await;
+}
+
+async fn record_leader_success_map(
+    health: &RwLock<HashMap<String, LeaderHealth>>,
+    leader_id: &str,
+) {
+    let mut health = health.write().await;
+    health
+        .entry(leader_id.to_string())
+        .or_insert_with(LeaderHealth::new)
+        .record_success();
+}
+
+async fn record_leader_failure_map(
+    health: &RwLock<HashMap<String, LeaderHealth>>,
+    leader_id: &str,
+) {
+    let mut health = health.write().await;
+    health
+        .entry(leader_id.to_string())
+        .or_insert_with(LeaderHealth::new)
+        .record_failure();
 }
 
 async fn fetch_consensus_round(http: &reqwest::Client, leader: &Leader) -> Option<u64> {
@@ -605,15 +714,55 @@ async fn fetch_consensus_round(http: &reqwest::Client, leader: &Leader) -> Optio
         .map(|response| response.round)
 }
 
-fn leader_targets(leaders: &[Leader], leader_fanout: usize, next_round: u64) -> Vec<Leader> {
+fn leader_targets(
+    leaders: &[Leader],
+    health: &HashMap<String, LeaderHealth>,
+    leader_fanout: usize,
+    round: u64,
+) -> Vec<Leader> {
     if leaders.is_empty() {
         return Vec::new();
     }
     let count = leader_fanout.min(leaders.len());
-    let start = next_round as usize % leaders.len();
-    (0..count)
+    let ordered = leader_window(leaders, round);
+    if count == leaders.len() {
+        return ordered;
+    }
+
+    let mut targets = Vec::with_capacity(count);
+    let mut fallback = Vec::new();
+    for leader in ordered {
+        if is_healthy(&leader, health) {
+            targets.push(leader);
+        } else {
+            fallback.push(leader);
+        }
+        if targets.len() == count {
+            return targets;
+        }
+    }
+
+    for leader in fallback {
+        targets.push(leader);
+        if targets.len() == count {
+            break;
+        }
+    }
+    targets
+}
+
+fn leader_window(leaders: &[Leader], round: u64) -> Vec<Leader> {
+    let start = round as usize % leaders.len();
+    (0..leaders.len())
         .map(|offset| leaders[(start + offset) % leaders.len()].clone())
         .collect()
+}
+
+fn is_healthy(leader: &Leader, health: &HashMap<String, LeaderHealth>) -> bool {
+    match health.get(&leader.public_key) {
+        Some(health) => health.healthy,
+        None => true,
+    }
 }
 
 fn build_state(config: RelayerConfig) -> AppState {
@@ -640,8 +789,12 @@ fn build_state(config: RelayerConfig) -> AppState {
     reject_duplicate_leaders(&leaders);
     let leader_count = leaders.len();
     let leader_fanout = configured_fanout
-        .unwrap_or_else(|| 3.min(leader_count))
-        .max(1);
+        .unwrap_or(leader_count)
+        .max(usize::from(leader_count > 0));
+    let leader_health = leaders
+        .iter()
+        .map(|leader| (leader.public_key.clone(), LeaderHealth::new()))
+        .collect();
 
     AppState {
         leaders: Arc::new(leaders),
@@ -650,6 +803,7 @@ fn build_state(config: RelayerConfig) -> AppState {
         round_poll: Duration::from_millis(round_poll_ms),
         max_batch_bytes,
         batches: Arc::new(RwLock::new(TrackedBatches::new(max_tracked_batches))),
+        leader_health: Arc::new(RwLock::new(leader_health)),
         observed_round: Arc::new(AtomicU64::new(0)),
         http: reqwest::Client::new(),
         listen,
@@ -708,10 +862,22 @@ const fn default_max_tracked_batches() -> usize {
 mod tests {
     use super::{
         AppState, BatchStatus, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_MAX_BATCH_BYTES,
-        DEFAULT_MAX_TRACKED_BATCHES, DEFAULT_ROUND_POLL_MS, Leader, TrackedBatches, leader_targets,
-        merge_terminal_statuses,
+        DEFAULT_MAX_TRACKED_BATCHES, DEFAULT_ROUND_POLL_MS, Leader, LeaderHealth, TrackedBatches,
+        leader_targets, merge_terminal_statuses, status_leaders,
     };
+    use commonware_codec::Encode;
+    use commonware_consensus::{
+        simplex::{
+            elector::{Config as ElectorConfig, Elector, RoundRobin, RoundRobinElector},
+            scheme::ed25519 as consensus_ed25519,
+        },
+        types::{Epoch, Round, View},
+    };
+    use commonware_cryptography::{Signer, ed25519, sha256};
+    use commonware_formatting::hex;
+    use commonware_utils::ordered::Set;
     use std::{
+        collections::HashMap,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
@@ -729,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_targets_rotate_from_next_round_and_deduplicate() {
+    fn leader_targets_rotate_from_current_round_and_deduplicate() {
         let leaders = ["01", "02", "00"]
             .into_iter()
             .map(leader)
@@ -737,7 +903,7 @@ mod tests {
         let mut sorted = leaders;
         sorted.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
-        let targets = leader_targets(&sorted, 3, 1)
+        let targets = leader_targets(&sorted, &HashMap::new(), 3, 1)
             .into_iter()
             .map(|leader| leader.public_key)
             .collect::<Vec<_>>();
@@ -749,38 +915,129 @@ mod tests {
     fn leader_targets_caps_fanout_at_unique_leaders() {
         let leaders = ["00", "01"].into_iter().map(leader).collect::<Vec<_>>();
 
-        let targets = leader_targets(&leaders, 5, 0);
+        let targets = leader_targets(&leaders, &HashMap::new(), 5, 0);
 
         assert_eq!(targets.len(), 2);
     }
 
     #[test]
-    fn default_fanout_includes_multiple_leaders() {
+    fn default_fanout_includes_all_leaders() {
         let state = AppState {
             leaders: Arc::new(vec![leader("00"), leader("01"), leader("02"), leader("03")]),
-            leader_fanout: 3,
+            leader_fanout: 4,
             ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS),
             round_poll: Duration::from_millis(DEFAULT_ROUND_POLL_MS),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             batches: Arc::new(RwLock::new(TrackedBatches::new(
                 DEFAULT_MAX_TRACKED_BATCHES,
             ))),
+            leader_health: Arc::new(RwLock::new(HashMap::new())),
             observed_round: Arc::new(AtomicU64::new(0)),
             http: reqwest::Client::new(),
             listen: "127.0.0.1:0".parse().expect("listen address parses"),
         };
 
-        let next_round = state.observed_round.load(Ordering::Relaxed).wrapping_add(1);
-        let targets = leader_targets(&state.leaders, state.leader_fanout, next_round);
+        let round = state.observed_round.load(Ordering::Relaxed);
+        let targets = leader_targets(&state.leaders, &HashMap::new(), state.leader_fanout, round);
 
-        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.len(), 4);
         assert_eq!(
             targets
                 .into_iter()
                 .map(|leader| leader.public_key)
                 .collect::<Vec<_>>(),
-            vec!["01", "02", "03"],
+            vec!["00", "01", "02", "03"],
         );
+    }
+
+    #[test]
+    fn leader_targets_scan_past_unhealthy_leaders_for_partial_fanout() {
+        let leaders = ["00", "01", "02", "03"]
+            .into_iter()
+            .map(leader)
+            .collect::<Vec<_>>();
+        let mut health = HashMap::new();
+        health.insert(
+            "01".to_string(),
+            LeaderHealth {
+                consecutive_failures: 3,
+                healthy: false,
+            },
+        );
+
+        let targets = leader_targets(&leaders, &health, 2, 1)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["02", "03"]);
+    }
+
+    #[test]
+    fn leader_targets_include_unhealthy_leaders_for_all_primary_fanout() {
+        let leaders = ["00", "01", "02"]
+            .into_iter()
+            .map(leader)
+            .collect::<Vec<_>>();
+        let mut health = HashMap::new();
+        health.insert(
+            "01".to_string(),
+            LeaderHealth {
+                consecutive_failures: 3,
+                healthy: false,
+            },
+        );
+
+        let targets = leader_targets(&leaders, &health, 3, 1)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["01", "02", "00"]);
+    }
+
+    #[test]
+    fn leader_targets_match_commonware_round_robin_order() {
+        let keys = [7, 3, 11, 5]
+            .into_iter()
+            .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
+            .collect::<Vec<_>>();
+        let participants = Set::from_iter_dedup(keys.clone());
+        let elector: RoundRobinElector<consensus_ed25519::Scheme> =
+            RoundRobin::<sha256::Sha256>::default().build(&participants);
+        let mut leaders = keys
+            .into_iter()
+            .map(|key| leader(&hex(&key.encode())))
+            .collect::<Vec<_>>();
+        leaders.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+        for view in 0..12 {
+            let round = Round::new(Epoch::new(0), View::new(view));
+            let elected = elector.elect(round, None);
+            let expected = hex(&participants
+                .get(usize::from(elected))
+                .expect("elected participant exists")
+                .encode());
+            let target = leader_targets(&leaders, &HashMap::new(), 1, view)
+                .pop()
+                .expect("target exists");
+
+            assert_eq!(target.public_key, expected);
+        }
+    }
+
+    #[test]
+    fn status_targets_query_targeted_before_late_acknowledged_leaders() {
+        let record = super::BatchRecord {
+            targeted_leaders: vec!["00".to_string(), "01".to_string()],
+            acknowledged_leaders: vec!["01".to_string(), "02".to_string()],
+        };
+        let leaders = status_leaders(&record)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(leaders, vec!["00", "01", "02"]);
     }
 
     #[test]

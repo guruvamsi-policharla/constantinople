@@ -103,8 +103,9 @@ cargo run --bin constantinople-deploy -- generate \
 
 This writes `relayer.yaml` and adds `constantinople-relayer` to the printed `mprocs` command. The
 relayer listens on the next local HTTP port after validators and secondaries
-(`base_http_port + validators + secondaries`) and forwards each submitted batch to the next
-leader window.
+(`base_http_port + validators + secondaries`) and forwards each submitted batch to the current
+leader plus upcoming leaders. Generated configs omit `leader_fanout`, so the relayer targets all
+primary validators by default.
 
 When both `--spammer` and `--relayer` are set, the generated spammer command uses
 `--relayer-url` and `--relayer-submitters <validators>`, preserving the same number of independent
@@ -263,8 +264,10 @@ cargo run --bin constantinople-deploy -- generate \
 ```
 
 This writes `relayer.yaml` and adds a `relayer` instance to `config.yaml`. The relayer listens on
-the configured HTTP port and forwards transaction batches to the next leader window among primary
-validators. It is optional; `--spammer` does not create a relayer unless `--relayer` is also set.
+the configured HTTP port and forwards transaction batches to the current leader plus upcoming
+leaders among primary validators. Generated configs omit `leader_fanout`, so the relayer targets all
+primaries by default. It is optional; `--spammer` does not create a relayer unless `--relayer` is
+also set.
 
 When `--spammer --relayer` are used together, `spammer.yaml` includes
 `relayer_url: http://relayer:<http_port>` and `relayer_submitters: <validators>`. With
