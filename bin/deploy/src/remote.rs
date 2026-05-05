@@ -277,9 +277,11 @@ fn remote_spammer_config(
         http_port: remote.http_port,
         relayer_url: relayer_enabled(args)
             .then(|| format!("http://{RELAYER_HOST}:{}", remote.http_port)),
-        relayer_submitters: relayer_enabled(args)
-            .then_some(args.validators as usize)
-            .unwrap_or(0),
+        relayer_submitters: if relayer_enabled(args) {
+            args.validators as usize
+        } else {
+            0
+        },
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
     }

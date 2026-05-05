@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
-    http::{Method, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
 use clap::Parser;
@@ -32,6 +32,9 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_TRACKED_BATCHES: usize = 1_000_000;
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const UNHEALTHY_FAILURES: u32 = 3;
+const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
+const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
+const TARGET_OFFSET_HEADER: &str = "x-constantinople-relayer-target-offset";
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-relayer")]
@@ -81,6 +84,7 @@ struct AppState {
     batches: Arc<RwLock<TrackedBatches>>,
     leader_health: Arc<RwLock<HashMap<String, LeaderHealth>>>,
     observed_round: Arc<AtomicU64>,
+    next_target_offset: Arc<AtomicU64>,
     http: reqwest::Client,
     listen: SocketAddr,
 }
@@ -113,12 +117,12 @@ impl LeaderHealth {
         }
     }
 
-    fn record_success(&mut self) {
+    const fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.healthy = true;
     }
 
-    fn record_failure(&mut self) {
+    const fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= UNHEALTHY_FAILURES {
             self.healthy = false;
@@ -245,7 +249,11 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (StatusCode, String) {
+async fn submit_transactions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
     if body.len()
         > state
             .max_batch_bytes
@@ -256,8 +264,23 @@ async fn submit_transactions(State(state): State<AppState>, body: Bytes) -> (Sta
 
     let batch_id = sha256::Sha256::hash(&body).to_string();
     let observed_round = state.observed_round.load(Ordering::Relaxed);
+    let target_offset = target_offset(&state, &headers);
+    let leader_fanout = requested_leader_fanout(&headers).unwrap_or(state.leader_fanout);
     let health = state.leader_health.read().await.clone();
-    let targets = leader_targets(&state.leaders, &health, state.leader_fanout, observed_round);
+    let targets = match requested_target_leader(&headers) {
+        Some(target_leader) => {
+            let Some(start) = leader_index(&state.leaders, &target_leader) else {
+                return (StatusCode::BAD_REQUEST, String::new());
+            };
+            leader_targets_from_index(&state.leaders, leader_fanout, start)
+        }
+        None => leader_targets(
+            &state.leaders,
+            &health,
+            leader_fanout,
+            observed_round.wrapping_add(target_offset),
+        ),
+    };
     if targets.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     }
@@ -753,16 +776,66 @@ fn leader_targets(
 
 fn leader_window(leaders: &[Leader], round: u64) -> Vec<Leader> {
     let start = round as usize % leaders.len();
-    (0..leaders.len())
+    leader_targets_from_index(leaders, leaders.len(), start)
+}
+
+fn leader_targets_from_index(
+    leaders: &[Leader],
+    leader_fanout: usize,
+    start: usize,
+) -> Vec<Leader> {
+    let count = leader_fanout.min(leaders.len());
+    (0..count)
         .map(|offset| leaders[(start + offset) % leaders.len()].clone())
         .collect()
 }
 
+fn leader_index(leaders: &[Leader], public_key: &str) -> Option<usize> {
+    leaders
+        .iter()
+        .position(|leader| leader.public_key == public_key)
+}
+
 fn is_healthy(leader: &Leader, health: &HashMap<String, LeaderHealth>) -> bool {
-    match health.get(&leader.public_key) {
-        Some(health) => health.healthy,
-        None => true,
+    health
+        .get(&leader.public_key)
+        .is_none_or(|health| health.healthy)
+}
+
+fn target_offset(state: &AppState, headers: &HeaderMap) -> u64 {
+    if let Some(offset) = requested_target_offset(headers) {
+        return offset;
     }
+    state.next_target_offset.fetch_add(1, Ordering::Relaxed)
+}
+
+fn requested_target_offset(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(TARGET_OFFSET_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn requested_leader_fanout(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(LEADER_FANOUT_HEADER)?
+        .to_str()
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|fanout| *fanout > 0)
+}
+
+fn requested_target_leader(headers: &HeaderMap) -> Option<String> {
+    Some(
+        headers
+            .get(TARGET_LEADER_HEADER)?
+            .to_str()
+            .ok()?
+            .to_lowercase(),
+    )
 }
 
 fn build_state(config: RelayerConfig) -> AppState {
@@ -789,7 +862,7 @@ fn build_state(config: RelayerConfig) -> AppState {
     reject_duplicate_leaders(&leaders);
     let leader_count = leaders.len();
     let leader_fanout = configured_fanout
-        .unwrap_or(leader_count)
+        .unwrap_or_else(|| 2.min(leader_count))
         .max(usize::from(leader_count > 0));
     let leader_health = leaders
         .iter()
@@ -805,6 +878,7 @@ fn build_state(config: RelayerConfig) -> AppState {
         batches: Arc::new(RwLock::new(TrackedBatches::new(max_tracked_batches))),
         leader_health: Arc::new(RwLock::new(leader_health)),
         observed_round: Arc::new(AtomicU64::new(0)),
+        next_target_offset: Arc::new(AtomicU64::new(0)),
         http: reqwest::Client::new(),
         listen,
     }
@@ -865,6 +939,7 @@ mod tests {
         DEFAULT_MAX_TRACKED_BATCHES, DEFAULT_ROUND_POLL_MS, Leader, LeaderHealth, TrackedBatches,
         leader_targets, merge_terminal_statuses, status_leaders,
     };
+    use axum::http::{HeaderMap, HeaderValue};
     use commonware_codec::Encode;
     use commonware_consensus::{
         simplex::{
@@ -921,10 +996,10 @@ mod tests {
     }
 
     #[test]
-    fn default_fanout_includes_all_leaders() {
+    fn default_fanout_includes_current_and_next_leader() {
         let state = AppState {
             leaders: Arc::new(vec![leader("00"), leader("01"), leader("02"), leader("03")]),
-            leader_fanout: 4,
+            leader_fanout: 2,
             ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT_MS),
             round_poll: Duration::from_millis(DEFAULT_ROUND_POLL_MS),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
@@ -933,6 +1008,7 @@ mod tests {
             ))),
             leader_health: Arc::new(RwLock::new(HashMap::new())),
             observed_round: Arc::new(AtomicU64::new(0)),
+            next_target_offset: Arc::new(AtomicU64::new(0)),
             http: reqwest::Client::new(),
             listen: "127.0.0.1:0".parse().expect("listen address parses"),
         };
@@ -940,13 +1016,13 @@ mod tests {
         let round = state.observed_round.load(Ordering::Relaxed);
         let targets = leader_targets(&state.leaders, &HashMap::new(), state.leader_fanout, round);
 
-        assert_eq!(targets.len(), 4);
+        assert_eq!(targets.len(), 2);
         assert_eq!(
             targets
                 .into_iter()
                 .map(|leader| leader.public_key)
                 .collect::<Vec<_>>(),
-            vec!["00", "01", "02", "03"],
+            vec!["00", "01"],
         );
     }
 
@@ -994,6 +1070,70 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(targets, vec!["01", "02", "00"]);
+    }
+
+    #[test]
+    fn requested_target_offset_uses_relayer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(super::TARGET_OFFSET_HEADER, HeaderValue::from_static("3"));
+
+        assert_eq!(super::requested_target_offset(&headers), Some(3));
+    }
+
+    #[test]
+    fn requested_target_offset_rejects_malformed_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            super::TARGET_OFFSET_HEADER,
+            HeaderValue::from_static("not-a-number"),
+        );
+
+        assert_eq!(super::requested_target_offset(&headers), None);
+    }
+
+    #[test]
+    fn requested_leader_fanout_uses_relayer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(super::LEADER_FANOUT_HEADER, HeaderValue::from_static("1"));
+
+        assert_eq!(super::requested_leader_fanout(&headers), Some(1));
+    }
+
+    #[test]
+    fn requested_leader_fanout_rejects_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(super::LEADER_FANOUT_HEADER, HeaderValue::from_static("0"));
+
+        assert_eq!(super::requested_leader_fanout(&headers), None);
+    }
+
+    #[test]
+    fn requested_target_leader_uses_relayer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            super::TARGET_LEADER_HEADER,
+            HeaderValue::from_static("ABCD"),
+        );
+
+        assert_eq!(
+            super::requested_target_leader(&headers),
+            Some("abcd".to_string())
+        );
+    }
+
+    #[test]
+    fn leader_targets_from_index_caps_fanout() {
+        let leaders = ["00", "01", "02"]
+            .into_iter()
+            .map(leader)
+            .collect::<Vec<_>>();
+
+        let targets = super::leader_targets_from_index(&leaders, 2, 2)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["02", "00"]);
     }
 
     #[test]

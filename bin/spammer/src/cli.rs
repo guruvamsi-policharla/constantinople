@@ -30,6 +30,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 1)]
     pub relayer_submitters: usize,
 
+    /// Hex-encoded primary validator keys used as exact relayer targets.
+    #[arg(long, value_delimiter = ',')]
+    pub relayer_targets: Vec<String>,
+
     /// Number of spam accounts per validator in the ring transfer.
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
@@ -102,6 +106,7 @@ mod tests {
 
         assert_eq!(cli.relayer_url, Some("http://127.0.0.1:8084".to_string()));
         assert_eq!(cli.relayer_submitters, 1);
+        assert!(cli.relayer_targets.is_empty());
         assert!(cli.peers.is_none());
         assert!(cli.hosts.is_none());
     }
@@ -118,6 +123,20 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.relayer_submitters, 4);
+    }
+
+    #[test]
+    fn parses_relayer_targets() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--relayer-targets",
+            "aa,bb",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.relayer_targets, vec!["aa", "bb"]);
     }
 
     #[test]

@@ -103,14 +103,16 @@ cargo run --bin constantinople-deploy -- generate \
 
 This writes `relayer.yaml` and adds `constantinople-relayer` to the printed `mprocs` command. The
 relayer listens on the next local HTTP port after validators and secondaries
-(`base_http_port + validators + secondaries`) and forwards each submitted batch to the current
-leader plus upcoming leaders. Generated configs omit `leader_fanout`, so the relayer targets all
-primary validators by default.
+(`base_http_port + validators + secondaries`) and forwards each submitted batch to a two-leader
+window starting at the current leader. Generated configs omit `leader_fanout`; set it explicitly to
+widen or narrow the target window.
 
 When both `--spammer` and `--relayer` are set, the generated spammer command uses
 `--relayer-url` and `--relayer-submitters <validators>`, preserving the same number of independent
-nonce-ordered streams as direct mode. Without `--relayer`, the spammer uses `--peers` and submits
-directly to primary validators.
+nonce-ordered streams as direct mode. Each relayed submitter pins an exact primary validator target
+and requests single-leader routing, so concurrent streams feed different primaries without creating
+stale duplicate nonce copies. Without `--relayer`, the spammer uses `--peers` and submits directly
+to primary validators.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -264,14 +266,16 @@ cargo run --bin constantinople-deploy -- generate \
 ```
 
 This writes `relayer.yaml` and adds a `relayer` instance to `config.yaml`. The relayer listens on
-the configured HTTP port and forwards transaction batches to the current leader plus upcoming
-leaders among primary validators. Generated configs omit `leader_fanout`, so the relayer targets all
-primaries by default. It is optional; `--spammer` does not create a relayer unless `--relayer` is
-also set.
+the configured HTTP port and forwards transaction batches to a two-leader window starting at the
+current leader. Generated configs omit `leader_fanout`; set it explicitly to widen or narrow the
+target window. It is optional; `--spammer` does not create a relayer unless `--relayer` is also set.
 
 When `--spammer --relayer` are used together, `spammer.yaml` includes
 `relayer_url: http://relayer:<http_port>` and `relayer_submitters: <validators>`. With
-`--spammer` alone, `relayer_url` is omitted and the spammer submits directly to primary validators.
+`--spammer --relayer`, each relayed submitter pins an exact primary validator target and requests
+single-leader routing, so concurrent streams feed different primaries without creating stale
+duplicate nonce copies. With `--spammer` alone, `relayer_url` is omitted and the spammer submits
+directly to primary validators.
 
 Build both binaries before creating the deployment. For Graviton instances:
 

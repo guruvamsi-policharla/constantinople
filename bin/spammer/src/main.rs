@@ -56,7 +56,11 @@ fn main() {
             cfg.http_port,
             cfg.relayer_url.or_else(|| cli.relayer_url.clone()),
             relayer_submitters,
-            cfg.primary_validators,
+            if cfg.primary_validators.is_empty() {
+                cli.relayer_targets.clone()
+            } else {
+                cfg.primary_validators
+            },
             cfg.accounts_jitter,
         )
     } else {
@@ -67,7 +71,7 @@ fn main() {
             cli.http_port,
             cli.relayer_url.clone(),
             cli.relayer_submitters.max(1),
-            Vec::new(),
+            cli.relayer_targets.clone(),
             cli.accounts_jitter,
         )
     };
@@ -114,6 +118,7 @@ fn main() {
                 seed_offset,
                 accounts_jitter,
                 relayer_submitters,
+                primary_validators,
                 strategy,
             )
             .await;
@@ -223,7 +228,8 @@ async fn run_relayer_mode(
     seed_offset: u64,
     accounts_jitter: f64,
     relayer_submitters: usize,
-    strategy: impl commonware_parallel::Strategy + Clone + 'static,
+    relayer_targets: Vec<String>,
+    strategy: impl commonware_parallel::Strategy + 'static,
 ) {
     info!(
         submitters = relayer_submitters,
@@ -241,7 +247,10 @@ async fn run_relayer_mode(
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone());
+        let target = relayer_targets
+            .get(index % relayer_targets.len().max(1))
+            .cloned();
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
         let strategy = strategy.clone();
         tokio::spawn(async move {
             let mut rng = JitterRng::new(account_offset.wrapping_add(1));

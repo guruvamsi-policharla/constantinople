@@ -61,7 +61,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
-    print_local_run_commands(&output_dir, args, local);
+    print_local_run_commands(&output_dir, args, local, &material.primary_hex());
 }
 
 fn build_validators(
@@ -255,8 +255,13 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     }
 }
 
-fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs) {
-    let commands = local_run_commands(output_dir, args, local);
+fn print_local_run_commands(
+    output_dir: &Path,
+    args: &GenerateArgs,
+    local: &LocalArgs,
+    relayer_targets: &[String],
+) {
+    let commands = local_run_commands(output_dir, args, local, relayer_targets);
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
@@ -272,7 +277,12 @@ fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &Loca
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
 }
 
-fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs) -> Vec<String> {
+fn local_run_commands(
+    output_dir: &Path,
+    args: &GenerateArgs,
+    local: &LocalArgs,
+    relayer_targets: &[String],
+) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
@@ -344,10 +354,12 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
 
     if args.spammer {
         let network_source = if relayer_enabled(args) {
+            let targets = relayer_targets.join(",");
             format!(
-                "--relayer-url http://127.0.0.1:{} --relayer-submitters {}",
+                "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
                 local.base_http_port + args.validators as u16 + args.secondaries as u16,
                 args.validators,
+                targets,
             )
         } else {
             format!("--peers {}", peers_path.display())
@@ -420,7 +432,7 @@ mod tests {
     #[test]
     fn local_run_commands_only_start_validators() {
         let args = test_args(false);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
@@ -429,7 +441,7 @@ mod tests {
     #[test]
     fn local_run_commands_include_spammer_when_enabled() {
         let args = test_args(true);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-spammer"));
@@ -444,7 +456,7 @@ mod tests {
     fn local_run_commands_include_optional_relayer_when_enabled() {
         let mut args = test_args(false);
         args.relayer = true;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-relayer"));
@@ -454,13 +466,20 @@ mod tests {
     fn local_spammer_uses_relayer_when_both_are_enabled() {
         let mut args = test_args(true);
         args.relayer = true;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let targets = vec!["aa".to_string(), "bb".to_string()];
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &targets,
+        );
 
         assert_eq!(commands.len(), 4);
         assert!(commands[2].contains("constantinople-relayer"));
         assert!(commands[3].contains("constantinople-spammer"));
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--relayer-submitters 2"));
+        assert!(commands[3].contains("--relayer-targets aa,bb"));
         assert!(!commands[3].contains("--peers"));
     }
 
@@ -468,7 +487,7 @@ mod tests {
     fn local_run_commands_propagate_accounts_jitter_to_spammer() {
         let mut args = test_args(true);
         args.spammer_accounts_jitter = 0.25;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert!(commands[2].contains("--accounts-jitter 0.25"));
     }
@@ -477,7 +496,7 @@ mod tests {
     fn local_run_commands_include_secondaries() {
         let mut args = test_args(false);
         args.secondaries = 2;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert_eq!(commands.len(), 4);
         assert!(commands[2].contains("secondary-0.yaml"));
@@ -500,7 +519,7 @@ mod tests {
         args.secondaries = 1;
         enable_indexer(&mut args, 8090);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         // 2 validators + 1 secondary + 1 indexer + 1 sql + 1 explorer = 6.
         assert_eq!(commands.len(), 6);
@@ -518,7 +537,7 @@ mod tests {
         args.secondaries = 1;
         enable_indexer(&mut args, 8090);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         let metadata_cmd = commands
             .iter()
@@ -535,7 +554,7 @@ mod tests {
         args.secondaries = 1;
         enable_indexer(&mut args, 8090);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         let explorer_cmd = commands
             .iter()
@@ -554,7 +573,7 @@ mod tests {
         let mut args = test_args(false);
         args.secondaries = 1;
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
         assert!(
             commands

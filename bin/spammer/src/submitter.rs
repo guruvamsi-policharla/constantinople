@@ -54,6 +54,9 @@ pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,
     stats: Arc<Stats>,
+    target_offset: usize,
+    target_leader: Option<String>,
+    leader_fanout: usize,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -89,11 +92,19 @@ enum RelayerBatchStatus {
 }
 
 impl RelayerSubmitter {
-    pub fn new(url: String, stats: Arc<Stats>) -> Self {
+    pub fn new(
+        url: String,
+        stats: Arc<Stats>,
+        target_offset: usize,
+        target_leader: Option<String>,
+    ) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
+            target_offset,
+            target_leader,
+            leader_fanout: 1,
         }
     }
 
@@ -179,13 +190,23 @@ impl RelayerSubmitter {
     ) -> Result<RelayerSubmitResponse, constantinople_mempool::webserver::client::SubmitError> {
         use constantinople_mempool::webserver::client::SubmitError;
 
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}/transactions", self.url))
             .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+            .header(
+                "x-constantinople-relayer-leader-fanout",
+                self.leader_fanout.to_string(),
+            );
+        if let Some(target_leader) = &self.target_leader {
+            request = request.header("x-constantinople-relayer-target-leader", target_leader);
+        } else {
+            request = request.header(
+                "x-constantinople-relayer-target-offset",
+                self.target_offset.to_string(),
+            );
+        }
+        let response = request.body(body).send().await?;
 
         match response.status().as_u16() {
             202 => {
