@@ -304,7 +304,7 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
                 context.with_label("transaction_resolver"),
-                crate::compact_resolver::Config {
+                commonware_glue::stateful::db::compact_p2p::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
