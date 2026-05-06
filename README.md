@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="#overview">Overview</a> •
+  <a href="#packages">Packages</a> •
   <a href="#demo">Demo</a> •
   <a href="#deployment">Deployment</a> •
   <a href="#contributing">Contributing</a> •
@@ -32,6 +33,13 @@ Constantinople is a high-throughput account-model blockchain example built on to
 | [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB)        | Merkleized key-value database for state and transactions |
 | [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
 | [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p) (discovery)           | Authenticated peer-to-peer networking with discovery     |
+
+## Packages
+
+| Package                                               | Description                                                       |
+|-------------------------------------------------------|-------------------------------------------------------------------|
+| [`constantinople-indexer`](./crates/indexer/README.md) | Publishes finalized block artifacts and SQL metadata to exoware.  |
+| [`constantinople-explorer`](./explorer/README.md)      | Streams indexer metadata into a live React block explorer.        |
 
 ## Demo
 

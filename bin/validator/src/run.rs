@@ -204,7 +204,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                16 * 1024 * 1024,
+                32 * 1024 * 1024,
             )
         } else {
             discovery::Config::local(
@@ -213,7 +213,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                16 * 1024 * 1024,
+                32 * 1024 * 1024,
             )
         };
 
