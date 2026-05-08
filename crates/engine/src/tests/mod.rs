@@ -32,7 +32,7 @@ use commonware_glue::{
 use commonware_macros::{test_group, test_traced};
 use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Handle, Metrics, Quota, Spawner};
+use commonware_runtime::{Handle, Metrics, Quota, Spawner, Supervisor};
 use commonware_utils::{
     NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
 };
@@ -189,152 +189,147 @@ impl EngineDefinition for TestEngineDefinition {
                 .await;
         }
 
-        let handle = context
-            .with_label("validator")
-            .spawn(move |context| async move {
-                let mut channels = channels.into_iter();
-                let votes = channels.next().expect("vote channel must exist");
-                let certificates = channels.next().expect("certificate channel must exist");
-                let resolver = channels.next().expect("resolver channel must exist");
-                let marshal = channels.next().expect("marshal channel must exist");
-                let marshal_resolver = channels
-                    .next()
-                    .expect("marshal resolver channel must exist");
-                let state_resolver = channels.next().expect("state resolver channel must exist");
-                let transaction_resolver = channels
-                    .next()
-                    .expect("transaction resolver channel must exist");
-                let bootstrapper_network =
-                    channels.next().expect("bootstrapper channel must exist");
-                assert!(channels.next().is_none(), "unexpected extra channel");
+        let handle = context.child("validator").spawn(move |context| async move {
+            let mut channels = channels.into_iter();
+            let votes = channels.next().expect("vote channel must exist");
+            let certificates = channels.next().expect("certificate channel must exist");
+            let resolver = channels.next().expect("resolver channel must exist");
+            let marshal = channels.next().expect("marshal channel must exist");
+            let marshal_resolver = channels
+                .next()
+                .expect("marshal resolver channel must exist");
+            let state_resolver = channels.next().expect("state resolver channel must exist");
+            let transaction_resolver = channels
+                .next()
+                .expect("transaction resolver channel must exist");
+            let bootstrapper_network = channels.next().expect("bootstrapper channel must exist");
+            assert!(channels.next().is_none(), "unexpected extra channel");
 
-                let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-                    context.with_label("bootstrapper"),
-                    bootstrapper::Config {
-                        public_key: public_key.clone(),
-                        peer_provider: manager.clone(),
-                        blocker: blocker.clone(),
-                        scheme: TestScheme::verifier(
-                            &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                            output.players().clone(),
-                            output.public().clone(),
-                        ),
-                        mailbox_size: 32,
-                        round_timeout: Duration::from_secs(1),
-                        retry_interval: Duration::from_millis(100),
-                        block_codec: Default::default(),
-                    },
-                );
-                let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
+            let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
+                context.child("bootstrapper"),
+                bootstrapper::Config {
+                    public_key: public_key.clone(),
+                    peer_provider: manager.clone(),
+                    blocker: blocker.clone(),
+                    scheme: TestScheme::verifier(
+                        &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
+                        output.players().clone(),
+                        output.public().clone(),
+                    ),
+                    mailbox_size: 32,
+                    round_timeout: Duration::from_secs(1),
+                    retry_interval: Duration::from_millis(100),
+                    block_codec: Default::default(),
+                },
+            );
+            let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
 
-                let (startup, startup_sync_height) = if uses_state_sync
-                    && !state_sync_done(&context, &stateful_partition_prefix).await
-                {
-                    bootstrapper_mailbox
-                        .fetch_initial_target()
-                        .await
-                        .map(|block| {
-                            let height = block.height().get();
-                            sync_heights.lock().insert(public_key.clone(), height);
-                            (StartupMode::StateSync { block }, Some(height))
-                        })
-                        .expect("bootstrapper actor exited before selecting a state-sync target")
-                } else {
-                    let prior = sync_heights.lock().get(&public_key).copied();
-                    (StartupMode::MarshalSync, prior)
-                };
-                let startup_mode = match &startup {
-                    StartupMode::MarshalSync => "marshal_sync",
-                    StartupMode::StateSync { .. } => "state_sync",
-                };
-                info!(
-                    validator = %public_key,
-                    %startup_mode,
-                    startup_sync_height,
-                    "initialized validator startup mode",
-                );
-
-                let channels = Channels {
-                    votes,
-                    certificates,
-                    resolver,
-                    marshal,
-                    marshal_resolver,
-                    state_resolver,
-                    transaction_resolver,
-                };
-
-                let input = StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(
-                    Vec::new(),
-                );
-                let reporter =
-                    HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
-                let engine = Engine::<
-                    _,
-                    _,
-                    _,
-                    _,
-                    TestHasher,
-                    MinSig,
-                    RoundRobin<TestHasher>,
-                    _,
-                    _,
-                    _,
-                    Ed25519Batch,
-                    crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
-                >::new(
-                    context.with_label("engine"),
-                    Config {
-                        signer,
-                        manager,
-                        blocker,
-                        namespace: ENGINE_NAMESPACE.to_vec(),
-                        output,
-                        share,
-                        input,
-                        partition_prefix,
-                        signature_strategy: Sequential,
-                        hash_strategy: Sequential,
-                        startup,
-                        sync_config: SyncEngineConfig {
-                            fetch_batch_size: NZU64!(16),
-                            apply_batch_size: 64,
-                            max_outstanding_requests: 8,
-                            update_channel_size: NZUsize!(256),
-                            max_retained_roots: 32,
-                        },
-                        prune_cadence_blocks: NZU64!(16),
-                        genesis_leader,
-                        transaction_namespace: TRANSACTION_NAMESPACE,
-                        block_codec: Default::default(),
-                        bootstrapper: bootstrapper_mailbox.clone(),
-                        simplex_observer: None,
-                    },
-                )
-                .await;
-
-                let marshal = engine.marshal_mailbox();
-                if state_sender
-                    .send(ValidatorState {
-                        marshal,
-                        startup_sync_height,
+            let (startup, startup_sync_height) = if uses_state_sync
+                && !state_sync_done(&context, &stateful_partition_prefix).await
+            {
+                bootstrapper_mailbox
+                    .fetch_initial_target()
+                    .await
+                    .map(|block| {
+                        let height = block.height().get();
+                        sync_heights.lock().insert(public_key.clone(), height);
+                        (StartupMode::StateSync { block }, Some(height))
                     })
-                    .is_err()
-                {
-                    warn!(validator = %public_key, "validator state receiver dropped");
-                    return;
-                }
+                    .expect("bootstrapper actor exited before selecting a state-sync target")
+            } else {
+                let prior = sync_heights.lock().get(&public_key).copied();
+                (StartupMode::MarshalSync, prior)
+            };
+            let startup_mode = match &startup {
+                StartupMode::MarshalSync => "marshal_sync",
+                StartupMode::StateSync { .. } => "state_sync",
+            };
+            info!(
+                validator = %public_key,
+                %startup_mode,
+                startup_sync_height,
+                "initialized validator startup mode",
+            );
 
-                let engine_handle = engine.start(channels, Some(reporter));
-                let (bootstrapper_result, engine_result) =
-                    futures::join!(bootstrapper_handle, engine_handle);
-                if let Err(error) = bootstrapper_result {
-                    warn!(validator = %public_key, ?error, "bootstrapper exited");
-                }
-                if let Err(error) = engine_result {
-                    warn!(validator = %public_key, ?error, "engine exited");
-                }
-            });
+            let channels = Channels {
+                votes,
+                certificates,
+                resolver,
+                marshal,
+                marshal_resolver,
+                state_resolver,
+                transaction_resolver,
+            };
+
+            let input =
+                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
+            let reporter = HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
+            let engine = Engine::<
+                _,
+                _,
+                _,
+                _,
+                TestHasher,
+                MinSig,
+                RoundRobin<TestHasher>,
+                _,
+                _,
+                _,
+                Ed25519Batch,
+                crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
+            >::new(
+                context.child("engine"),
+                Config {
+                    signer,
+                    manager,
+                    blocker,
+                    namespace: ENGINE_NAMESPACE.to_vec(),
+                    output,
+                    share,
+                    input,
+                    partition_prefix,
+                    signature_strategy: Sequential,
+                    hash_strategy: Sequential,
+                    startup,
+                    sync_config: SyncEngineConfig {
+                        fetch_batch_size: NZU64!(16),
+                        apply_batch_size: 64,
+                        max_outstanding_requests: 8,
+                        update_channel_size: NZUsize!(256),
+                        max_retained_roots: 32,
+                    },
+                    prune_cadence_blocks: NZU64!(16),
+                    genesis_leader,
+                    transaction_namespace: TRANSACTION_NAMESPACE,
+                    block_codec: Default::default(),
+                    bootstrapper: bootstrapper_mailbox.clone(),
+                    simplex_observer: None,
+                },
+            )
+            .await;
+
+            let marshal = engine.marshal_mailbox();
+            if state_sender
+                .send(ValidatorState {
+                    marshal,
+                    startup_sync_height,
+                })
+                .is_err()
+            {
+                warn!(validator = %public_key, "validator state receiver dropped");
+                return;
+            }
+
+            let engine_handle = engine.start(channels, Some(reporter));
+            let (bootstrapper_result, engine_result) =
+                futures::join!(bootstrapper_handle, engine_handle);
+            if let Err(error) = bootstrapper_result {
+                warn!(validator = %public_key, ?error, "bootstrapper exited");
+            }
+            if let Err(error) = engine_result {
+                warn!(validator = %public_key, ?error, "engine exited");
+            }
+        });
 
         let state = state_receiver
             .await

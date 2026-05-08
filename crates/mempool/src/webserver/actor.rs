@@ -515,7 +515,7 @@ where
             account_reader,
         });
         let app = http::router::<C, P, H, BV, SigSt, HashSt>(app_state);
-        let _http_handle = context.as_present().with_label("http").spawn(|_| async {
+        let _http_handle = context.as_present().child("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });
 

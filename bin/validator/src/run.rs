@@ -21,7 +21,7 @@ use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Metrics as _, Quota, Runner as _, ThreadPooler as _,
+    Quota, Runner as _, Supervisor as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
@@ -173,7 +173,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
     runner.start(|context| async move {
         telemetry::init(
-            context.with_label("telemetry"),
+            context.child("telemetry"),
             Logging {
                 level: log_level.parse().expect("bad log_level in config"),
                 json: json_logs,
@@ -191,11 +191,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             "starting validator"
         );
         let signature_strategy = context
-            .clone()
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create signature verification strategy");
         let hash_strategy = context
-            .clone()
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create hashing strategy");
 
@@ -219,8 +217,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             )
         };
 
-        let (mut network, mut oracle) =
-            discovery::Network::new(context.with_label("p2p"), p2p_config);
+        let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
 
         let primary: Set<ed25519::PublicKey> = decoded
             .primary_participants
@@ -249,7 +246,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
 
         let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-            context.with_label("bootstrapper"),
+            context.child("bootstrapper"),
             bootstrapper::Config {
                 public_key: decoded.public_key.clone(),
                 peer_provider: oracle.clone(),
@@ -273,7 +270,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader<ed25519::PublicKey>>>> =
             Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
-            context.with_label("mempool"),
+            context.child("mempool"),
             webserver::Config {
                 max_pool_bytes: MAX_POOL_BYTES,
                 max_propose_bytes: MAX_PROPOSE_BYTES,
@@ -331,7 +328,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Batch,
             EngineCertReporter,
         >::new(
-            context.with_label("engine"),
+            context.child("engine"),
             EngineConfig {
                 signer: decoded.signer,
                 manager: oracle.clone(),

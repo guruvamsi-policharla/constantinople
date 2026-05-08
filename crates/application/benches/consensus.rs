@@ -12,7 +12,7 @@ use commonware_cryptography::{
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Error as RuntimeError, Metrics as _, Storage as _, ThreadPooler,
+    Error as RuntimeError, Metrics as _, Storage as _, Supervisor, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
     buffer::paged::CacheRef,
     tokio::{Config as RuntimeConfig, Context as RuntimeContext},
@@ -552,7 +552,7 @@ async fn new_application(
         };
 
     TestApplication::new(
-        runtime.with_label("application"),
+        runtime.child("application"),
         signature_strategy,
         hash_strategy,
         leader,
@@ -597,7 +597,7 @@ fn state_db_config(
     strategy: Rayon,
 ) -> FixedConfig<EightCap, Rayon> {
     let page_cache = CacheRef::from_pooler(
-        &runtime.with_label("state_page_cache"),
+        &runtime.child("state_page_cache"),
         PAGE_CACHE_PAGE_SIZE,
         PAGE_CACHE_CAPACITY,
     );

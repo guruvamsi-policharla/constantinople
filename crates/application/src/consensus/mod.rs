@@ -273,7 +273,7 @@ where
 
         let (state_batches, transaction_batch) = batches;
         let preload = verification::preload_transactions::<E, P, H, HashSt>(
-            runtime.clone(),
+            runtime.child("preload_transactions"),
             self.hash_strategy.clone(),
             Arc::clone(&prepared),
         );
@@ -283,7 +283,7 @@ where
         }
 
         let signature = verification::verify_signatures::<E, P, H, B, SigSt>(
-            runtime.clone(),
+            runtime.child("verify_signatures"),
             self.signature_strategy.clone(),
             self.transaction_namespace,
             Arc::clone(&prepared),
@@ -347,7 +347,7 @@ where
     {
         let prepared = Arc::new(verification::prepare_transactions(block.body.clone()));
         let preload = verification::preload_transactions::<E, P, H, HashSt>(
-            runtime.clone(),
+            runtime.child("preload_transactions"),
             self.hash_strategy.clone(),
             Arc::clone(&prepared),
         );

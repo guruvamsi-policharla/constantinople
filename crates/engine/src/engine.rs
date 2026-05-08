@@ -266,12 +266,12 @@ where
     /// Initializes the full engine stack.
     pub async fn new(context: E, config: Config<C, M, B, V, SigT, HashT, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
-            &context.with_label("other"),
+            &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
             PAGE_CACHE_CAPACITY,
         );
         let storage_page_cache = CacheRef::from_pooler(
-            &context.with_label("state"),
+            &context.child("state"),
             PAGE_CACHE_PAGE_SIZE,
             PAGE_CACHE_CAPACITY,
         );
@@ -284,7 +284,7 @@ where
 
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
-                context.with_label("state_resolver"),
+                context.child("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
@@ -301,7 +301,7 @@ where
             );
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
-                context.with_label("transaction_resolver"),
+                context.child("transaction_resolver"),
                 commonware_glue::stateful::db::compact_p2p::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
@@ -331,7 +331,7 @@ where
         );
 
         let (marshal, marshal_mailbox, _) = MarshalActor::init(
-            context.with_label("marshal"),
+            context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
             marshal::Config {
@@ -355,7 +355,7 @@ where
         config.bootstrapper.attach(marshal_mailbox.clone()).await;
 
         let (shards, shard_mailbox) = shards::Engine::new(
-            context.with_label("shards"),
+            context.child("shards"),
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
@@ -373,7 +373,7 @@ where
         let transaction_db_config =
             transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
         let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
-            context.with_label("genesis_transactions"),
+            context.child("genesis_transactions"),
             transaction_db_config.clone(),
         )
         .await
@@ -383,7 +383,7 @@ where
                 .await;
 
         let application = Application::new(
-            context.with_label("application"),
+            context.child("application"),
             config.signature_strategy,
             config.hash_strategy.clone(),
             config.genesis_leader.clone(),
@@ -401,7 +401,7 @@ where
             }),
         );
         let (stateful, stateful_mailbox) = Stateful::init(
-            context.with_label("stateful"),
+            context.child("stateful"),
             StatefulConfig {
                 app: application,
                 db_config: (
@@ -423,7 +423,7 @@ where
         );
 
         let application = Marshaled::new(
-            context.with_label("application"),
+            context.child("application"),
             MarshaledConfig {
                 application: stateful_mailbox.clone(),
                 marshal: marshal_mailbox.clone(),
@@ -446,7 +446,7 @@ where
             Reporters::from((marshal_mailbox, config.simplex_observer));
 
         let simplex = simplex::Engine::new(
-            context.with_label("simplex"),
+            context.child("simplex"),
             simplex::Config {
                 scheme,
                 elector: L::default(),
@@ -510,8 +510,9 @@ where
         Rx: Receiver<PublicKey = C::PublicKey>,
         Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
     {
+        let resolver_context = self.context.into_present();
         let marshal_resolver = marshal_resolver::init(
-            self.context.as_present(),
+            resolver_context,
             marshal_resolver::Config {
                 public_key: self.signer.public_key(),
                 peer_provider: self.manager.clone(),
@@ -591,7 +592,7 @@ where
 {
     let start = Instant::now();
     let archive = prunable::Archive::init(
-        context.with_label("finalizations_by_height"),
+        context.child("finalizations_by_height"),
         prunable::Config {
             translator: EightCap,
             key_partition: format!("{partition_prefix}-finalizations-by-height-key"),
@@ -624,7 +625,7 @@ where
 {
     let start = Instant::now();
     let archive = prunable::Archive::init(
-        context.with_label("finalized_blocks"),
+        context.child("finalized_blocks"),
         prunable::Config {
             translator: EightCap,
             key_partition: format!("{partition_prefix}-finalized-blocks-key"),

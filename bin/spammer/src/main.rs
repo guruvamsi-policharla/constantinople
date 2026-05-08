@@ -17,7 +17,7 @@ mod submitter;
 use accounts::generate_accounts;
 use clap::Parser;
 use cli::Cli;
-use commonware_runtime::{Metrics as _, Runner as _, ThreadPooler as _, tokio::telemetry};
+use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
@@ -96,7 +96,7 @@ fn main() {
         // In deployer mode (--hosts), use JSON logs so Loki/Promtail can scrape them.
         let json_logs = cli.hosts.is_some();
         telemetry::init(
-            context.with_label("telemetry"),
+            context.child("telemetry"),
             telemetry::Logging {
                 level: tracing::Level::INFO,
                 json: json_logs,
@@ -106,7 +106,6 @@ fn main() {
         );
 
         let strategy = context
-            .clone()
             .create_strategy(NZUsize!(cli.rayon_threads))
             .expect("failed to create parallel strategy");
 
