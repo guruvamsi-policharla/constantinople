@@ -1,20 +1,11 @@
 //! Consensus-facing application integration.
 //!
-//! This module bridges consensus, the mempool, the processor, and the backing
-//! databases. It is responsible for:
-//!
-//! - proposing blocks from mempool transactions
-//! - filtering or rejecting invalid signatures before execution
-//! - loading processor state from speculative database batches
-//! - executing transaction slices against that loaded state
-//! - finalizing state and transaction-history roots together
-//! - verifying and applying certified blocks
-//!
-//! The execution boundary is intentionally narrow: the [`Application`] owns
-//! the execution strategy and QMDB integration, while the processor owns the
-//! in-memory state transition logic.
+//! The consensus wrapper is deliberately thin. It prepares block bodies,
+//! delegates account transitions to the executor, updates the backing QMDB
+//! batches, and checks the commitments that consensus votes on.
 
-use crate::processor::executor::{self, ProposalOutput};
+use crate::executor::{self, PreparedTransfer, State};
+use commonware_codec::types::lazy::Lazy;
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -35,8 +26,12 @@ use commonware_runtime::{
 use commonware_storage::{mmr, qmdb::sync::Target, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
+use constantinople_primitives::{
+    Block, Header, Sealable, SealedBlock, SignedTransaction, materialize_transaction_chunks,
+    verify_transaction_chunks,
+};
 use futures::StreamExt;
+use hashbrown::HashSet;
 use rand::Rng;
 use rand_core::CryptoRngCore;
 use std::{
@@ -53,27 +48,29 @@ use std::{
 use tracing::{info, warn};
 
 mod db;
-mod execution;
 mod history;
 mod time;
-mod utils;
-mod verification;
-use db::{Databases, apply_changeset, apply_transaction_digests};
+
+use db::{Databases, StateBatch, TransactionBatch, apply_changeset, apply_transaction_digests};
 pub use db::{
     STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb, TransactionHistoryOperation,
     TransactionHistoryTarget,
 };
-use execution::{ExecutionTimings, child_state_sync_range, finalize_child_execution};
-use history::header_range_to_target;
-pub use utils::{load_lazy_state, load_state};
+use history::{
+    child_transactions_range, header_range_to_target, parent_transactions_inactivity_floor,
+};
 
 type FinalizedPruneFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type FinalizedPruneFn = Arc<dyn Fn(Height) -> FinalizedPruneFuture + Send + Sync>;
+type Result<T> = core::result::Result<T, &'static str>;
 
-/// Core constantinople application.
-///
-/// This type implements the consensus application trait on top of the
-/// processor and the managed state databases.
+const INVALID_SIGNATURE: &str = "invalid signature";
+const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
+const MATERIALIZE_TASK_CLOSED: &str = "transaction materialization task closed";
+const MALFORMED_TRANSACTION: &str = "malformed transaction";
+const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
+
+/// Core Constantinople application.
 pub struct Application<H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
@@ -82,15 +79,15 @@ where
     hash_strategy: HashSt,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
-    genesis_state_root: <H as Hasher>::Digest,
-    genesis_state_sync_root: <H as Hasher>::Digest,
+    genesis_state_root: H::Digest,
+    genesis_state_sync_root: H::Digest,
     genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
-    genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+    genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     prune_cadence_blocks: NonZeroU64,
     finalized_pruner: FinalizedPruneFn,
     finalized_state_sync_start: Arc<AtomicU64>,
     proposed_transactions: Counter,
-    _marker: PhantomData<(H, C, S, I, B)>,
+    _marker: PhantomData<(C, S, I, B)>,
 }
 
 impl<H, C, S, P, I, B, SigSt, HashSt> Clone for Application<H, C, S, P, I, B, SigSt, HashSt>
@@ -129,20 +126,20 @@ where
     HashSt: Strategy,
 {
     /// Creates an application.
-    ///
-    /// The application keeps the execution strategy, genesis leader, and
-    /// transaction signing namespace for all later block proposal,
-    /// verification, and application.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the engine constructs the application from already grouped config"
+    )]
     pub fn new(
         context: impl Metrics,
         signature_strategy: SigSt,
         hash_strategy: HashSt,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
-        genesis_state_root: <H as Hasher>::Digest,
-        genesis_state_sync_root: <H as Hasher>::Digest,
+        genesis_state_root: H::Digest,
+        genesis_state_sync_root: H::Digest,
         genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
-        genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+        genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         prune_cadence_blocks: NonZeroU64,
         finalized_pruner: FinalizedPruneFn,
     ) -> Self {
@@ -169,7 +166,7 @@ where
     }
 
     const fn should_prune_after_finalize(&self, height: u64) -> bool {
-        height != 0 && height % self.prune_cadence_blocks.get() == 0
+        height != 0 && height.is_multiple_of(self.prune_cadence_blocks.get())
     }
 
     fn state_sync_start(&self, parent: &SealedBlock<C, P, H>) -> u64 {
@@ -197,80 +194,70 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
-        let propose_started_at = Instant::now();
+        let started_at = Instant::now();
 
         let input_started_at = Instant::now();
         let body = input.propose(&parent.header, &context).await;
         let input_ms = input_started_at.elapsed().as_millis();
 
-        let (state_batches, transaction_batch) = batches;
+        let prepare_started_at = Instant::now();
+        let proposal_input = executor::prepare_proposal(body);
+        let candidate_transfers = proposal_input
+            .candidates
+            .iter()
+            .map(|candidate| candidate.transfer.clone())
+            .collect::<Vec<_>>();
+        let prepare_ms = prepare_started_at.elapsed().as_millis();
 
-        let load_state_started_at = Instant::now();
-        let state = load_state(&state_batches, &body)
-            .await
-            .expect("proposal state loading must succeed")
-            .expect("proposal transactions must have decodable senders");
-        let load_state_ms = load_state_started_at.elapsed().as_millis();
+        let (state_batch, transaction_batch) = batches;
+        let execution = self
+            .execute_proposal(
+                state_batch,
+                transaction_batch,
+                parent,
+                proposal_input,
+                &candidate_transfers,
+            )
+            .await;
+        let ProposalExecution {
+            block_execution,
+            body,
+        } = execution;
 
-        let execute_started_at = Instant::now();
-        let ProposalOutput {
-            valid,
-            invalid: _,
-            changeset,
-        } = executor::propose(&state, body);
-        let execute_ms = execute_started_at.elapsed().as_millis();
-
-        self.proposed_transactions.inc_by(valid.len() as u64);
-
-        let state_sync_range =
-            child_state_sync_range(parent, self.state_sync_start(parent), changeset.len());
-        let state_batch = apply_changeset(state_batches, &changeset);
-        let transaction_count = valid.len();
-        let transaction_batch = apply_transaction_digests(transaction_batch, &valid);
-        let prepare_signers_ms = 0;
-        let timings =
-            ExecutionTimings::before_finalize(prepare_signers_ms, load_state_ms, execute_ms);
-        let execution = finalize_child_execution(
-            state_batch,
-            transaction_batch,
-            parent,
-            state_sync_range.clone(),
-            transaction_count,
-            timings,
-            "database merkleization must succeed",
-        )
-        .await;
+        self.proposed_transactions
+            .inc_by(block_execution.transaction_count as u64);
 
         let header = Header {
             context,
             parent: parent.digest(),
             height: parent.header.height + 1,
             timestamp: time::timestamp_ms(&runtime),
-            state_root: execution.state.root(),
-            state_sync_root: execution.state.sync_root(),
-            state_range: state_sync_range,
-            transactions_root: execution.transactions.root(),
-            transactions_range: execution.transactions_range.clone(),
+            state_root: block_execution.state.root(),
+            state_sync_root: block_execution.state.sync_root(),
+            state_range: block_execution.state_sync_range.clone(),
+            transactions_root: block_execution.transactions.root(),
+            transactions_range: block_execution.transactions_range.clone(),
         };
-        let block = Block::new(header, valid).seal(&mut H::default());
+        let block = Block::new(header, body).seal(&mut H::default());
 
         info!(
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
             height = block.header.height,
-            txs = block.body.len(),
+            txs = block_execution.transaction_count,
             timestamp = block.header.timestamp,
             input_ms,
-            load_state_ms = execution.timings.load_state_ms,
-            execute_ms = execution.timings.execute_ms,
-            finalize_ms = execution.timings.finalize_ms,
-            total_ms = propose_started_at.elapsed().as_millis(),
+            prepare_ms,
+            load_state_ms = block_execution.timings.load_state_ms,
+            execute_ms = block_execution.timings.execute_ms,
+            finalize_ms = block_execution.timings.finalize_ms,
+            total_ms = started_at.elapsed().as_millis(),
             "proposed block"
         );
 
         Some(Proposed {
             block,
-            merkleized: execution.into_merkleized(),
+            merkleized: block_execution.into_merkleized(),
         })
     }
 
@@ -291,7 +278,7 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
-        let verify_started_at = Instant::now();
+        let started_at = Instant::now();
         let Block { header, body } = block.into_inner();
 
         if !time::is_valid_child_timestamp(parent.header.timestamp, header.timestamp) {
@@ -304,48 +291,34 @@ where
             return None;
         }
 
-        let deadline = time::block_deadline(header.timestamp);
-        let prepare_started_at = Instant::now();
-        let prepared = Arc::new(verification::prepare_transactions(body));
-        let prepare_ms = prepare_started_at.elapsed().as_millis();
-
-        let (state_batches, transaction_batch) = batches;
-        let preload = verification::preload_transactions::<E, P, H, HashSt>(
-            runtime.child("preload_transactions"),
-            self.hash_strategy.clone(),
-            Arc::clone(&prepared),
-        );
-        if let Err(reason) = preload.await {
-            verification::reject(header.height, reason);
-            return None;
-        }
-
-        let signature = verification::verify_signatures::<E, P, H, B, SigSt>(
+        let body = Arc::new(PreparedBody { transactions: body });
+        let (state_batch, transaction_batch) = batches;
+        let signatures = verify_signatures::<E, P, H, B, SigSt, HashSt>(
             runtime.child("verify_signatures"),
             self.signature_strategy.clone(),
+            self.hash_strategy.clone(),
             self.transaction_namespace,
-            Arc::clone(&prepared),
+            Arc::clone(&body),
         );
-        let execution = verification::execute_block(
-            state_batches,
+        let execution = execute_body(
+            state_batch,
             transaction_batch,
-            &self.hash_strategy,
             parent,
             self.state_sync_start(parent),
-            prepared.as_ref(),
+            Arc::clone(&body),
         );
-        let sleep = verification::wait_for_timestamp(runtime, deadline);
+        let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let (signature_ms, execution, sleep_ms) =
-            match futures::try_join!(signature, execution, sleep) {
+            match futures::try_join!(signatures, execution, wait) {
                 Ok(result) => result,
                 Err(reason) => {
-                    verification::reject(header.height, reason);
+                    reject(header.height, reason);
                     return None;
                 }
             };
 
-        if !verification::commitments_match(&header, &execution) {
+        if !commitments_match(&header, &execution) {
             return None;
         }
 
@@ -357,14 +330,14 @@ where
             timestamp = header.timestamp,
             signature_ms,
             sleep_ms,
-            prepare_ms,
-            prepare_signers_ms = execution.timings.prepare_signers_ms,
+            prepare_ms = execution.timings.prepare_ms,
             load_state_ms = execution.timings.load_state_ms,
             execute_ms = execution.timings.execute_ms,
             finalize_ms = execution.timings.finalize_ms,
-            total_ms = verify_started_at.elapsed().as_millis(),
+            total_ms = started_at.elapsed().as_millis(),
             "verified block"
         );
+
         Some(execution.into_merkleized())
     }
 
@@ -384,34 +357,77 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
-        let prepared = Arc::new(verification::prepare_transactions(block.body.clone()));
-        let preload = verification::preload_transactions::<E, P, H, HashSt>(
-            runtime.child("preload_transactions"),
-            self.hash_strategy.clone(),
-            Arc::clone(&prepared),
-        );
-        preload
-            .await
-            .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+        let materialized =
+            materialize_body(runtime, self.hash_strategy.clone(), block.body.clone())
+                .await
+                .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+        let body = materialized
+            .iter()
+            .map(executor::prepare_transfer)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 
-        let signature = verification::verify_signatures::<E, P, H, B, SigSt>(
-            runtime,
-            self.signature_strategy.clone(),
-            self.transaction_namespace,
-            Arc::clone(&prepared),
-        );
-        let (state_batches, transaction_batch) = batches;
-        let execution = verification::apply_block(
-            state_batches,
+        let (state_batch, transaction_batch) = batches;
+        apply_prepared_body(
+            state_batch,
             transaction_batch,
-            &self.hash_strategy,
             mmr::Location::new(block.header.transactions_range.start()),
-            prepared.as_ref(),
-        );
+            &body,
+        )
+        .await
+        .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
+    }
 
-        match futures::try_join!(signature, execution) {
-            Ok((_signature_ms, merkleized)) => merkleized,
-            Err(reason) => panic!("certified block contained {reason}"),
+    async fn execute_proposal<E>(
+        &self,
+        state_batch: StateBatch<E, H, P, EightCap, HashSt>,
+        transaction_batch: TransactionBatch<E, H, HashSt>,
+        parent: &SealedBlock<C, P, H>,
+        proposal_input: executor::ProposalInput<P, H>,
+        candidate_transfers: &[PreparedTransfer<P, H>],
+    ) -> ProposalExecution<E, H, P, HashSt>
+    where
+        E: Storage + Clock + Metrics,
+        HashSt: Strategy,
+    {
+        let load_started_at = Instant::now();
+        let state = load_state(&state_batch, candidate_transfers)
+            .await
+            .expect("proposal state loading must succeed");
+        let load_state_ms = load_started_at.elapsed().as_millis();
+
+        let execute_started_at = Instant::now();
+        let output = executor::propose_prepared(&state, proposal_input);
+        let execute_ms = execute_started_at.elapsed().as_millis();
+        let transfers = output
+            .valid
+            .iter()
+            .map(executor::prepare_transfer)
+            .collect::<Option<Vec<_>>>()
+            .expect("included proposal transactions were already prepared");
+        let digests = transfer_digests(&transfers);
+        let state_sync_range = child_state_sync_range(
+            parent,
+            self.state_sync_start(parent),
+            output.changeset.len(),
+        );
+        let state_batch = apply_changeset(state_batch, &output.changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+        let timings = Timings::before_finalize(0, load_state_ms, execute_ms);
+        let execution = finalize_child(
+            state_batch,
+            transaction_batch,
+            parent,
+            state_sync_range,
+            output.valid.len(),
+            timings,
+            "database merkleization must succeed",
+        )
+        .await;
+
+        ProposalExecution {
+            block_execution: execution,
+            body: output.valid,
         }
     }
 }
@@ -435,7 +451,6 @@ where
     type Databases = Databases<E, H, P, EightCap, HashSt>;
     type InputProvider = I;
 
-    /// Returns the sync targets required to fetch the block's state.
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
             Target {
@@ -452,10 +467,6 @@ where
         )
     }
 
-    /// Builds the genesis block.
-    ///
-    /// The genesis block always uses timestamp `0` and the configured genesis
-    /// leader.
     async fn genesis(&mut self) -> Self::Block {
         genesis_block(
             &mut H::default(),
@@ -468,12 +479,6 @@ where
         )
     }
 
-    /// Proposes the next block from the mempool and current ancestry.
-    ///
-    /// Proposal consumes already-verified mempool transactions, preloads the
-    /// touched accounts, filters out statically invalid transfers, and
-    /// executes the survivors against in-memory state before block
-    /// construction.
     async fn propose<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -485,12 +490,6 @@ where
         self.propose_child(context, &parent, batches, input).await
     }
 
-    /// Verifies a proposed block against speculative execution.
-    ///
-    /// Verification rejects invalid transaction signatures and invalid
-    /// timestamps, then waits until the block timestamp has passed to
-    /// account for clock skew. After the wait, it re-executes the block
-    /// and compares all derived roots and ranges.
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -502,17 +501,6 @@ where
         self.verify_child(context, block, &parent, batches).await
     }
 
-    /// Applies a certified block to speculative batches and returns merkleized state.
-    ///
-    /// Unlike verification, application assumes consensus has already
-    /// certified the block. It reconstitutes verified execution transactions
-    /// from the signed wire block and deterministically replays them to
-    /// derive the merkleized state batch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the certified block contains an invalid signature or if
-    /// execution or database finalization fails.
     async fn apply(
         &mut self,
         context: (E, Self::Context),
@@ -536,26 +524,404 @@ where
         (self.finalized_pruner)(Height::new(height)).await;
 
         let (state, _) = databases;
-        {
-            let mut state = state.write().await;
-            let prune_to = state.sync_boundary();
-            state
-                .prune(prune_to)
-                .await
-                .expect("state db prune must not fail at the sync boundary");
-            self.finalized_state_sync_start
-                .store(*prune_to, Ordering::Relaxed);
-        }
-
-        // The transaction history database uses compact storage, so it already
-        // retains only the compact frontier and exposes no explicit prune API.
+        let mut state = state.write().await;
+        let prune_to = state.sync_boundary();
+        state
+            .prune(prune_to)
+            .await
+            .expect("state db prune must not fail at the sync boundary");
+        self.finalized_state_sync_start
+            .store(*prune_to, Ordering::Relaxed);
     }
 }
 
+#[derive(Debug)]
+struct PreparedBody<P, H>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+}
+
+struct ProposalExecution<E, H, P, S>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    block_execution: BlockExecution<E, H, P, S>,
+    body: Vec<SignedTransaction<P, H>>,
+}
+
+struct BlockExecution<E, H, P, S>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    state: db::StateMerkleized<E, H, P, EightCap, S>,
+    transactions: db::TransactionMerkleized<E, H, S>,
+    state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
+    transactions_range: commonware_utils::range::NonEmptyRange<u64>,
+    transaction_count: usize,
+    timings: Timings,
+}
+
+impl<E, H, P, S> BlockExecution<E, H, P, S>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, P, S> {
+        (self.state, self.transactions)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Timings {
+    prepare_ms: u128,
+    load_state_ms: u128,
+    execute_ms: u128,
+    finalize_ms: u128,
+}
+
+impl Timings {
+    const fn before_finalize(prepare_ms: u128, load_state_ms: u128, execute_ms: u128) -> Self {
+        Self {
+            prepare_ms,
+            load_state_ms,
+            execute_ms,
+            finalize_ms: 0,
+        }
+    }
+
+    const fn with_finalize_ms(mut self, finalize_ms: u128) -> Self {
+        self.finalize_ms = finalize_ms;
+        self
+    }
+}
+
+async fn verify_signatures<E, P, H, B, SigSt, HashSt>(
+    runtime: E,
+    signature_strategy: SigSt,
+    hash_strategy: HashSt,
+    namespace: &'static [u8],
+    body: Arc<PreparedBody<P, H>>,
+) -> Result<u128>
+where
+    E: Spawner + CryptoRngCore,
+    P: PublicKey,
+    H: Hasher,
+    B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+    SigSt: Strategy + Send + Sync + 'static,
+    HashSt: Strategy + Send + Sync + 'static,
+{
+    let (result_tx, result_rx) = futures::channel::oneshot::channel();
+    let _handle = runtime.shared(true).spawn(move |mut runtime| async move {
+        let started_at = Instant::now();
+        let result = verify_transaction_chunks::<P, H, B, _, _>(
+            &signature_strategy,
+            &hash_strategy,
+            namespace,
+            &mut runtime,
+            body.transactions.clone(),
+        )
+        .map(|_| started_at.elapsed().as_millis())
+        .ok_or(INVALID_SIGNATURE);
+        let _ = result_tx.send(result);
+    });
+
+    result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
+}
+
+async fn materialize_body<E, P, H, HashSt>(
+    runtime: E,
+    hash_strategy: HashSt,
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+) -> Result<Vec<SignedTransaction<P, H>>>
+where
+    E: Spawner,
+    P: PublicKey,
+    H: Hasher,
+    HashSt: Strategy + Send + Sync + 'static,
+{
+    let (result_tx, result_rx) = futures::channel::oneshot::channel();
+    let _handle = runtime.shared(true).spawn(move |_| async move {
+        let result = materialize_transaction_chunks(&hash_strategy, transactions)
+            .ok_or(MALFORMED_TRANSACTION);
+        let _ = result_tx.send(result);
+    });
+
+    result_rx.await.map_err(|_| MATERIALIZE_TASK_CLOSED)?
+}
+
+async fn execute_body<E, C, P, H, S>(
+    state_batch: StateBatch<E, H, P, EightCap, S>,
+    transaction_batch: TransactionBatch<E, H, S>,
+    parent: &SealedBlock<C, P, H>,
+    state_sync_start: u64,
+    body: Arc<PreparedBody<P, H>>,
+) -> Result<BlockExecution<E, H, P, S>>
+where
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    S: Strategy,
+{
+    let prepare_started_at = Instant::now();
+    let transfers = body
+        .transactions
+        .iter()
+        .map(|transaction| executor::prepare_transfer(transaction.get()?))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(MALFORMED_TRANSACTION)?;
+    let prepare_ms = prepare_started_at.elapsed().as_millis();
+
+    execute_prepared_child(
+        state_batch,
+        transaction_batch,
+        parent,
+        state_sync_start,
+        &transfers,
+        prepare_ms,
+    )
+    .await
+}
+
+async fn execute_prepared_child<E, C, P, H, S>(
+    state_batch: StateBatch<E, H, P, EightCap, S>,
+    transaction_batch: TransactionBatch<E, H, S>,
+    parent: &SealedBlock<C, P, H>,
+    state_sync_start: u64,
+    transfers: &[PreparedTransfer<P, H>],
+    prepare_ms: u128,
+) -> Result<BlockExecution<E, H, P, S>>
+where
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    S: Strategy,
+{
+    let load_started_at = Instant::now();
+    let state = load_state(&state_batch, transfers)
+        .await
+        .expect("block state loading must succeed");
+    let load_state_ms = load_started_at.elapsed().as_millis();
+
+    let execute_started_at = Instant::now();
+    let changeset = executor::execute(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let execute_ms = execute_started_at.elapsed().as_millis();
+    let state_sync_range = child_state_sync_range(parent, state_sync_start, changeset.len());
+    let digests = transfer_digests(transfers);
+    let state_batch = apply_changeset(state_batch, &changeset);
+    let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+    let timings = Timings::before_finalize(prepare_ms, load_state_ms, execute_ms);
+
+    Ok(finalize_child(
+        state_batch,
+        transaction_batch,
+        parent,
+        state_sync_range,
+        transfers.len(),
+        timings,
+        "database merkleization during verification must succeed",
+    )
+    .await)
+}
+
+async fn apply_prepared_body<E, P, H, S>(
+    state_batch: StateBatch<E, H, P, EightCap, S>,
+    transaction_batch: TransactionBatch<E, H, S>,
+    transaction_floor: mmr::Location,
+    transfers: &[PreparedTransfer<P, H>],
+) -> Result<db::MerkleizedDatabases<E, H, P, S>>
+where
+    E: Storage + Clock + Metrics,
+    P: PublicKey,
+    H: Hasher,
+    S: Strategy,
+{
+    let state = load_state(&state_batch, transfers)
+        .await
+        .expect("state loading must succeed for certified apply");
+    let changeset = executor::execute(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let digests = transfer_digests(transfers);
+    let state_batch = apply_changeset(state_batch, &changeset);
+    let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
+        .with_inactivity_floor(transaction_floor);
+
+    db::finalize_execution(state_batch, transaction_batch)
+        .await
+        .map_err(|_| STATIC_INVALID_TRANSACTION)
+}
+
+async fn load_state<E, H, P, S>(
+    batch: &StateBatch<E, H, P, EightCap, S>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    if transfers.is_empty() {
+        return Ok(State::new());
+    }
+
+    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
+    for transfer in transfers {
+        account_keys.insert(transfer.sender.clone());
+        account_keys.insert(transfer.recipient.clone());
+    }
+
+    let account_keys = account_keys.into_iter().collect::<Vec<_>>();
+    let keys = account_keys.iter().collect::<Vec<_>>();
+    let values = batch.get_many(&keys).await?;
+    Ok(account_keys
+        .into_iter()
+        .zip(values)
+        .map(|(account_key, account)| (account_key, account.unwrap_or_default()))
+        .collect())
+}
+
+async fn finalize_child<E, C, P, H, S>(
+    state_batch: StateBatch<E, H, P, EightCap, S>,
+    transaction_batch: TransactionBatch<E, H, S>,
+    parent: &SealedBlock<C, P, H>,
+    state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
+    transaction_count: usize,
+    timings: Timings,
+    expect_message: &'static str,
+) -> BlockExecution<E, H, P, S>
+where
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    S: Strategy,
+{
+    let transaction_batch =
+        transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
+    let transactions_range = child_transactions_range(parent, transaction_count);
+    let finalize_started_at = Instant::now();
+    let (state, transactions) = db::finalize_execution(state_batch, transaction_batch)
+        .await
+        .expect(expect_message);
+    let finalize_ms = finalize_started_at.elapsed().as_millis();
+
+    BlockExecution {
+        state,
+        transactions,
+        state_sync_range,
+        transactions_range,
+        transaction_count,
+        timings: timings.with_finalize_ms(finalize_ms),
+    }
+}
+
+fn child_state_sync_range<C, P, H>(
+    parent: &SealedBlock<C, P, H>,
+    state_sync_start: u64,
+    state_write_count: usize,
+) -> commonware_utils::range::NonEmptyRange<u64>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let state_ops = u64::try_from(state_write_count)
+        .expect("state write count must fit into u64")
+        .checked_add(1)
+        .expect("state batch commit must not overflow u64");
+    let state_sync_end = parent
+        .header
+        .state_range
+        .end()
+        .checked_add(state_ops)
+        .expect("state sync range end must not overflow u64");
+    non_empty_range!(state_sync_start, state_sync_end)
+}
+
+fn transfer_digests<P, H>(transfers: &[PreparedTransfer<P, H>]) -> Vec<H::Digest>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    transfers.iter().map(|transfer| transfer.digest).collect()
+}
+
+async fn wait_for_timestamp<E>(runtime: E, deadline: std::time::SystemTime) -> Result<u128>
+where
+    E: Clock,
+{
+    let started_at = Instant::now();
+    runtime.sleep_until(deadline).await;
+    Ok(started_at.elapsed().as_millis())
+}
+
+fn reject(height: u64, reason: &'static str) {
+    warn!(height, reason, "verify rejected");
+}
+
+fn commitments_match<E, C, P, H, S>(
+    header: &Header<C, H::Digest, P>,
+    execution: &BlockExecution<E, H, P, S>,
+) -> bool
+where
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    S: Strategy,
+{
+    if execution.state.root() != header.state_root {
+        warn!(
+            height = header.height,
+            "verify rejected: state root mismatch"
+        );
+        return false;
+    }
+    if execution.state.sync_root() != header.state_sync_root {
+        warn!(
+            height = header.height,
+            "verify rejected: state sync root mismatch"
+        );
+        return false;
+    }
+    if execution.state_sync_range != header.state_range {
+        warn!(
+            height = header.height,
+            "verify rejected: state range mismatch"
+        );
+        return false;
+    }
+    if execution.transactions.root() != header.transactions_root {
+        warn!(
+            height = header.height,
+            "verify rejected: transaction root mismatch"
+        );
+        return false;
+    }
+    if execution.transactions_range != header.transactions_range {
+        warn!(
+            height = header.height,
+            "verify rejected: transaction range mismatch"
+        );
+        return false;
+    }
+
+    true
+}
+
 /// Creates the genesis block.
-///
-/// The genesis block starts with empty state, the initialized transaction
-/// history target, and the provided leader and timestamp.
 pub fn genesis_block<C, P, H>(
     hasher: &mut H,
     leader: P,
@@ -591,9 +957,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TransactionHistoryTarget, genesis_block, history::parent_transactions_inactivity_floor,
-    };
+    use super::{TransactionHistoryTarget, genesis_block, parent_transactions_inactivity_floor};
     use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Block, Sealable, Signable, Transaction};

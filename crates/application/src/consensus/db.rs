@@ -1,6 +1,6 @@
 //! Database aliases and batch helpers for consensus execution.
 
-use crate::processor::executor::Changeset;
+use crate::executor::Changeset;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, current::CurrentUnmerkleized};
 use commonware_parallel::Strategy;
@@ -21,7 +21,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::sync::AsyncRwLock;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey};
 use std::sync::Arc;
 
 pub const STATE_BITMAP_CHUNK_BYTES: usize = 64;
@@ -48,7 +48,7 @@ pub(super) type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistor
 pub(super) type Databases<E, H, P, T, S> =
     (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
 
-/// Unmerkleized application state batch used for processor read-through.
+/// Unmerkleized application state batch used for executor read-through.
 pub(super) type StateBatch<E, H, P, T, S> = CurrentUnmerkleized<
     mmr::Family,
     E,
@@ -95,19 +95,18 @@ where
         })
 }
 
-pub(super) fn apply_transaction_digests<E, H, P, S>(
+pub(super) fn apply_transaction_digests<E, H, S>(
     batch: TransactionBatch<E, H, S>,
-    transactions: &[SignedTransaction<P, H>],
+    digests: &[H::Digest],
 ) -> TransactionBatch<E, H, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
-    transactions.iter().fold(batch, |batch, transaction| {
-        batch.append(*transaction.message_digest())
-    })
+    digests
+        .iter()
+        .fold(batch, |batch, digest| batch.append(*digest))
 }
 
 pub(super) async fn finalize_execution<E, H, P, S>(

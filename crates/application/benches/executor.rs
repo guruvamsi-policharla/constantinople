@@ -1,6 +1,6 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
-use constantinople_application::processor::{executor, state::State};
+use constantinople_application::executor::{self, State};
 use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -10,11 +10,11 @@ use std::hint::black_box;
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
 
-const NAMESPACE: &[u8] = b"processor-bench";
+const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
 
-fn processor(c: &mut Criterion) {
-    let mut group = c.benchmark_group("processor");
+fn executor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("executor");
 
     for &transaction_count in TRANSACTION_COUNTS {
         group.throughput(Throughput::Elements(transaction_count as u64));
@@ -23,10 +23,15 @@ fn processor(c: &mut Criterion) {
             &transaction_count,
             |bencher, &transaction_count| {
                 let (state, transactions) = build_fixture(transaction_count);
+                let transfers = transactions
+                    .iter()
+                    .map(executor::prepare_transfer)
+                    .collect::<Option<Vec<_>>>()
+                    .expect("bench transactions should prepare");
                 bencher.iter(|| {
                     black_box(
-                        executor::execute(black_box(&state), black_box(&transactions))
-                            .expect("bench transactions should execute")
+                        executor::execute(black_box(&state), black_box(&transfers))
+                            .expect("bench transfers should execute")
                             .len(),
                     )
                 });
@@ -85,6 +90,6 @@ impl TestSigner {
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = processor
+    targets = executor
 }
 criterion_main!(benches);

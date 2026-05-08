@@ -12,7 +12,7 @@ use commonware_cryptography::{
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Error as RuntimeError, Metrics as _, Storage as _, Supervisor, ThreadPooler,
+    Error as RuntimeError, Storage as _, Supervisor, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
     buffer::paged::CacheRef,
     tokio::{Config as RuntimeConfig, Context as RuntimeContext},
@@ -186,14 +186,16 @@ enum Operation {
     Verify,
     VerifyDecoded,
     Apply,
+    LocalLifecycle,
 }
 
 impl Operation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Propose,
         Self::Verify,
         Self::VerifyDecoded,
         Self::Apply,
+        Self::LocalLifecycle,
     ];
 
     const fn name(self) -> &'static str {
@@ -202,12 +204,13 @@ impl Operation {
             Self::Verify => "verify",
             Self::VerifyDecoded => "verify-decoded",
             Self::Apply => "apply",
+            Self::LocalLifecycle => "local-lifecycle",
         }
     }
 
     async fn measure_once(
         self,
-        runtime: RuntimeContext,
+        runtime: &RuntimeContext,
         transaction_count: usize,
         iteration: u64,
     ) -> Duration {
@@ -215,18 +218,17 @@ impl Operation {
             "consensus-bench-{}-{transaction_count}-{iteration}",
             self.name()
         );
-        cleanup_partitions(&runtime, &prefix).await;
+        cleanup_partitions(runtime, &prefix).await;
 
         let elapsed = match self {
-            Self::Propose => propose_once(runtime.clone(), transaction_count, &prefix).await,
-            Self::Verify => verify_once(runtime.clone(), transaction_count, &prefix).await,
-            Self::VerifyDecoded => {
-                verify_decoded_once(runtime.clone(), transaction_count, &prefix).await
-            }
-            Self::Apply => apply_once(runtime.clone(), transaction_count, &prefix).await,
+            Self::Propose => propose_once(runtime, transaction_count, &prefix).await,
+            Self::Verify => verify_once(runtime, transaction_count, &prefix).await,
+            Self::VerifyDecoded => verify_decoded_once(runtime, transaction_count, &prefix).await,
+            Self::Apply => apply_once(runtime, transaction_count, &prefix).await,
+            Self::LocalLifecycle => lifecycle_once(runtime, transaction_count, &prefix).await,
         };
 
-        cleanup_partitions(&runtime, &prefix).await;
+        cleanup_partitions(runtime, &prefix).await;
         elapsed
     }
 }
@@ -259,27 +261,36 @@ async fn measure(operation: Operation, transaction_count: usize, iterations: u64
 
     for iteration in 0..iterations {
         total += operation
-            .measure_once(runtime.clone(), transaction_count, iteration)
+            .measure_once(&runtime, transaction_count, iteration)
             .await;
     }
 
     total
 }
 
-async fn propose_once(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
+async fn propose_once(
+    runtime: &RuntimeContext,
+    transaction_count: usize,
+    prefix: &str,
+) -> Duration {
     let Fixture {
         mut app,
         databases,
         parent,
         context,
         transactions,
-    } = Fixture::new(runtime.clone(), transaction_count, prefix).await;
+    } = Fixture::new(runtime, transaction_count, prefix).await;
     let mut input = TestTransactionSource::new(vec![transactions]);
     let batches = databases.new_batches().await;
 
     let started_at = Instant::now();
     let proposed = app
-        .propose_child((runtime, context), &parent, batches, &mut input)
+        .propose_child(
+            (runtime.child("propose"), context),
+            &parent,
+            batches,
+            &mut input,
+        )
         .await
         .expect("proposal should succeed");
     let elapsed = started_at.elapsed();
@@ -291,8 +302,8 @@ async fn propose_once(runtime: RuntimeContext, transaction_count: usize, prefix:
     elapsed
 }
 
-async fn verify_once(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
-    let prepared = PreparedBlock::new(runtime.clone(), transaction_count, prefix).await;
+async fn verify_once(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
+    let prepared = PreparedBlock::new(runtime, transaction_count, prefix).await;
     verify_prepared_once(
         runtime,
         prepared,
@@ -302,11 +313,11 @@ async fn verify_once(runtime: RuntimeContext, transaction_count: usize, prefix: 
 }
 
 async fn verify_decoded_once(
-    runtime: RuntimeContext,
+    runtime: &RuntimeContext,
     transaction_count: usize,
     prefix: &str,
 ) -> Duration {
-    let prepared = PreparedBlock::new_decoded(runtime.clone(), transaction_count, prefix).await;
+    let prepared = PreparedBlock::new_decoded(runtime, transaction_count, prefix).await;
     verify_prepared_once(
         runtime,
         prepared,
@@ -316,7 +327,7 @@ async fn verify_decoded_once(
 }
 
 async fn verify_prepared_once(
-    runtime: RuntimeContext,
+    runtime: &RuntimeContext,
     prepared: PreparedBlock,
     success: &str,
 ) -> Duration {
@@ -331,7 +342,7 @@ async fn verify_prepared_once(
 
     let started_at = Instant::now();
     let merkleized = app
-        .verify_child((runtime, context), block, &parent, batches)
+        .verify_child((runtime.child("verify"), context), block, &parent, batches)
         .await
         .expect(success);
     let elapsed = started_at.elapsed();
@@ -343,25 +354,88 @@ async fn verify_prepared_once(
     elapsed
 }
 
-async fn apply_once(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
+async fn apply_once(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
     let PreparedBlock {
         mut app,
         databases,
         parent: _,
         block,
-    } = PreparedBlock::new(runtime.clone(), transaction_count, prefix).await;
+    } = PreparedBlock::new(runtime, transaction_count, prefix).await;
     let batches = databases.new_batches().await;
     let context = block.header.context.clone();
 
     let started_at = Instant::now();
     let merkleized = app
-        .apply_certified((runtime, context), &block, batches)
+        .apply_certified((runtime.child("apply"), context), &block, batches)
         .await;
     let elapsed = started_at.elapsed();
 
     black_box(merkleized.0.root());
     black_box(merkleized.1.root());
     drop(merkleized);
+    drop(databases);
+    elapsed
+}
+
+async fn lifecycle_once(
+    runtime: &RuntimeContext,
+    transaction_count: usize,
+    prefix: &str,
+) -> Duration {
+    let Fixture {
+        mut app,
+        databases,
+        parent,
+        context,
+        transactions,
+    } = Fixture::new(runtime, transaction_count, prefix).await;
+    let mut input = TestTransactionSource::new(vec![transactions]);
+
+    let started_at = Instant::now();
+    let propose_batches = databases.new_batches().await;
+    let proposed = app
+        .propose_child(
+            (runtime.child("lifecycle_propose"), context),
+            &parent,
+            propose_batches,
+            &mut input,
+        )
+        .await
+        .expect("proposal should succeed");
+    let block = proposed.block;
+    black_box(proposed.merkleized.0.root());
+    black_box(proposed.merkleized.1.root());
+    drop(proposed.merkleized);
+
+    let verify_batches = databases.new_batches().await;
+    let verify_context = block.header.context.clone();
+    let verified = app
+        .verify_child(
+            (runtime.child("lifecycle_verify"), verify_context),
+            block.clone(),
+            &parent,
+            verify_batches,
+        )
+        .await
+        .expect("verification should accept the proposed block");
+    black_box(verified.0.root());
+    black_box(verified.1.root());
+    drop(verified);
+
+    let apply_batches = databases.new_batches().await;
+    let apply_context = block.header.context.clone();
+    let applied = app
+        .apply_certified(
+            (runtime.child("lifecycle_apply"), apply_context),
+            &block,
+            apply_batches,
+        )
+        .await;
+    let elapsed = started_at.elapsed();
+
+    black_box(applied.0.root());
+    black_box(applied.1.root());
+    drop(applied);
     drop(databases);
     elapsed
 }
@@ -375,17 +449,12 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
+    async fn new(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
         let generated = GeneratedTransactions::new(transaction_count);
-        let signature_strategy = bench_strategy(&runtime);
-        let hash_strategy = bench_strategy(&runtime);
-        let databases = init_databases(
-            runtime.clone(),
-            prefix,
-            &generated.accounts,
-            hash_strategy.clone(),
-        )
-        .await;
+        let signature_strategy = bench_strategy(runtime);
+        let hash_strategy = bench_strategy(runtime);
+        let databases =
+            init_databases(runtime, prefix, &generated.accounts, hash_strategy.clone()).await;
         let leader = generated.leader.clone();
         let parent = parent_block(leader.clone(), &databases).await;
         let context = block_context(leader.clone());
@@ -416,18 +485,23 @@ struct PreparedBlock {
 }
 
 impl PreparedBlock {
-    async fn new(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
+    async fn new(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
         let Fixture {
             mut app,
             databases,
             parent,
             context,
             transactions,
-        } = Fixture::new(runtime.clone(), transaction_count, prefix).await;
+        } = Fixture::new(runtime, transaction_count, prefix).await;
         let mut input = TestTransactionSource::new(vec![transactions]);
         let batches = databases.new_batches().await;
         let proposed = app
-            .propose_child((runtime, context), &parent, batches, &mut input)
+            .propose_child(
+                (runtime.child("prepare_block"), context),
+                &parent,
+                batches,
+                &mut input,
+            )
             .await
             .expect("proposal should succeed");
         let block = proposed.block;
@@ -441,7 +515,7 @@ impl PreparedBlock {
         }
     }
 
-    async fn new_decoded(runtime: RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
+    async fn new_decoded(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
         let mut prepared = Self::new(runtime, transaction_count, prefix).await;
         prepared.block = decode_block(prepared.block);
         prepared
@@ -510,15 +584,15 @@ impl TestSigner {
 }
 
 async fn init_databases(
-    runtime: RuntimeContext,
+    runtime: &RuntimeContext,
     prefix: &str,
     accounts: &[(AccountKey<TestPublicKey>, Account)],
     strategy: Rayon,
 ) -> TestDatabases {
     let databases = TestDatabases::init(
-        runtime.clone(),
+        runtime.child("databases"),
         (
-            state_db_config(&runtime, prefix, strategy.clone()),
+            state_db_config(runtime, prefix, strategy.clone()),
             transaction_db_config(prefix, strategy),
         ),
     )
@@ -541,7 +615,7 @@ async fn init_databases(
 }
 
 async fn new_application(
-    runtime: RuntimeContext,
+    runtime: &RuntimeContext,
     leader: TestPublicKey,
     databases: &TestDatabases,
     signature_strategy: Rayon,

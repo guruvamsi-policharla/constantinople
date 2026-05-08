@@ -50,7 +50,7 @@ rand.workspace = true
 criterion.workspace = true
 
 [[bench]]
-name = "processor"
+name = "executor"
 harness = false
 
 [[bench]]
