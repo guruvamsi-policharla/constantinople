@@ -2,7 +2,7 @@
 
 use crate::processor::executor::Changeset;
 use commonware_cryptography::{Hasher, PublicKey};
-use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
+use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, current::CurrentUnmerkleized};
 use commonware_parallel::{Sequential, Strategy};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
@@ -11,10 +11,10 @@ use commonware_storage::{
     mmr,
     qmdb::{
         any::{
-            operation::Operation as AnyOperation,
-            unordered::{Update as UnorderedUpdate, fixed},
+            operation::Operation as AnyOperation, unordered::Update as UnorderedUpdate,
             value::FixedEncoding,
         },
+        current::unordered::fixed,
         keyless::fixed as keyless_fixed,
         sync::compact::Target as CompactTarget,
     },
@@ -24,9 +24,12 @@ use commonware_utils::sync::AsyncRwLock;
 use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 use std::sync::Arc;
 
+pub const STATE_BITMAP_CHUNK_BYTES: usize = 64;
+
 /// Shared QMDB handle for the application state database.
-pub(super) type StateDatabase<E, H, P, T, S = Sequential> =
-    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, S>>>;
+pub(super) type StateDatabase<E, H, P, T> = Arc<
+    AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, STATE_BITMAP_CHUNK_BYTES>>,
+>;
 
 pub type TransactionHistoryDb<E, H, S = Sequential> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -42,10 +45,10 @@ pub(super) type TransactionDatabase<E, H, S = Sequential> =
 
 /// The backing databases owned by the application.
 pub(super) type Databases<E, H, P, T, S = Sequential> =
-    (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
+    (StateDatabase<E, H, P, T>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for processor read-through.
-pub(super) type StateBatch<E, H, P, T, S = Sequential> = AnyUnmerkleized<
+pub(super) type StateBatch<E, H, P, T> = CurrentUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<
@@ -55,33 +58,32 @@ pub(super) type StateBatch<E, H, P, T, S = Sequential> = AnyUnmerkleized<
     UnorderedIndex<T, mmr::Location>,
     H,
     UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>,
-    S,
+    STATE_BITMAP_CHUNK_BYTES,
+    Sequential,
 >;
 
 pub(super) type TransactionBatch<E, H, S = Sequential> =
     <TransactionDatabase<E, H, S> as DatabaseSet<E>>::Unmerkleized;
 
-pub(super) type StateMerkleized<E, H, P, T, S = Sequential> =
-    <StateBatch<E, H, P, T, S> as Unmerkleized>::Merkleized;
+pub(super) type StateMerkleized<E, H, P, T> = <StateBatch<E, H, P, T> as Unmerkleized>::Merkleized;
 
 pub(super) type TransactionMerkleized<E, H, S = Sequential> =
     <TransactionBatch<E, H, S> as Unmerkleized>::Merkleized;
 
 pub(super) type MerkleizedDatabases<E, H, P, S = Sequential> = (
-    StateMerkleized<E, H, P, EightCap, S>,
+    StateMerkleized<E, H, P, EightCap>,
     TransactionMerkleized<E, H, S>,
 );
 
 /// Writes a changeset of account updates to a state batch.
-pub(super) fn apply_changeset<E, H, P, S>(
-    batch: StateBatch<E, H, P, EightCap, S>,
+pub(super) fn apply_changeset<E, H, P>(
+    batch: StateBatch<E, H, P, EightCap>,
     changeset: &Changeset<P>,
-) -> StateBatch<E, H, P, EightCap, S>
+) -> StateBatch<E, H, P, EightCap>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
-    S: Strategy,
 {
     changeset
         .iter()
@@ -106,7 +108,7 @@ where
 }
 
 pub(super) async fn finalize_execution<E, H, P, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+    state_batch: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H, S>,
 ) -> Result<MerkleizedDatabases<E, H, P, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where

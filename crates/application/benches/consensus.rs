@@ -22,7 +22,7 @@ use commonware_storage::{
     merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
     mmr,
     qmdb::{
-        any::{FixedConfig, unordered::fixed},
+        current::{FixedConfig, unordered::fixed},
         keyless::fixed as keyless_fixed,
     },
     translator::EightCap,
@@ -30,7 +30,9 @@ use commonware_storage::{
 use commonware_utils::{
     Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, sync::AsyncRwLock,
 };
-use constantinople_application::consensus::{Application, TransactionHistoryDb};
+use constantinople_application::consensus::{
+    Application, STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb,
+};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, Signable,
@@ -66,7 +68,7 @@ type TestStateDb = fixed::Db<
     Account,
     TestHasher,
     EightCap,
-    Rayon,
+    STATE_BITMAP_CHUNK_BYTES,
 >;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
 type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
@@ -515,7 +517,7 @@ async fn init_databases(
     let databases = TestDatabases::init(
         runtime.clone(),
         (
-            state_db_config(&runtime, prefix, strategy.clone()),
+            state_db_config(&runtime, prefix),
             transaction_db_config(prefix, strategy),
         ),
     )
@@ -544,7 +546,8 @@ async fn new_application(
     signature_strategy: Rayon,
     hash_strategy: Rayon,
 ) -> TestApplication {
-    let (_, transaction_target) = databases.committed_targets().await;
+    let (state_target, transaction_target) = databases.committed_targets().await;
+    let state_root = databases.0.read().await.root();
     let genesis_transactions_target =
         constantinople_application::consensus::TransactionHistoryTarget {
             root: transaction_target.root,
@@ -557,6 +560,9 @@ async fn new_application(
         hash_strategy,
         leader,
         TRANSACTION_NAMESPACE,
+        state_root,
+        state_target.root,
+        non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         genesis_transactions_target,
         NZU64!(1024),
         Arc::new(|_| Box::pin(async {})),
@@ -569,12 +575,14 @@ fn bench_strategy(runtime: &RuntimeContext) -> Rayon {
 
 async fn parent_block(leader: TestPublicKey, databases: &TestDatabases) -> TestBlock {
     let (state_target, transaction_target) = databases.committed_targets().await;
+    let state_root = databases.0.read().await.root();
     let header = Header {
         context: block_context(leader),
         parent: sha256::Digest::EMPTY,
         height: 0,
         timestamp: 0,
-        state_root: state_target.root,
+        state_root,
+        state_sync_root: state_target.root,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transaction_target.root,
         transactions_range: non_empty_range!(0, *transaction_target.leaf_count),
@@ -591,11 +599,7 @@ const fn block_context(leader: TestPublicKey) -> TestConsensusContext {
     }
 }
 
-fn state_db_config(
-    runtime: &RuntimeContext,
-    prefix: &str,
-    strategy: Rayon,
-) -> FixedConfig<EightCap, Rayon> {
+fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightCap> {
     let page_cache = CacheRef::from_pooler(
         &runtime.child("state_page_cache"),
         PAGE_CACHE_PAGE_SIZE,
@@ -608,7 +612,7 @@ fn state_db_config(
             metadata_partition: format!("{prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
-            strategy,
+            strategy: commonware_parallel::Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -617,6 +621,7 @@ fn state_db_config(
             page_cache,
             write_buffer: WRITE_BUFFER,
         },
+        grafted_metadata_partition: format!("{prefix}-state-grafted-metadata"),
         translator: EightCap,
     }
 }
@@ -640,11 +645,12 @@ async fn cleanup_partitions(runtime: &RuntimeContext, prefix: &str) {
     }
 }
 
-fn partition_names(prefix: &str) -> [String; 4] {
+fn partition_names(prefix: &str) -> [String; 5] {
     [
         format!("{prefix}-state-journal"),
         format!("{prefix}-state-metadata"),
         format!("{prefix}-state-log"),
+        format!("{prefix}-state-grafted-metadata"),
         format!("{prefix}-transactions-merkle"),
     ]
 }

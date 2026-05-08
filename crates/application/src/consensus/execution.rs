@@ -51,8 +51,9 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    pub(super) state: StateMerkleized<E, H, P, EightCap, S>,
+    pub(super) state: StateMerkleized<E, H, P, EightCap>,
     pub(super) transactions: TransactionMerkleized<E, H, S>,
+    pub(super) state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transaction_count: usize,
     pub(super) timings: ExecutionTimings,
@@ -65,19 +66,39 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    pub(super) fn state_range(&self) -> commonware_utils::range::NonEmptyRange<u64> {
-        non_empty_range!(*self.state.inactivity_floor(), *self.state.size())
-    }
-
     pub(super) fn into_merkleized(self) -> MerkleizedDatabases<E, H, P, S> {
         (self.state, self.transactions)
     }
 }
 
+pub(super) fn child_state_sync_range<C, P, H>(
+    parent: &SealedBlock<C, P, H>,
+    state_sync_start: u64,
+    state_write_count: usize,
+) -> commonware_utils::range::NonEmptyRange<u64>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let state_ops = u64::try_from(state_write_count)
+        .expect("state write count must fit into u64")
+        .checked_add(1)
+        .expect("state batch commit must not overflow u64");
+    let state_sync_end = parent
+        .header
+        .state_range
+        .end()
+        .checked_add(state_ops)
+        .expect("state sync range end must not overflow u64");
+    non_empty_range!(state_sync_start, state_sync_end)
+}
+
 pub(super) async fn finalize_child_execution<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+    state_batch: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
+    state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     transaction_count: usize,
     timings: ExecutionTimings,
     expect_message: &'static str,
@@ -102,6 +123,7 @@ where
     BlockExecution {
         state,
         transactions,
+        state_sync_range,
         transactions_range,
         transaction_count,
         timings: timings.with_finalize_ms(finalize_ms),

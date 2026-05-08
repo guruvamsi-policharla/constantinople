@@ -40,7 +40,15 @@ use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
 use std::{
-    future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc, time::Instant,
+    future::Future,
+    marker::PhantomData,
+    num::NonZeroU64,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use tracing::{info, warn};
 
@@ -51,8 +59,11 @@ mod time;
 mod utils;
 mod verification;
 use db::{Databases, apply_changeset, apply_transaction_digests};
-pub use db::{TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget};
-use execution::{ExecutionTimings, finalize_child_execution};
+pub use db::{
+    STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb, TransactionHistoryOperation,
+    TransactionHistoryTarget,
+};
+use execution::{ExecutionTimings, child_state_sync_range, finalize_child_execution};
 use history::header_range_to_target;
 pub use utils::{load_lazy_state, load_state};
 
@@ -71,9 +82,13 @@ where
     hash_strategy: HashSt,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
+    genesis_state_root: <H as Hasher>::Digest,
+    genesis_state_sync_root: <H as Hasher>::Digest,
+    genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
     genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
     prune_cadence_blocks: NonZeroU64,
     finalized_pruner: FinalizedPruneFn,
+    finalized_state_sync_start: Arc<AtomicU64>,
     proposed_transactions: Counter,
     _marker: PhantomData<(H, C, S, I, B)>,
 }
@@ -91,9 +106,13 @@ where
             hash_strategy: self.hash_strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
+            genesis_state_root: self.genesis_state_root,
+            genesis_state_sync_root: self.genesis_state_sync_root,
+            genesis_state_range: self.genesis_state_range.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             prune_cadence_blocks: self.prune_cadence_blocks,
             finalized_pruner: self.finalized_pruner.clone(),
+            finalized_state_sync_start: self.finalized_state_sync_start.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -120,6 +139,9 @@ where
         hash_strategy: HashSt,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
+        genesis_state_root: <H as Hasher>::Digest,
+        genesis_state_sync_root: <H as Hasher>::Digest,
+        genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
         genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
         prune_cadence_blocks: NonZeroU64,
         finalized_pruner: FinalizedPruneFn,
@@ -134,9 +156,13 @@ where
             hash_strategy,
             genesis_leader,
             transaction_namespace,
+            genesis_state_root,
+            genesis_state_sync_root,
+            genesis_state_range,
             genesis_transactions_target,
             prune_cadence_blocks,
             finalized_pruner,
+            finalized_state_sync_start: Arc::new(AtomicU64::new(0)),
             proposed_transactions,
             _marker: PhantomData,
         }
@@ -144,6 +170,14 @@ where
 
     const fn should_prune_after_finalize(&self, height: u64) -> bool {
         height != 0 && height % self.prune_cadence_blocks.get() == 0
+    }
+
+    fn state_sync_start(&self, parent: &SealedBlock<C, P, H>) -> u64 {
+        parent
+            .header
+            .state_range
+            .start()
+            .max(self.finalized_state_sync_start.load(Ordering::Relaxed))
     }
 
     /// Proposes a child block from an already fetched parent.
@@ -188,6 +222,8 @@ where
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
+        let state_sync_range =
+            child_state_sync_range(parent, self.state_sync_start(parent), changeset.len());
         let state_batch = apply_changeset(state_batches, &changeset);
         let transaction_count = valid.len();
         let transaction_batch = apply_transaction_digests(transaction_batch, &valid);
@@ -198,6 +234,7 @@ where
             state_batch,
             transaction_batch,
             parent,
+            state_sync_range.clone(),
             transaction_count,
             timings,
             "database merkleization must succeed",
@@ -210,7 +247,8 @@ where
             height: parent.header.height + 1,
             timestamp: time::timestamp_ms(&runtime),
             state_root: execution.state.root(),
-            state_range: execution.state_range(),
+            state_sync_root: execution.state.sync_root(),
+            state_range: state_sync_range,
             transactions_root: execution.transactions.root(),
             transactions_range: execution.transactions_range.clone(),
         };
@@ -293,6 +331,7 @@ where
             transaction_batch,
             &self.hash_strategy,
             parent,
+            self.state_sync_start(parent),
             prepared.as_ref(),
         );
         let sleep = verification::wait_for_timestamp(runtime, deadline);
@@ -400,7 +439,7 @@ where
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
             Target {
-                root: block.header.state_root,
+                root: block.header.state_sync_root,
                 range: non_empty_range!(
                     mmr::Location::new(block.header.state_range.start()),
                     mmr::Location::new(block.header.state_range.end())
@@ -422,6 +461,9 @@ where
             &mut H::default(),
             self.genesis_leader.clone(),
             0,
+            self.genesis_state_root,
+            self.genesis_state_sync_root,
+            self.genesis_state_range.clone(),
             self.genesis_transactions_target.clone(),
         )
     }
@@ -501,6 +543,8 @@ where
                 .prune(prune_to)
                 .await
                 .expect("state db prune must not fail at the sync boundary");
+            self.finalized_state_sync_start
+                .store(*prune_to, Ordering::Relaxed);
         }
 
         // The transaction history database uses compact storage, so it already
@@ -516,6 +560,9 @@ pub fn genesis_block<C, P, H>(
     hasher: &mut H,
     leader: P,
     timestamp: u64,
+    state_root: H::Digest,
+    state_sync_root: H::Digest,
+    state_range: commonware_utils::range::NonEmptyRange<u64>,
     transactions_target: TransactionHistoryTarget<H::Digest>,
 ) -> SealedBlock<C, P, H>
 where
@@ -532,8 +579,9 @@ where
         parent: H::Digest::EMPTY,
         height: 0,
         timestamp,
-        state_root: H::Digest::EMPTY,
-        state_range: non_empty_range!(0, 1),
+        state_root,
+        state_sync_root,
+        state_range,
         transactions_root: transactions_target.root,
         transactions_range: non_empty_range!(0, *transactions_target.leaf_count),
     };
@@ -563,6 +611,9 @@ mod tests {
             &mut sha256::Sha256::default(),
             leader.public_key(),
             0,
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            non_empty_range!(0, 1),
             genesis_target,
         )
         .into_inner()
@@ -608,6 +659,9 @@ mod tests {
             &mut sha256::Sha256::default(),
             leader,
             0,
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            non_empty_range!(0, 1),
             target.clone(),
         );
 

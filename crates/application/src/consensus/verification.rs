@@ -2,7 +2,9 @@
 
 use super::{
     db::{MerkleizedDatabases, StateBatch, TransactionBatch, apply_changeset, finalize_execution},
-    execution::{BlockExecution, ExecutionTimings, finalize_child_execution},
+    execution::{
+        BlockExecution, ExecutionTimings, child_state_sync_range, finalize_child_execution,
+    },
     utils::load_accounts,
 };
 use crate::processor::executor;
@@ -247,8 +249,8 @@ where
     AccountKey::from_bytes(bytes.freeze())
 }
 
-async fn load_transfer_state<E, H, P, St>(
-    batch: &StateBatch<E, H, P, EightCap, St>,
+async fn load_transfer_state<E, H, P>(
+    batch: &StateBatch<E, H, P, EightCap>,
     transfers: &[PreparedTransfer<P, H>],
 ) -> core::result::Result<
     Option<crate::processor::state::State<P>>,
@@ -258,7 +260,6 @@ where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
-    St: Strategy,
 {
     let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
@@ -307,10 +308,11 @@ where
 
 /// Executes and merkleizes a block body for verification.
 pub(super) async fn execute_block<E, C, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap, St>,
+    state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     parent: &SealedBlock<C, P, H>,
+    state_sync_start: u64,
     prepared: &Prepared<P, H>,
 ) -> Result<BlockExecution<E, H, P, St>>
 where
@@ -334,6 +336,7 @@ where
     let execute_started_at = Instant::now();
     let changeset = execute_transfers(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
+    let state_sync_range = child_state_sync_range(parent, state_sync_start, changeset.len());
 
     let state_batch = apply_changeset(state_batches, &changeset);
     let transaction_batch = apply_transfer_digests(transaction_batch, &transfers);
@@ -342,6 +345,7 @@ where
         state_batch,
         transaction_batch,
         parent,
+        state_sync_range,
         prepared.transactions.len(),
         timings,
         "database merkleization during verification must succeed",
@@ -351,7 +355,7 @@ where
 
 /// Executes and merkleizes a certified block body.
 pub(super) async fn apply_block<E, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap, St>,
+    state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     transactions_floor: mmr::Location,
@@ -402,7 +406,14 @@ where
         );
         return false;
     }
-    if execution.state_range() != header.state_range {
+    if execution.state.sync_root() != header.state_sync_root {
+        warn!(
+            height = header.height,
+            "verify rejected: state sync root mismatch"
+        );
+        return false;
+    }
+    if execution.state_sync_range != header.state_range {
         warn!(
             height = header.height,
             "verify rejected: state range mismatch"

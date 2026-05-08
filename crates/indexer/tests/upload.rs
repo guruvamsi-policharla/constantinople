@@ -63,6 +63,7 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         height,
         timestamp: 1_000 + height,
         state_root: sha256::Digest::EMPTY,
+        state_sync_root: sha256::Digest::EMPTY,
         state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
         transactions_root: sha256::Digest::EMPTY,
         transactions_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,

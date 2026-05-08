@@ -134,6 +134,7 @@ mod tests {
             height: 0,
             timestamp: 0,
             state_root: sha256::Digest::EMPTY,
+            state_sync_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),

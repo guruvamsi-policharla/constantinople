@@ -4,7 +4,6 @@ use super::db::StateBatch;
 use crate::processor::state::State;
 use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
-use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
 use constantinople_primitives::{AccountKey, SignedTransaction};
@@ -15,8 +14,8 @@ use hashbrown::HashSet;
 /// The loader gathers every unique sender and recipient across the block body,
 /// reads each account at most once, and builds an in-memory [`State`] snapshot
 /// for verification.
-pub async fn load_state<E, H, P, T, S>(
-    batch: &StateBatch<E, H, P, T, S>,
+pub async fn load_state<E, H, P, T>(
+    batch: &StateBatch<E, H, P, T>,
     transactions: &[SignedTransaction<P, H>],
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
@@ -24,7 +23,6 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
-    S: Strategy,
 {
     let mut account_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
     for transaction in transactions {
@@ -41,8 +39,8 @@ where
 /// Loads the accounts needed by lazily decoded `transactions`.
 ///
 /// Returns `Ok(None)` if any transaction fails to decode.
-pub async fn load_lazy_state<E, H, P, T, S>(
-    batch: &StateBatch<E, H, P, T, S>,
+pub async fn load_lazy_state<E, H, P, T>(
+    batch: &StateBatch<E, H, P, T>,
     transactions: &[Lazy<SignedTransaction<P, H>>],
     signers: &[AccountKey<P>],
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
@@ -51,7 +49,6 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
-    S: Strategy,
 {
     assert_eq!(
         transactions.len(),
@@ -71,8 +68,8 @@ where
     load_accounts(batch, account_keys).await
 }
 
-pub(super) async fn load_accounts<E, H, P, T, S>(
-    batch: &StateBatch<E, H, P, T, S>,
+pub(super) async fn load_accounts<E, H, P, T>(
+    batch: &StateBatch<E, H, P, T>,
     account_keys: HashSet<AccountKey<P>>,
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
@@ -80,7 +77,6 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
-    S: Strategy,
 {
     if account_keys.is_empty() {
         return Ok(Some(State::new()));

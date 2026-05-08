@@ -32,7 +32,7 @@ use commonware_glue::{
 use commonware_macros::{test_group, test_traced};
 use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Handle, Metrics, Quota, Spawner, Supervisor};
+use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
 use commonware_utils::{
     NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
 };

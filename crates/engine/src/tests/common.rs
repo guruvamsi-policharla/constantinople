@@ -157,7 +157,7 @@ pub(crate) async fn state_sync_done(
     partition_prefix: &str,
 ) -> bool {
     let metadata = Metadata::<_, U64, bool>::init(
-        context.clone(),
+        context.child("state_sync_done"),
         MetadataConfig {
             partition: format!("{partition_prefix}{STATE_SYNC_METADATA_SUFFIX}"),
             codec_config: (),

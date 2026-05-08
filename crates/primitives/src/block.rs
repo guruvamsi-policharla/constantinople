@@ -31,9 +31,11 @@ where
     pub height: u64,
     /// The timestamp of the block.
     pub timestamp: u64,
-    /// A root of the chain state after applying this block.
+    /// The canonical root of the chain state after applying this block.
     pub state_root: D,
-    /// The active range of the state database.
+    /// The root used for state sync.
+    pub state_sync_root: D,
+    /// The retained range needed to sync the state database.
     pub state_range: NonEmptyRange<u64>,
     /// A root of all transactions in the history, including those within this block.
     pub transactions_root: D,
@@ -66,6 +68,7 @@ where
             + self.height.encode_size()
             + self.timestamp.encode_size()
             + self.state_root.encode_size()
+            + self.state_sync_root.encode_size()
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
             + self.transactions_range.encode_size()
@@ -84,6 +87,7 @@ where
         self.height.write(buf);
         self.timestamp.write(buf);
         self.state_root.write(buf);
+        self.state_sync_root.write(buf);
         self.state_range.write(buf);
         self.transactions_root.write(buf);
         self.transactions_range.write(buf);
@@ -105,6 +109,7 @@ where
             height: u64::read(buf)?,
             timestamp: u64::read(buf)?,
             state_root: D::read(buf)?,
+            state_sync_root: D::read(buf)?,
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
             transactions_range: NonEmptyRange::read(buf)?,
@@ -126,6 +131,7 @@ where
             height: u.arbitrary()?,
             timestamp: u.arbitrary()?,
             state_root: u.arbitrary()?,
+            state_sync_root: u.arbitrary()?,
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
             transactions_range: u.arbitrary()?,
@@ -346,6 +352,7 @@ mod tests {
             height: 42,
             timestamp: 1000,
             state_root: sha256::Digest::EMPTY,
+            state_sync_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
