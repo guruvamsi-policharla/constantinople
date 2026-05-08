@@ -28,6 +28,10 @@ pub(crate) const fn default_upload_buffer() -> usize {
     1024
 }
 
+pub(crate) const fn default_prune_cadence_blocks() -> u64 {
+    1024
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexerMode {
@@ -91,6 +95,8 @@ pub struct ValidatorConfig {
     pub http_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    #[serde(default = "default_prune_cadence_blocks")]
+    pub prune_cadence_blocks: u64,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -144,6 +150,7 @@ pub struct LoadedConfig {
     pub rayon_threads: usize,
     pub http_listen: SocketAddr,
     pub metrics_listen: SocketAddr,
+    pub prune_cadence_blocks: u64,
     pub json_logs: bool,
     pub deployer_managed: bool,
     pub indexer: Option<IndexerConfig>,
@@ -257,6 +264,7 @@ fn decode_with_network(
         rayon_threads: config.rayon_threads,
         http_listen,
         metrics_listen,
+        prune_cadence_blocks: config.prune_cadence_blocks,
         json_logs,
         deployer_managed: json_logs,
         indexer: config.indexer,
@@ -398,7 +406,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, IndexerMode, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_upload_buffer, load_deployer_config, load_local_config,
+        default_prune_cadence_blocks, default_upload_buffer, load_deployer_config,
+        load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -512,6 +521,7 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
             }
@@ -541,6 +551,7 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
             }

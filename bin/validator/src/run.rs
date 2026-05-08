@@ -34,6 +34,7 @@ use constantinople_indexer::{BlockReporter, CertificateReporter, spawn_uploaders
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
+    num::NonZeroU64,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -155,6 +156,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         rayon_threads,
         http_listen,
         metrics_listen,
+        prune_cadence_blocks,
         json_logs,
         deployer_managed,
         indexer,
@@ -339,11 +341,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 share: decoded.share,
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
-                freezer_table_initial_size: 1024,
                 signature_strategy,
                 hash_strategy,
                 startup,
                 sync_config: production_sync_config(),
+                prune_cadence_blocks: NonZeroU64::new(prune_cadence_blocks)
+                    .expect("prune_cadence_blocks must be non-zero"),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),

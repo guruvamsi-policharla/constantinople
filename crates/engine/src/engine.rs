@@ -43,7 +43,7 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
-    archive::immutable,
+    archive::{prunable, prunable::Archive as PrunableArchive},
     journal::contiguous::fixed::Config as FixedJournalConfig,
     merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
@@ -57,6 +57,7 @@ use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
     num::{NonZero, NonZeroU16},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -68,10 +69,6 @@ const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: usize = 1024;
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
-const IMMUTABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(262_144);
-const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
-const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 2u32.pow(16);
-const FREEZER_VALUE_TARGET_SIZE: u64 = 1024 * 1024 * 1024;
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
@@ -157,11 +154,11 @@ where
     pub share: Option<group::Share>,
     pub input: I,
     pub partition_prefix: String,
-    pub freezer_table_initial_size: u32,
     pub signature_strategy: SigT,
     pub hash_strategy: HashT,
     pub startup: StartupMode<EngineBlock<H, C::PublicKey>>,
     pub sync_config: SyncEngineConfig,
+    pub prune_cadence_blocks: NonZero<u64>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
@@ -207,12 +204,13 @@ where
         E,
         EngineVariant<H, C::PublicKey>,
         SchemeProvider<C::PublicKey, V>,
-        immutable::Archive<
+        PrunableArchive<
+            EightCap,
             E,
             H::Digest,
             Finalization<ThresholdScheme<C::PublicKey, V>, Commitment>,
         >,
-        immutable::Archive<E, H::Digest, CodingBlock<H, C::PublicKey>>,
+        PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
         FixedEpocher,
         HashT,
     >,
@@ -323,13 +321,11 @@ where
                 &context,
                 &page_cache,
                 &config.partition_prefix,
-                config.freezer_table_initial_size,
             ),
             init_finalized_blocks_archive::<E, H, C::PublicKey>(
                 &context,
                 &page_cache,
                 &config.partition_prefix,
-                config.freezer_table_initial_size,
                 &config.block_codec,
             ),
         );
@@ -393,6 +389,16 @@ where
             config.genesis_leader.clone(),
             config.transaction_namespace,
             genesis_transactions_target,
+            config.prune_cadence_blocks,
+            Arc::new({
+                let marshal = marshal_mailbox.clone();
+                move |height| {
+                    let marshal = marshal.clone();
+                    Box::pin(async move {
+                        marshal.prune(height).await;
+                    })
+                }
+            }),
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.with_label("stateful"),
@@ -576,8 +582,7 @@ async fn init_finalizations_archive<E, H, P, V>(
     context: &E,
     page_cache: &CacheRef,
     partition_prefix: &str,
-    freezer_table_initial_size: u32,
-) -> immutable::Archive<E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
+) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     H: Hasher,
@@ -585,32 +590,19 @@ where
     V: Variant,
 {
     let start = Instant::now();
-    let archive = immutable::Archive::init(
+    let archive = prunable::Archive::init(
         context.with_label("finalizations_by_height"),
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
-            freezer_table_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-table"
-            ),
-            freezer_table_initial_size,
-            freezer_table_resize_frequency: FREEZER_TABLE_RESIZE_FREQUENCY,
-            freezer_table_resize_chunk_size: FREEZER_TABLE_RESIZE_CHUNK_SIZE,
-            freezer_key_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-key"
-            ),
-            freezer_key_page_cache: page_cache.clone(),
-            freezer_value_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-value"
-            ),
-            freezer_value_target_size: FREEZER_VALUE_TARGET_SIZE,
-            freezer_value_compression: FREEZER_VALUE_COMPRESSION,
-            ordinal_partition: format!("{partition_prefix}-finalizations-by-height-ordinal"),
-            items_per_section: IMMUTABLE_ITEMS_PER_SECTION,
+        prunable::Config {
+            translator: EightCap,
+            key_partition: format!("{partition_prefix}-finalizations-by-height-key"),
+            key_page_cache: page_cache.clone(),
+            value_partition: format!("{partition_prefix}-finalizations-by-height-value"),
+            compression: FREEZER_VALUE_COMPRESSION,
+            items_per_section: PRUNABLE_ITEMS_PER_SECTION,
             codec_config: ThresholdScheme::<P, V>::certificate_codec_config_unbounded(),
             replay_buffer: REPLAY_BUFFER,
-            freezer_key_write_buffer: WRITE_BUFFER,
-            freezer_value_write_buffer: WRITE_BUFFER,
-            ordinal_write_buffer: WRITE_BUFFER,
+            key_write_buffer: WRITE_BUFFER,
+            value_write_buffer: WRITE_BUFFER,
         },
     )
     .await
@@ -623,35 +615,27 @@ async fn init_finalized_blocks_archive<E, H, P>(
     context: &E,
     page_cache: &CacheRef,
     partition_prefix: &str,
-    freezer_table_initial_size: u32,
     block_codec: &BlockCfg,
-) -> immutable::Archive<E, H::Digest, CodingBlock<H, P>>
+) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
 {
     let start = Instant::now();
-    let archive = immutable::Archive::init(
+    let archive = prunable::Archive::init(
         context.with_label("finalized_blocks"),
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalized-blocks-metadata"),
-            freezer_table_partition: format!("{partition_prefix}-finalized-blocks-freezer-table"),
-            freezer_table_initial_size,
-            freezer_table_resize_frequency: FREEZER_TABLE_RESIZE_FREQUENCY,
-            freezer_table_resize_chunk_size: FREEZER_TABLE_RESIZE_CHUNK_SIZE,
-            freezer_key_partition: format!("{partition_prefix}-finalized-blocks-freezer-key"),
-            freezer_key_page_cache: page_cache.clone(),
-            freezer_value_partition: format!("{partition_prefix}-finalized-blocks-freezer-value"),
-            freezer_value_target_size: FREEZER_VALUE_TARGET_SIZE,
-            freezer_value_compression: FREEZER_VALUE_COMPRESSION,
-            ordinal_partition: format!("{partition_prefix}-finalized-blocks-ordinal"),
-            items_per_section: IMMUTABLE_ITEMS_PER_SECTION,
+        prunable::Config {
+            translator: EightCap,
+            key_partition: format!("{partition_prefix}-finalized-blocks-key"),
+            key_page_cache: page_cache.clone(),
+            value_partition: format!("{partition_prefix}-finalized-blocks-value"),
+            compression: FREEZER_VALUE_COMPRESSION,
+            items_per_section: PRUNABLE_ITEMS_PER_SECTION,
             codec_config: block_codec.clone(),
             replay_buffer: REPLAY_BUFFER,
-            freezer_key_write_buffer: WRITE_BUFFER,
-            freezer_value_write_buffer: WRITE_BUFFER,
-            ordinal_write_buffer: WRITE_BUFFER,
+            key_write_buffer: WRITE_BUFFER,
+            value_write_buffer: WRITE_BUFFER,
         },
     )
     .await

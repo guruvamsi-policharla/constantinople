@@ -18,7 +18,7 @@ use crate::processor::executor::{self, ProposalOutput};
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
-    types::{Round, View},
+    types::{Height, Round, View},
 };
 use commonware_cryptography::{
     BatchVerifier, Digest, Digestible, Hasher, PublicKey, certificate::Scheme,
@@ -39,7 +39,9 @@ use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{
+    future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc, time::Instant,
+};
 use tracing::{info, warn};
 
 mod db;
@@ -54,6 +56,9 @@ use execution::{ExecutionTimings, finalize_child_execution};
 use history::header_range_to_target;
 pub use utils::{load_lazy_state, load_state};
 
+type FinalizedPruneFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type FinalizedPruneFn = Arc<dyn Fn(Height) -> FinalizedPruneFuture + Send + Sync>;
+
 /// Core constantinople application.
 ///
 /// This type implements the consensus application trait on top of the
@@ -67,6 +72,8 @@ where
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+    prune_cadence_blocks: NonZeroU64,
+    finalized_pruner: FinalizedPruneFn,
     proposed_transactions: Counter,
     _marker: PhantomData<(H, C, S, I, B)>,
 }
@@ -85,6 +92,8 @@ where
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             genesis_transactions_target: self.genesis_transactions_target.clone(),
+            prune_cadence_blocks: self.prune_cadence_blocks,
+            finalized_pruner: self.finalized_pruner.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -112,6 +121,8 @@ where
         genesis_leader: P,
         transaction_namespace: &'static [u8],
         genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+        prune_cadence_blocks: NonZeroU64,
+        finalized_pruner: FinalizedPruneFn,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
@@ -124,9 +135,15 @@ where
             genesis_leader,
             transaction_namespace,
             genesis_transactions_target,
+            prune_cadence_blocks,
+            finalized_pruner,
             proposed_transactions,
             _marker: PhantomData,
         }
+    }
+
+    const fn should_prune_after_finalize(&self, height: u64) -> bool {
+        height != 0 && height % self.prune_cadence_blocks.get() == 0
     }
 
     /// Proposes a child block from an already fetched parent.
@@ -461,6 +478,33 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         self.apply_certified(context, block, batches).await
+    }
+
+    async fn finalized(
+        &mut self,
+        _context: (E, Self::Context),
+        block: &Self::Block,
+        databases: &Self::Databases,
+    ) {
+        let height = block.header.height;
+        if !self.should_prune_after_finalize(height) {
+            return;
+        }
+
+        (self.finalized_pruner)(Height::new(height)).await;
+
+        let (state, _) = databases;
+        {
+            let mut state = state.write().await;
+            let prune_to = state.sync_boundary();
+            state
+                .prune(prune_to)
+                .await
+                .expect("state db prune must not fail at the sync boundary");
+        }
+
+        // The transaction history database uses compact storage, so it already
+        // retains only the compact frontier and exposes no explicit prune API.
     }
 }
 
