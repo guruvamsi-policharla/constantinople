@@ -22,6 +22,7 @@ const COL_TX_COUNT = 'tx_count';
 
 /** The SQL table the explorer subscribes to. */
 const BLOCK_META_TABLE = 'block_meta';
+const NETWORK_RECONNECT_DELAY_MS = 5_000;
 
 /** Aggregate summary of one finalized block as observed on the live stream. */
 export interface ObservedBlock {
@@ -33,6 +34,12 @@ export interface ObservedBlock {
     readonly arrivedAt: number;
     /** Underlying store batch sequence number. Multiple rows may share it. */
     readonly sequence: bigint;
+}
+
+export interface SubscribeBlocksOptions {
+    readonly signal?: AbortSignal;
+    readonly onNetworkError?: (message: string) => void;
+    readonly onReconnect?: () => void;
 }
 
 /**
@@ -47,37 +54,64 @@ export interface ObservedBlock {
  */
 export async function* subscribeBlocks(
     sqlUrl: string,
-    signal?: AbortSignal,
+    options: SubscribeBlocksOptions = {},
 ): AsyncGenerator<ObservedBlock, void, void> {
     const sql = new SqlClient(sqlUrl);
+    const signal = options.signal;
 
     // Cap consecutive transient retries so a genuinely broken server can't
     // trap us in a tight reconnect loop. A single delivered frame resets
     // the counter.
     const MAX_TRANSIENT_RETRIES = 10;
     let transientRetries = 0;
+    let nextSequence: bigint | undefined;
+    let latestHeight: bigint | null = null;
 
     while (!signal?.aborted) {
         try {
+            options.onReconnect?.();
             const stream = sql.subscribe(
                 {
                     table: BLOCK_META_TABLE,
                     // Empty predicate => emit every block_meta row. The
                     // server still applies its own bounded compile budget.
                     whereSql: '',
+                    sinceSequenceNumber: nextSequence,
                 },
                 { signal },
             );
 
             for await (const frame of stream) {
                 transientRetries = 0;
-                yield* decodeFrame(frame);
+                const frameNextSequence = frame.sequenceNumber + 1n;
+                for (const block of decodeFrame(frame)) {
+                    if (latestHeight !== null && block.height <= latestHeight) {
+                        continue;
+                    }
+                    if (latestHeight !== null && block.height > latestHeight + 1n) {
+                        yield* (await fetchMissingBlocks(
+                            sql,
+                            latestHeight + 1n,
+                            block.height - 1n,
+                            signal,
+                        ));
+                    }
+                    latestHeight = block.height;
+                    yield block;
+                }
+                nextSequence = frameNextSequence;
             }
             // Server-streaming RPC ended cleanly (no more frames). Loop
-            // and re-subscribe so the UI keeps following the live tail.
+            // and re-subscribe from `nextSequence` so the UI keeps following
+            // the live tail without dropping batches committed between RPCs.
         } catch (error) {
             if (signal?.aborted) {
                 return;
+            }
+            if (isNetworkError(error)) {
+                options.onNetworkError?.(errorMessage(error));
+                await sleep(NETWORK_RECONNECT_DELAY_MS, signal);
+                continue;
             }
             if (
                 !isTransientBatchRaceError(error) ||
@@ -112,6 +146,7 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
         return;
     }
     const arrivedAt = Date.now();
+    const blocks: ObservedBlock[] = [];
     for (const row of frame.rows) {
         const heightCell = row.cells[heightIdx];
         const txCountCell = row.cells[txCountIdx];
@@ -120,13 +155,57 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
         }
         // `block_meta.tx_count` is u64; Number() is safe for any realistic
         // block (Number.MAX_SAFE_INTEGER is 2^53 - 1, far above per-block tx counts).
-        yield {
+        blocks.push({
             height: heightCell,
             txCount: Number(txCountCell),
             arrivedAt,
             sequence: frame.sequenceNumber,
-        };
+        });
     }
+    blocks.sort((a, b) => compareBigint(a.height, b.height));
+    yield* blocks;
+}
+
+async function fetchMissingBlocks(
+    sql: SqlClient,
+    fromHeight: bigint,
+    toHeight: bigint,
+    signal?: AbortSignal,
+): Promise<ObservedBlock[]> {
+    if (fromHeight > toHeight) {
+        return [];
+    }
+    const result = await sql.query(
+        `SELECT ${COL_HEIGHT}, ${COL_TX_COUNT} FROM ${BLOCK_META_TABLE} WHERE ${COL_HEIGHT} >= ${fromHeight.toString()} AND ${COL_HEIGHT} <= ${toHeight.toString()} ORDER BY ${COL_HEIGHT} ASC`,
+        { signal },
+    );
+    const heightIdx = result.columns.indexOf(COL_HEIGHT);
+    const txCountIdx = result.columns.indexOf(COL_TX_COUNT);
+    if (heightIdx < 0 || txCountIdx < 0) {
+        return [];
+    }
+    const arrivedAt = Date.now();
+    const blocks: ObservedBlock[] = [];
+    for (const row of result.rows) {
+        const heightCell = row.cells[heightIdx];
+        const txCountCell = row.cells[txCountIdx];
+        if (typeof heightCell !== 'bigint' || typeof txCountCell !== 'bigint') {
+            continue;
+        }
+        blocks.push({
+            height: heightCell,
+            txCount: Number(txCountCell),
+            arrivedAt,
+            sequence: 0n,
+        });
+    }
+    return blocks;
+}
+
+function compareBigint(a: bigint, b: bigint): number {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
 }
 
 /**
@@ -148,6 +227,36 @@ function isTransientBatchRaceError(error: unknown): boolean {
     );
 }
 
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function isNetworkError(error: unknown): boolean {
+    if (error instanceof ConnectError) {
+        return (
+            error.code === Code.Unavailable ||
+            error.code === Code.Aborted ||
+            error.code === Code.DeadlineExceeded ||
+            (error.code === Code.Unknown && /fetch|network|transport|failed/i.test(error.message))
+        );
+    }
+    return error instanceof TypeError && /fetch|network|load|failed/i.test(error.message);
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+            return;
+        }
+        const timeout = window.setTimeout(resolve, ms);
+        signal?.addEventListener(
+            'abort',
+            () => {
+                window.clearTimeout(timeout);
+                reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+            },
+            { once: true },
+        );
+    });
 }

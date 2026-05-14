@@ -132,9 +132,14 @@ export default function App() {
 
         (async () => {
             try {
-                for await (const block of subscribeBlocks(indexerUrl, controller.signal)) {
+                for await (const block of subscribeBlocks(indexerUrl, {
+                    signal: controller.signal,
+                    onNetworkError: (message) =>
+                        setStatus({ kind: 'error', message: `network error: ${message}` }),
+                    onReconnect: () => setStatus({ kind: 'connecting' }),
+                })) {
                     if (cancelled) return;
-                    setBlocks((current) => prependBounded(block, current));
+                    setBlocks((current) => upsertBounded(block, current));
                     setBlocksObserved((current) => current + 1);
                     setTotalTxObserved((current) => current + block.txCount);
                     setObservedRateWindow((current) => ({
@@ -846,12 +851,19 @@ function AsciiTooltip({
     );
 }
 
-function prependBounded(block: ObservedBlock, current: ObservedBlock[]): ObservedBlock[] {
-    const next = [block, ...current];
+function upsertBounded(block: ObservedBlock, current: ObservedBlock[]): ObservedBlock[] {
+    const next = [block, ...current.filter((entry) => entry.height !== block.height)];
+    next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
     if (next.length > MAX_ROWS) {
         next.length = MAX_ROWS;
     }
     return next;
+}
+
+function compareBlockHeightDesc(a: bigint, b: bigint): number {
+    if (a > b) return -1;
+    if (a < b) return 1;
+    return 0;
 }
 
 function prependTransaction(
