@@ -24,27 +24,6 @@ export interface VerifiedTransactionProof {
     readonly location: bigint;
     readonly tip: bigint;
     readonly proofSizeBytes: number;
-    readonly mmr: MmrProofVisualization;
-}
-
-export interface MmrProofVisualization {
-    readonly leaves: string;
-    readonly inactivePeaks: number;
-    readonly targetPosition: string;
-    readonly peaks: MmrPeak[];
-    readonly nodes: MmrNode[];
-}
-
-export interface MmrPeak {
-    readonly position: string;
-    readonly height: number;
-}
-
-export interface MmrNode {
-    readonly position: string;
-    readonly height: number;
-    readonly digest: string;
-    readonly kind: 'target' | 'proof';
 }
 
 interface TransactionProofMetadata {
@@ -84,7 +63,6 @@ export async function fetchAndVerifyTransactionProof({
         location: metadata.location,
         tip: metadata.tip,
         proofSizeBytes: verification.proofSizeBytes,
-        mmr: normalizeMmrVisualization(verification.mmr),
     };
 }
 
@@ -174,37 +152,4 @@ function trimTrailingSlash(value: string): string {
 
 interface WasmTransactionProof {
     readonly proofSizeBytes: number;
-    readonly mmr: {
-        readonly leaves: bigint;
-        readonly inactivePeaks: number;
-        readonly targetPosition: bigint;
-        readonly peaks: {
-            readonly position: bigint;
-            readonly height: number;
-        }[];
-        readonly nodes: {
-            readonly position: bigint;
-            readonly height: number;
-            readonly digest: Uint8Array;
-            readonly kind: 'target' | 'proof';
-        }[];
-    };
-}
-
-function normalizeMmrVisualization(value: WasmTransactionProof['mmr']): MmrProofVisualization {
-    return {
-        leaves: value.leaves.toString(),
-        inactivePeaks: value.inactivePeaks,
-        targetPosition: value.targetPosition.toString(),
-        peaks: value.peaks.map((peak) => ({
-            position: peak.position.toString(),
-            height: peak.height,
-        })),
-        nodes: value.nodes.map((node) => ({
-            position: node.position.toString(),
-            height: node.height,
-            digest: toHex(node.digest),
-            kind: node.kind,
-        })),
-    };
 }
