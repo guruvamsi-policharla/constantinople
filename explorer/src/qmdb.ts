@@ -18,6 +18,7 @@ const BLOCK_META_TABLE = 'block_meta';
 const BLOCK_META_HEIGHT = 'height';
 const BLOCK_META_TRANSACTIONS_ROOT = 'transactions_root';
 const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
+const TX_META_HEIGHT_SEARCH_WINDOW = 16;
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -94,23 +95,26 @@ async function fetchTransactionProofMetadata(
     signal?: AbortSignal,
 ): Promise<TransactionProofMetadata> {
     const sql = new SqlClient(sqlUrl);
+    const minHeight = Math.max(0, height - TX_META_HEIGHT_SEARCH_WINDOW);
+    const maxHeight = height + TX_META_HEIGHT_SEARCH_WINDOW;
     const txRows = await sql.query(
-        `SELECT ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION} FROM ${TX_META_TABLE} WHERE ${TX_META_HEIGHT} = ${height}`,
+        `SELECT ${TX_META_HEIGHT}, ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION} FROM ${TX_META_TABLE} WHERE ${TX_META_HEIGHT} >= ${minHeight} AND ${TX_META_HEIGHT} <= ${maxHeight}`,
         { signal },
     );
     const tx = txRows.rows.find((row) => cellDigestHex(row, TX_META_DIGEST) === digest);
     if (!tx) {
-        throw new Error(`tx_meta missing ${shortHex(digest)} at height ${height}`);
+        throw new Error(`tx_meta missing ${shortHex(digest)} near height ${height}`);
     }
 
     const location = bigintCell(tx, TX_META_QMDB_LOCATION);
+    const actualHeight = Number(bigintCell(tx, TX_META_HEIGHT));
     const blockRows = await sql.query(
-        `SELECT ${BLOCK_META_TRANSACTIONS_ROOT}, ${BLOCK_META_TRANSACTIONS_TIP} FROM ${BLOCK_META_TABLE} WHERE ${BLOCK_META_HEIGHT} = ${height}`,
+        `SELECT ${BLOCK_META_TRANSACTIONS_ROOT}, ${BLOCK_META_TRANSACTIONS_TIP} FROM ${BLOCK_META_TABLE} WHERE ${BLOCK_META_HEIGHT} = ${actualHeight}`,
         { signal },
     );
     const block = blockRows.rows[0];
     if (!block) {
-        throw new Error(`block_meta missing height ${height}`);
+        throw new Error(`block_meta missing height ${actualHeight}`);
     }
 
     return {

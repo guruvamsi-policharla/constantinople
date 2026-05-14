@@ -66,6 +66,7 @@ const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
 
 interface SubmittedTransaction {
+    readonly sender: string | null;
     readonly digest: string;
     readonly to: string;
     readonly value: string;
@@ -168,7 +169,8 @@ export default function App() {
     }, [history]);
 
     useEffect(() => {
-        const candidates = history.filter(shouldFetchTransactionProof);
+        const signedInSender = wallet?.publicKeyHex ?? null;
+        const candidates = history.filter((tx) => shouldFetchTransactionProof(tx, signedInSender));
         for (const tx of candidates) {
             setHistory((current) =>
                 updateTransactionProof(
@@ -189,19 +191,39 @@ export default function App() {
                     );
                 })
                 .catch((error) => {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (isRetryableProofError(detail)) {
+                        setHistory((current) =>
+                            updateTransactionProof(
+                                tx.digest,
+                                { status: 'fetching', detail: 'waiting for indexer metadata' },
+                                current,
+                            ),
+                        );
+                        window.setTimeout(() => {
+                            setHistory((current) =>
+                                updateTransactionProof(
+                                    tx.digest,
+                                    { status: 'waiting', detail: 'waiting for QMDB proof' },
+                                    current,
+                                ),
+                            );
+                        }, 1_000);
+                        return;
+                    }
                     setHistory((current) =>
                         updateTransactionProof(
                             tx.digest,
                             {
                                 status: 'error',
-                                detail: error instanceof Error ? error.message : String(error),
+                                detail,
                             },
                             current,
                         ),
                     );
                 });
         }
-    }, [history]);
+    }, [history, wallet]);
 
     useEffect(() => {
         return () => {
@@ -341,6 +363,7 @@ export default function App() {
                 wallet.sign,
             );
             const pending: SubmittedTransaction = {
+                sender: wallet.publicKeyHex,
                 digest: encoded.digestHex,
                 to: toKey.trim().replace(/^0x/i, '').toLowerCase(),
                 value: parsedValue.toString(),
@@ -430,6 +453,7 @@ export default function App() {
                         />
                         <TransactionHistory
                             transactions={history}
+                            signedInPublicKey={wallet?.publicKeyHex ?? null}
                             copiedValue={copiedValue}
                             onCopy={copyValue}
                         />
@@ -676,10 +700,12 @@ function SpinnerText({
 
 function TransactionHistory({
     transactions,
+    signedInPublicKey,
     copiedValue,
     onCopy,
 }: {
     transactions: SubmittedTransaction[];
+    signedInPublicKey: string | null;
     copiedValue: string;
     onCopy: (value: string) => void;
 }) {
@@ -726,6 +752,7 @@ function TransactionHistory({
                             copiedValue={copiedValue}
                             formatter={formatter}
                             onCopy={onCopy}
+                            signedInPublicKey={signedInPublicKey}
                             tx={tx}
                         />
                     ))}
@@ -739,13 +766,17 @@ function TransactionRow({
     copiedValue,
     formatter,
     onCopy,
+    signedInPublicKey,
     tx,
 }: {
     copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
+    signedInPublicKey: string | null;
     tx: SubmittedTransaction;
 }) {
+    const ownsTx = tx.sender !== null && tx.sender === signedInPublicKey;
+    const proofDetail = ownsTx ? tx.proof.detail : 'sign in as sender to fetch proof';
     return (
         <>
             <tr>
@@ -758,11 +789,11 @@ function TransactionRow({
                 <td>{tx.value}</td>
                 <td>{tx.nonce}</td>
                 <td>{tx.detail}</td>
-                <td>{tx.proof.detail}</td>
+                <td>{proofDetail}</td>
                 <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
                 <td>{formatter.format(tx.submittedAt)}</td>
             </tr>
-            {tx.proof.status === 'verified' && (
+            {ownsTx && tx.proof.status === 'verified' && (
                 <tr className="tx-proof-row">
                     <td colSpan={8}>
                         <MmrProofMap proof={tx.proof} />
@@ -945,12 +976,22 @@ function updateTransactionProof(
 
 function shouldFetchTransactionProof(
     tx: SubmittedTransaction,
+    signedInSender: string | null,
 ): tx is SubmittedTransaction & { readonly finalizedHeight: number } {
     return (
+        signedInSender !== null &&
+        tx.sender === signedInSender &&
         tx.finalizedHeight !== null &&
         (tx.status === 'finalized' ||
             (tx.status === 'partially_finalized' && !tx.detail.startsWith('rejected'))) &&
-        tx.proof.status === 'waiting'
+        (tx.proof.status === 'waiting' ||
+            (tx.proof.status === 'error' && isRetryableProofError(tx.proof.detail)))
+    );
+}
+
+function isRetryableProofError(detail: string): boolean {
+    return /tx_meta missing|block_meta missing|QMDB transaction proof response missing|out_of_range|unavailable|fetch/i.test(
+        detail,
     );
 }
 
@@ -1126,6 +1167,7 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     return {
         digest: transaction.digest,
+        sender: typeof transaction.sender === 'string' ? transaction.sender : null,
         to: transaction.to,
         value: transaction.value,
         nonce: transaction.nonce,
