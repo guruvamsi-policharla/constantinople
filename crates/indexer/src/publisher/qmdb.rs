@@ -77,13 +77,23 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    state_writer: Arc<StateWriter<H, P>>,
     state_operations: Mutex<Vec<StateOperation<P>>>,
     state_next_location: Mutex<u64>,
-    transaction_writer: Arc<TransactionWriter<H>>,
     transaction_next_location: Mutex<u64>,
-    commit_tx: mpsc::Sender<PreparedQmdbUpload>,
+    prepare_tx: mpsc::Sender<PendingQmdbUpload<H, P>>,
+    _prepare_join: JoinHandle<()>,
     _commit_join: JoinHandle<()>,
+}
+
+struct PendingQmdbUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    height: u64,
+    state_delta: Vec<StateOperation<P>>,
+    state_boundary: CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>,
+    transaction_ops: Vec<TransactionOperation<H>>,
 }
 
 #[derive(Debug)]
@@ -114,20 +124,26 @@ where
         let transaction_next_location =
             next_writer_location(transaction_writer.latest_published_watermark().await);
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
+        let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_client.clone(),
             state_writer.clone(),
             transaction_writer.clone(),
             commit_rx,
         ));
+        let prepare_join = tokio::spawn(run_qmdb_preparer(
+            state_writer.clone(),
+            transaction_writer.clone(),
+            prepare_rx,
+            commit_tx,
+        ));
 
         Ok(Self {
-            state_writer,
             state_operations: Mutex::new(Vec::new()),
             state_next_location: Mutex::new(state_next_location),
-            transaction_writer,
             transaction_next_location: Mutex::new(transaction_next_location),
-            commit_tx,
+            prepare_tx,
+            _prepare_join: prepare_join,
             _commit_join: commit_join,
         })
     }
@@ -143,15 +159,14 @@ where
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
-        let state = self
-            .prepare_state_upload::<E, S>(block, &databases.0)
-            .await?;
-        let transactions = self.prepare_transaction_upload(block).await?;
-        self.commit_tx
-            .send(PreparedQmdbUpload {
+        let state = self.build_state_upload::<E, S>(block, &databases.0).await?;
+        let transactions = self.build_transaction_upload(block).await?;
+        self.prepare_tx
+            .send(PendingQmdbUpload {
                 height: block.header.height,
-                state,
-                transactions,
+                state_delta: state.delta,
+                state_boundary: state.boundary,
+                transaction_ops: transactions.ops,
             })
             .await
             .map_err(|_| PublishError::CommitterStopped {
@@ -160,38 +175,86 @@ where
         Ok(())
     }
 
-    async fn prepare_state_upload<E, S>(
+    async fn build_state_upload<E, S>(
         &self,
         block: &EngineBlock<H, P>,
         state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-    ) -> Result<PreparedUpload<QmdbFamily>, PublishError>
+    ) -> Result<PendingStateUpload<H, P>, PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
         let mut next = self.state_next_location.lock().await;
-        let prepared = prepare_state_upload::<E, H, P, S>(
-            &self.state_writer,
-            &self.state_operations,
-            *next,
-            block,
-            state_db,
-        )
-        .await?;
-        *next = next_writer_location(Some(prepared.latest_location()));
-        Ok(prepared)
+        let pending =
+            build_state_upload::<E, H, P, S>(&self.state_operations, *next, block, state_db)
+                .await?;
+        *next = pending.next_location;
+        Ok(pending)
     }
 
-    async fn prepare_transaction_upload(
+    async fn build_transaction_upload(
         &self,
         block: &EngineBlock<H, P>,
-    ) -> Result<PreparedUpload<QmdbFamily>, PublishError> {
+    ) -> Result<PendingTransactionUpload<H>, PublishError> {
         let mut next = self.transaction_next_location.lock().await;
-        let prepared = prepare_transaction_upload(&self.transaction_writer, block, *next).await?;
-        *next = next_writer_location(Some(prepared.latest_location()));
-        Ok(prepared)
+        let pending = build_transaction_upload(block, *next)?;
+        *next = pending.next_location;
+        Ok(pending)
     }
+}
+
+async fn run_qmdb_preparer<H, P>(
+    state_writer: Arc<StateWriter<H, P>>,
+    transaction_writer: Arc<TransactionWriter<H>>,
+    mut rx: mpsc::Receiver<PendingQmdbUpload<H, P>>,
+    commit_tx: mpsc::Sender<PreparedQmdbUpload>,
+) where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    P: PublicKey + Send + Sync + 'static,
+{
+    while let Some(upload) = rx.recv().await {
+        let state_writer = state_writer.clone();
+        let transaction_writer = transaction_writer.clone();
+        let commit_tx = commit_tx.clone();
+        tokio::spawn(async move {
+            let height = upload.height;
+            if let Err(error) =
+                prepare_and_queue_upload(state_writer, transaction_writer, commit_tx, upload).await
+            {
+                panic!("qmd prepare worker failed at height {height}: {error}");
+            }
+        });
+    }
+    debug!("indexer qmd preparer task exiting: channel closed");
+}
+
+async fn prepare_and_queue_upload<H, P>(
+    state_writer: Arc<StateWriter<H, P>>,
+    transaction_writer: Arc<TransactionWriter<H>>,
+    commit_tx: mpsc::Sender<PreparedQmdbUpload>,
+    upload: PendingQmdbUpload<H, P>,
+) -> Result<(), PublishError>
+where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    P: PublicKey + Send + Sync + 'static,
+{
+    let height = upload.height;
+    let (state, transactions) = tokio::try_join!(
+        state_writer.prepare_current_upload(&upload.state_delta, &upload.state_boundary),
+        transaction_writer.prepare_upload(&upload.transaction_ops),
+    )?;
+    commit_tx
+        .send(PreparedQmdbUpload {
+            height,
+            state,
+            transactions,
+        })
+        .await
+        .map_err(|_| PublishError::CommitterStopped { height })?;
+    Ok(())
 }
 
 async fn run_qmdb_committer<H, P>(
@@ -350,13 +413,30 @@ where
     Ok(WriterState::from_checkpoint::<H>(&checkpoint)?)
 }
 
-async fn prepare_state_upload<E, H, P, S>(
-    writer: &StateWriter<H, P>,
+struct PendingStateUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    delta: Vec<StateOperation<P>>,
+    boundary: CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>,
+    next_location: u64,
+}
+
+struct PendingTransactionUpload<H>
+where
+    H: Hasher,
+{
+    ops: Vec<TransactionOperation<H>>,
+    next_location: u64,
+}
+
+async fn build_state_upload<E, H, P, S>(
     operation_cache: &Mutex<Vec<StateOperation<P>>>,
     writer_next: u64,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-) -> Result<PreparedUpload<QmdbFamily>, PublishError>
+) -> Result<PendingStateUpload<H, P>, PublishError>
 where
     E: Storage + Clock + Metrics,
     H: Hasher + Send + Sync + 'static,
@@ -389,12 +469,11 @@ where
     };
     let delta = operations[writer_next as usize..].to_vec();
     let boundary = state_boundary::<E, H, P, S>(&state, previous_operations, &operations).await?;
-    drop(operations);
-
-    writer
-        .prepare_current_upload(&delta, &boundary)
-        .await
-        .map_err(Into::into)
+    Ok(PendingStateUpload {
+        delta,
+        boundary,
+        next_location: end,
+    })
 }
 
 async fn extend_state_ops<E, H, P, S>(
@@ -571,14 +650,13 @@ where
     Ok((proof, chunk))
 }
 
-async fn prepare_transaction_upload<H, P>(
-    writer: &TransactionWriter<H>,
+fn build_transaction_upload<H, P>(
     block: &EngineBlock<H, P>,
     writer_next: u64,
-) -> Result<PreparedUpload<QmdbFamily>, PublishError>
+) -> Result<PendingTransactionUpload<H>, PublishError>
 where
-    H: Hasher + Send + Sync + 'static,
-    H::Digest: Codec + Send + Sync,
+    H: Hasher,
+    H::Digest: Codec,
     P: PublicKey,
 {
     if writer_next == 0 && block.header.height > 1 {
@@ -588,7 +666,10 @@ where
     }
 
     let ops = transaction_ops(block, writer_next)?;
-    writer.prepare_upload(&ops).await.map_err(Into::into)
+    let next_location = writer_next
+        .checked_add(u64::try_from(ops.len()).expect("operation count fits u64"))
+        .expect("transaction operation range does not overflow");
+    Ok(PendingTransactionUpload { ops, next_location })
 }
 
 fn transaction_ops<H, P>(
