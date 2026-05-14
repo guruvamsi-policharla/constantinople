@@ -47,6 +47,17 @@ pub struct SqlBatch {
     pub ack: Option<Exact>,
 }
 
+/// Block-level metadata needed to build the `block_meta` row.
+pub(crate) struct BlockMetaRow {
+    pub height: u64,
+    pub digest: [u8; 32],
+    pub tx_count: u64,
+    pub transactions_root: [u8; 32],
+    pub transactions_tip: u64,
+    pub view: u64,
+    pub finalized_ts_micros: i64,
+}
+
 /// Hand a [`SqlBatch`] off to the SQL uploader on a fresh tokio task.
 ///
 /// Mirrors the back-pressure semantics of [`super::dispatch_batch`]: the
@@ -140,31 +151,36 @@ async fn flush_with_retry(writer: &mut BatchWriter, rows: &[SqlRow]) {
 /// either by joining tables or by extending [`SqlRow`] with an update
 /// path.
 pub(crate) fn encode_sql_rows(
-    height: u64,
-    digest: [u8; 32],
-    tx_count: u64,
-    view: u64,
-    finalized_ts_micros: i64,
+    block: BlockMetaRow,
     tx_digests: &[[u8; 32]],
+    tx_qmdb_locations: &[u64],
 ) -> Vec<SqlRow> {
+    assert_eq!(
+        tx_digests.len(),
+        tx_qmdb_locations.len(),
+        "each transaction digest must have a QMDB location"
+    );
     let mut rows = Vec::with_capacity(1 + tx_digests.len());
     rows.push(SqlRow {
         table: BLOCK_META_TABLE,
         values: vec![
-            CellValue::UInt64(height),
-            CellValue::FixedBinary(digest.to_vec()),
-            CellValue::UInt64(tx_count),
-            CellValue::UInt64(view),
-            CellValue::Timestamp(finalized_ts_micros),
+            CellValue::UInt64(block.height),
+            CellValue::FixedBinary(block.digest.to_vec()),
+            CellValue::UInt64(block.tx_count),
+            CellValue::FixedBinary(block.transactions_root.to_vec()),
+            CellValue::UInt64(block.transactions_tip),
+            CellValue::UInt64(block.view),
+            CellValue::Timestamp(block.finalized_ts_micros),
         ],
     });
-    for (idx, tx_digest) in tx_digests.iter().enumerate() {
+    for (idx, (tx_digest, qmd_location)) in tx_digests.iter().zip(tx_qmdb_locations).enumerate() {
         rows.push(SqlRow {
             table: TX_META_TABLE,
             values: vec![
-                CellValue::UInt64(height),
+                CellValue::UInt64(block.height),
                 CellValue::UInt64(idx as u64),
                 CellValue::FixedBinary(tx_digest.to_vec()),
+                CellValue::UInt64(*qmd_location),
             ],
         });
     }

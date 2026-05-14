@@ -22,7 +22,7 @@ use crate::{
     keys,
     publisher::{
         SqlBatch, UploadBatch, dispatch_batch,
-        sql::{dispatch_sql_batch, encode_sql_rows},
+        sql::{BlockMetaRow, dispatch_sql_batch, encode_sql_rows},
     },
 };
 use bytes::Bytes;
@@ -178,7 +178,10 @@ where
     // typed CellValue path.
     let mut block_digest_arr = [0u8; 32];
     block_digest_arr.copy_from_slice(block_digest.as_ref());
+    let mut transactions_root = [0u8; 32];
+    transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
     let mut tx_digests: Vec<[u8; 32]> = Vec::with_capacity(body_len);
+    let mut tx_qmdb_locations: Vec<u64> = Vec::with_capacity(body_len);
 
     // BLOCK family: digest -> encoded SealedBlock (which serializes the inner Block).
     // BLOCK_BY_H family: height -> block digest (32 bytes).
@@ -229,13 +232,27 @@ where
     // carried is now derived from `MAX(block_meta.height)` instead.
     // `view` is currently 0; see `encode_sql_rows` docs for why.
     let tx_count = u64::try_from(tx_digests.len()).expect("tx count fits u64");
+    if tx_count > 0 {
+        let first_qmdb_location = block
+            .header
+            .transactions_range
+            .end()
+            .checked_sub(tx_count + 1)
+            .expect("transaction QMDB range includes block append operations");
+        tx_qmdb_locations.extend((0..tx_count).map(|idx| first_qmdb_location + idx));
+    }
     let sql = encode_sql_rows(
-        height,
-        block_digest_arr,
-        tx_count,
-        0,
-        finalized_ts_micros,
+        BlockMetaRow {
+            height,
+            digest: block_digest_arr,
+            tx_count,
+            transactions_root,
+            transactions_tip: block.header.transactions_range.end() - 1,
+            view: 0,
+            finalized_ts_micros,
+        },
         &tx_digests,
+        &tx_qmdb_locations,
     );
 
     EncodedRows {

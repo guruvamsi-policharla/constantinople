@@ -8,7 +8,7 @@ Source:
 
 - Repository: `https://github.com/exowarexyz/monorepo`
 - Revision: `296d6423634c2ea7b5f34133c79a7b7386c44f60`
-- Packages: `sdk/ts`, `sql/ts`
+- Packages: `sdk/ts`, `sql/ts`, generated QMDB protos from `qmdb/ts`
 
 When the Rust Exoware revision in the workspace changes, refresh these package
 copies from the same Git revision.

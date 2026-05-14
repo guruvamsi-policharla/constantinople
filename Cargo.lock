@@ -1556,6 +1556,8 @@ version = "0.0.0"
 dependencies = [
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-storage",
+ "js-sys",
  "wasm-bindgen",
 ]
 

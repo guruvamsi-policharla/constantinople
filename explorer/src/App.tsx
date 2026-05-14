@@ -14,6 +14,7 @@ import {
     type SubmitResponse,
     type TxStatus,
 } from './mempool';
+import { fetchAndVerifyTransactionProof, type VerifiedTransactionProof } from './qmdb';
 import {
     clearSession,
     createWallet,
@@ -52,10 +53,12 @@ type Status =
 // `--metadata-indexer-port` in `bin/deploy/src/local.rs`; override via
 // `VITE_SQL_URL` for non-default deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
+const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
 const LOCAL_HISTORY_KEY = 'constantinople.submitted-transactions.v1';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
+const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
 
 interface SubmittedTransaction {
@@ -67,7 +70,21 @@ interface SubmittedTransaction {
     readonly finalizedInMs: number | null;
     readonly status: 'pending' | 'accepted' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
+    readonly finalizedHeight: number | null;
+    readonly proof: TransactionProofState;
 }
+
+type TransactionProofState =
+    | { readonly status: 'waiting'; readonly detail: string }
+    | { readonly status: 'fetching'; readonly detail: string }
+    | {
+          readonly status: 'verified';
+          readonly detail: string;
+          readonly location: string;
+          readonly tip: string;
+          readonly proofSizeBytes: number;
+      }
+    | { readonly status: 'error'; readonly detail: string };
 
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
@@ -143,6 +160,42 @@ export default function App() {
 
     useEffect(() => {
         writeHistory(history);
+    }, [history]);
+
+    useEffect(() => {
+        const candidates = history.filter(shouldFetchTransactionProof);
+        for (const tx of candidates) {
+            setHistory((current) =>
+                updateTransactionProof(
+                    tx.digest,
+                    { status: 'fetching', detail: 'fetching QMDB proof' },
+                    current,
+                ),
+            );
+            fetchAndVerifyTransactionProof({
+                sqlUrl: indexerUrl,
+                qmdbUrl,
+                digest: tx.digest,
+                height: tx.finalizedHeight,
+            })
+                .then((proof) => {
+                    setHistory((current) =>
+                        updateTransactionProof(tx.digest, verifiedProofState(proof), current),
+                    );
+                })
+                .catch((error) => {
+                    setHistory((current) =>
+                        updateTransactionProof(
+                            tx.digest,
+                            {
+                                status: 'error',
+                                detail: error instanceof Error ? error.message : String(error),
+                            },
+                            current,
+                        ),
+                    );
+                });
+        }
     }, [history]);
 
     useEffect(() => {
@@ -291,6 +344,8 @@ export default function App() {
                 finalizedInMs: null,
                 status: 'pending',
                 detail: 'submitted to mempool',
+                finalizedHeight: null,
+                proof: { status: 'waiting', detail: 'waiting for finalization' },
             };
             setHistory((current) => prependTransaction(pending, current));
             setSubmitMessage('submitting');
@@ -648,6 +703,7 @@ function TransactionHistory({
                         <th className="tx-col-amount">amount</th>
                         <th className="tx-col-nonce">nonce</th>
                         <th className="tx-col-status">status</th>
+                        <th className="tx-col-proof">proof</th>
                         <th className="tx-col-latency">
                             <AsciiTooltip
                                 tooltip="delta between finalization response and submission timestamp"
@@ -670,6 +726,7 @@ function TransactionHistory({
                             <td>{tx.value}</td>
                             <td>{tx.nonce}</td>
                             <td>{tx.detail}</td>
+                            <td>{tx.proof.detail}</td>
                             <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
                             <td>{formatter.format(tx.submittedAt)}</td>
                         </tr>
@@ -729,8 +786,58 @@ function updateTransactionStatus(
             status: status.status,
             detail,
             finalizedInMs: status.status === 'accepted' ? null : Date.now() - tx.submittedAt,
+            finalizedHeight: statusHasHeight(status) ? status.height : tx.finalizedHeight,
+            proof: nextProofState(status, digest, tx.proof),
         };
     });
+}
+
+function updateTransactionProof(
+    digest: string,
+    proof: TransactionProofState,
+    current: SubmittedTransaction[],
+): SubmittedTransaction[] {
+    return current.map((tx) => (tx.digest === digest ? { ...tx, proof } : tx));
+}
+
+function shouldFetchTransactionProof(
+    tx: SubmittedTransaction,
+): tx is SubmittedTransaction & { readonly finalizedHeight: number } {
+    return (
+        tx.finalizedHeight !== null &&
+        (tx.status === 'finalized' ||
+            (tx.status === 'partially_finalized' && !tx.detail.startsWith('rejected'))) &&
+        tx.proof.status === 'waiting'
+    );
+}
+
+function nextProofState(
+    status: TxStatus,
+    digest: string,
+    current: TransactionProofState,
+): TransactionProofState {
+    if (status.status === 'accepted') return current;
+    if (status.status === 'dropped') {
+        return { status: 'waiting', detail: 'not finalized' };
+    }
+    if (status.status === 'partially_finalized' && status.filtered.includes(digest)) {
+        return { status: 'waiting', detail: 'not included' };
+    }
+    return { status: 'waiting', detail: 'waiting for QMDB proof' };
+}
+
+function statusHasHeight(status: TxStatus): status is Extract<TxStatus, { readonly height: number }> {
+    return status.status === 'finalized' || status.status === 'partially_finalized';
+}
+
+function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
+    return {
+        status: 'verified',
+        detail: `verified at op ${proof.location.toString()}`,
+        location: proof.location.toString(),
+        tip: proof.tip.toString(),
+        proofSizeBytes: proof.proofSizeBytes,
+    };
 }
 
 async function pollTransactionStatus(baseUrl: string, submission: SubmitResponse): Promise<TxStatus> {
@@ -882,7 +989,33 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         finalizedInMs,
         status: transaction.status as SubmittedTransaction['status'],
         detail: transaction.detail,
+        finalizedHeight:
+            typeof transaction.finalizedHeight === 'number' ? transaction.finalizedHeight : null,
+        proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+function normalizeTransactionProof(value: unknown): TransactionProofState {
+    if (typeof value !== 'object' || value === null) {
+        return { status: 'waiting', detail: 'waiting for finalization' };
+    }
+    const proof = value as Record<string, unknown>;
+    if (proof.status === 'verified' && typeof proof.detail === 'string') {
+        return {
+            status: 'verified',
+            detail: proof.detail,
+            location: typeof proof.location === 'string' ? proof.location : '',
+            tip: typeof proof.tip === 'string' ? proof.tip : '',
+            proofSizeBytes: typeof proof.proofSizeBytes === 'number' ? proof.proofSizeBytes : 0,
+        };
+    }
+    if (
+        (proof.status === 'waiting' || proof.status === 'fetching' || proof.status === 'error') &&
+        typeof proof.detail === 'string'
+    ) {
+        return { status: proof.status, detail: proof.detail };
+    }
+    return { status: 'waiting', detail: 'waiting for finalization' };
 }
 
 function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {

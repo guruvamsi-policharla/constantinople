@@ -26,7 +26,8 @@ use constantinople_engine::types::EngineBlock;
 use constantinople_indexer::{
     BlockReporter, IndexerClient, UploaderHandles, keys as indexer_keys, spawn_uploaders,
     sql_schema::{
-        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TX_COUNT, TX_META_TABLE,
+        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_ROOT,
+        BLOCK_META_TRANSACTIONS_TIP, BLOCK_META_TX_COUNT, TX_META_QMDB_LOCATION, TX_META_TABLE,
         build_meta_schema,
     },
 };
@@ -57,6 +58,7 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         leader,
         parent: (View::new(height.saturating_sub(1)), valid_commitment()),
     };
+    let transactions_end = tx_count as u64 + 2;
     let header = Header {
         context,
         parent: sha256::Digest::EMPTY,
@@ -66,7 +68,7 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         state_sync_root: sha256::Digest::EMPTY,
         state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
         transactions_root: sha256::Digest::EMPTY,
-        transactions_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
+        transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
     };
 
     let txs: Vec<SignedTransaction<PublicKey, Sha256>> = (0..tx_count)
@@ -358,7 +360,7 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
 
     // block_meta: exactly one row matching the encoded block.
     let block_meta_query = format!(
-        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_DIGEST}, {BLOCK_META_TX_COUNT} FROM {BLOCK_META_TABLE}",
+        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_DIGEST}, {BLOCK_META_TX_COUNT}, {BLOCK_META_TRANSACTIONS_ROOT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE}",
     );
     let batches = ctx
         .sql(&block_meta_query)
@@ -391,6 +393,20 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
         .expect("tx_count col")
         .value(0);
     assert_eq!(tx_count, expected_tx_count);
+    let transactions_root = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("transactions_root col")
+        .value(0);
+    assert_eq!(transactions_root, block.header.transactions_root.as_ref());
+    let transactions_tip = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("transactions_tip col")
+        .value(0);
+    assert_eq!(transactions_tip, block.header.transactions_range.end() - 1);
 
     // tx_meta: exactly `expected_tx_count` rows, all at height=42.
     let tx_meta_query = format!("SELECT COUNT(*) FROM {TX_META_TABLE}");
@@ -409,6 +425,24 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
         .expect("count col")
         .value(0);
     assert_eq!(count as u64, expected_tx_count);
+
+    let location_rows = ctx
+        .sql(&format!(
+            "SELECT {TX_META_QMDB_LOCATION} FROM {TX_META_TABLE} ORDER BY {TX_META_QMDB_LOCATION}"
+        ))
+        .await
+        .expect("tx_meta locations query")
+        .collect()
+        .await
+        .expect("collect tx_meta locations");
+    let locations = location_rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("qmd location col");
+    assert_eq!(locations.value(0), 1);
+    assert_eq!(locations.value(1), 2);
+    assert_eq!(locations.value(2), 3);
 
     drop(uploaders);
 }

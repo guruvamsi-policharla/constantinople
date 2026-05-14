@@ -478,6 +478,10 @@ body {
     width: 18ch;
 }
 
+.tx-col-proof {
+    width: 20ch;
+}
+
 .tx-col-latency {
     width: 24ch;
 }

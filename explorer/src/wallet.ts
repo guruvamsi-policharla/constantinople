@@ -108,7 +108,7 @@ function activeWallet(profile: WalletProfile, chainKey: ChainKey): ActiveWallet 
     };
 }
 
-async function loadCrypto() {
+export async function loadCrypto() {
     cryptoReady ??= initCrypto();
     await cryptoReady;
 }

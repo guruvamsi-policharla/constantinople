@@ -36,6 +36,10 @@ pub const BLOCK_META_HEIGHT: &str = "height";
 pub const BLOCK_META_DIGEST: &str = "digest";
 /// `block_meta`: number of transactions contained in the block.
 pub const BLOCK_META_TX_COUNT: &str = "tx_count";
+/// `block_meta`: root of the transaction-hash QMDB operation log at this block.
+pub const BLOCK_META_TRANSACTIONS_ROOT: &str = "transactions_root";
+/// `block_meta`: latest transaction-hash QMDB operation location at this block.
+pub const BLOCK_META_TRANSACTIONS_TIP: &str = "transactions_tip";
 /// `block_meta`: simplex consensus view that finalized the block.
 pub const BLOCK_META_VIEW: &str = "view";
 /// `block_meta`: finalization timestamp in microseconds since the Unix epoch.
@@ -49,6 +53,8 @@ pub const TX_META_HEIGHT: &str = "height";
 pub const TX_META_INDEX: &str = "index";
 /// `tx_meta`: 32-byte transaction digest, fixed-size binary.
 pub const TX_META_DIGEST: &str = "tx_digest";
+/// `tx_meta`: transaction-hash QMDB operation location for this digest.
+pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
@@ -73,6 +79,12 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(BLOCK_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(BLOCK_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(BLOCK_META_TX_COUNT, DataType::UInt64, false),
+                TableColumnConfig::new(
+                    BLOCK_META_TRANSACTIONS_ROOT,
+                    DataType::FixedSizeBinary(32),
+                    false,
+                ),
+                TableColumnConfig::new(BLOCK_META_TRANSACTIONS_TIP, DataType::UInt64, false),
                 TableColumnConfig::new(BLOCK_META_VIEW, DataType::UInt64, false),
                 TableColumnConfig::new(
                     BLOCK_META_FINALIZED_TS,
@@ -89,6 +101,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(TX_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_INDEX, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
             ],
             vec![TX_META_HEIGHT.to_string(), TX_META_INDEX.to_string()],
             vec![],
@@ -135,10 +148,13 @@ mod tests {
         assert_eq!(BLOCK_META_HEIGHT, "height");
         assert_eq!(BLOCK_META_DIGEST, "digest");
         assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
+        assert_eq!(BLOCK_META_TRANSACTIONS_ROOT, "transactions_root");
+        assert_eq!(BLOCK_META_TRANSACTIONS_TIP, "transactions_tip");
         assert_eq!(BLOCK_META_VIEW, "view");
         assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
         assert_eq!(TX_META_HEIGHT, "height");
         assert_eq!(TX_META_INDEX, "index");
         assert_eq!(TX_META_DIGEST, "tx_digest");
+        assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
     }
 }
