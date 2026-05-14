@@ -128,7 +128,8 @@ mod tests {
             .map(commonware_codec::types::lazy::Lazy::new)
             .collect();
         assert!(
-            verify_transaction_batch::<ed25519::PublicKey, Sha256, ed25519::Batch>(
+            verify_transaction_batch::<ed25519::PublicKey, Sha256, ed25519::Batch, _>(
+                &Sequential,
                 TRANSACTION_NAMESPACE,
                 &mut rng,
                 &lazy_decoded,

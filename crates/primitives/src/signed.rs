@@ -11,7 +11,6 @@ use crate::{Sealable, Sealed, SignedTransaction};
 use commonware_codec::{Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
-use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 
 /// A [`Sealed`] object with an attached signature over its seal.
@@ -256,14 +255,12 @@ where
 /// verification.
 ///
 /// Calling `.get()` on each [`Lazy`] forces the underlying
-/// [`SignedTransaction`] to be decoded and its seal digest computed. When this
-/// function runs inside a worker thread (via [`verify_transaction_chunks`])
-/// that per-transaction cost is paid on the worker rather than the runtime
-/// thread.
+/// [`SignedTransaction`] to be decoded and its seal digest computed.
 ///
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
-pub fn verify_transaction_batch<P, H, BV>(
+pub fn verify_transaction_batch<P, H, BV, St>(
+    signature_strategy: &St,
     namespace: &[u8],
     rng: &mut impl CryptoRngCore,
     transactions: &[Lazy<SignedTransaction<P, H>>],
@@ -272,12 +269,10 @@ where
     P: PublicKey,
     H: Hasher,
     BV: BatchVerifier<PublicKey = P>,
+    St: Strategy,
 {
     let mut verifier = BV::new();
     for lazy in transactions {
-        // Force materialization on this thread (the chunked caller runs this
-        // inside a parallel worker, so decoding + seal hashing is spread
-        // across cores).
         let Some(transaction) = lazy.get() else {
             return false;
         };
@@ -296,14 +291,14 @@ where
             return false;
         }
     }
-    verifier.verify(rng)
+    verifier.verify(rng, signature_strategy)
 }
 
-/// Splits lazily-encoded transactions into chunks and verifies each chunk.
+/// Verifies lazily-encoded transactions.
 ///
 /// The hash strategy first forces each [`Lazy`] to decode and compute its seal
 /// digest. The signature strategy then runs batch signature verification over
-/// the warmed transactions. Returns `None` if any chunk contains an invalid or
+/// the warmed transactions. Returns `None` if any transaction contains an invalid or
 /// undecodable transaction.
 pub fn verify_transaction_chunks<P, H, BV, SigSt, HashSt>(
     signature_strategy: &SigSt,
@@ -325,38 +320,15 @@ where
 
     let transactions = preload_transaction_chunks(hash_strategy, transactions)?;
 
-    let chunk_count = signature_strategy
-        .parallelism_hint()
-        .min(transactions.len());
-    let chunk_size = transactions.len().div_ceil(chunk_count);
-
-    let mut remaining = transactions;
-    let mut chunks = Vec::with_capacity(chunk_count);
-    while !remaining.is_empty() {
-        let split_at = chunk_size.min(remaining.len());
-        let rest = remaining.split_off(split_at);
-        let mut rng_seed = [0u8; 32];
-        rng.fill_bytes(&mut rng_seed);
-        chunks.push((rng_seed, remaining));
-        remaining = rest;
+    if !verify_transaction_batch::<P, H, BV, _>(signature_strategy, namespace, rng, &transactions) {
+        return None;
     }
 
-    let verified_chunks = signature_strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
-        let mut chunk_rng = StdRng::from_seed(rng_seed);
-        if !verify_transaction_batch::<P, H, BV>(namespace, &mut chunk_rng, &chunk) {
-            return None;
-        }
-        // Each lazy was forced during verification above, so unwrapping the
-        // materialized value is infallible here.
-        let verified: Option<Vec<_>> = chunk.into_iter().map(|lazy| lazy.get().cloned()).collect();
-        verified
-    });
-
-    let mut verified = Vec::new();
-    for chunk in verified_chunks {
-        verified.extend(chunk?);
-    }
-    Some(verified)
+    // Each lazy was forced during verification above, so materialization cannot fail here.
+    transactions
+        .into_iter()
+        .map(|lazy| lazy.get().cloned())
+        .collect()
 }
 
 #[cfg(test)]

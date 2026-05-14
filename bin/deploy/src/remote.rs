@@ -359,7 +359,7 @@ fn build_deployer_config(
         });
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
-            region: shared_indexer_region.clone(),
+            region: shared_indexer_region,
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
