@@ -1,12 +1,11 @@
-//! Typed read-only wrapper around the two KV [`StoreClient`]s.
+//! Typed read-only wrapper around the indexer's raw KV [`StoreClient`]s.
 //!
-//! Constantinople fans its full-storage KV data across two independent
-//! exoware stores: one for blocks + consensus certificates, and one for
-//! transactions. (Block-level metadata lives in the SQL `block_meta`
-//! table — see [`crate::sql_schema`] — and is not served by this client.)
-//! `IndexerClient` is the canonical way for tests and library consumers to
-//! pull artifacts back out of those stores; it routes each query to the
-//! store that owns the relevant key family.
+//! Constantinople writes full-storage KV data to one raw exoware Store.
+//! `IndexerClient` accepts separate handles for block/certificate and
+//! transaction families so older tests can still model split stores, but
+//! production wiring passes the same [`StoreClient`] for both handles.
+//! Block-level metadata lives in the SQL `block_meta` table — see
+//! [`crate::sql_schema`] — and is not served by this client.
 //!
 //! The struct does not own any sockets beyond the underlying [`StoreClient`]s,
 //! so it is cheap to clone.
@@ -34,8 +33,7 @@ pub enum ReadError {
     Malformed { expected: usize, got: usize },
 }
 
-/// Typed read client over the two exoware [`StoreClient`]s that back the
-/// indexer's KV path.
+/// Typed read client over the exoware [`StoreClient`]s that back KV reads.
 ///
 /// | Field          | Families served                                |
 /// | -------------- | ---------------------------------------------- |
@@ -48,7 +46,7 @@ pub struct IndexerClient {
 }
 
 impl IndexerClient {
-    /// Wrap two existing [`StoreClient`]s, one per backing store.
+    /// Wrap existing [`StoreClient`]s for block and transaction families.
     pub const fn new(blocks: StoreClient, transactions: StoreClient) -> Self {
         Self {
             blocks,
@@ -56,12 +54,12 @@ impl IndexerClient {
         }
     }
 
-    /// Borrow the blocks-store [`StoreClient`] for raw access (e.g. streams).
+    /// Borrow the block-family [`StoreClient`] for raw access.
     pub const fn blocks(&self) -> &StoreClient {
         &self.blocks
     }
 
-    /// Borrow the transactions-store [`StoreClient`] for raw access.
+    /// Borrow the transaction-family [`StoreClient`] for raw access.
     pub const fn transactions(&self) -> &StoreClient {
         &self.transactions
     }

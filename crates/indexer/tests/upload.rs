@@ -1,8 +1,8 @@
-//! End-to-end integration: drive `BlockReporter` against three in-process
-//! `exoware-simulator` instances (blocks, transactions, sql) and read every
+//! End-to-end integration: drive `BlockReporter` against two in-process
+//! `exoware-simulator` instances (raw KV, sql) and read every
 //! artifact back out via `IndexerClient` (KV) and a fresh DataFusion
-//! `SessionContext` (SQL). Also asserts that each store only contains the
-//! families it owns.
+//! `SessionContext` (SQL). Also asserts that metadata-only mode leaves the
+//! raw KV store untouched.
 
 use bytes::Bytes;
 use commonware_codec::Encode;
@@ -103,14 +103,13 @@ fn valid_commitment() -> Commitment {
     ))
 }
 
-/// Three running simulators with their connected store clients. The temp dirs
+/// Running simulators with their connected store clients. The temp dirs
 /// and join handles are kept alive for the duration of the test.
 struct Stores {
-    blocks: StoreClient,
-    transactions: StoreClient,
+    raw: StoreClient,
     sql: StoreClient,
-    _handles: [tokio::task::JoinHandle<()>; 3],
-    _dirs: [TempDir; 3],
+    _handles: [tokio::task::JoinHandle<()>; 2],
+    _dirs: [TempDir; 2],
 }
 
 async fn spawn_stores() -> Stores {
@@ -123,30 +122,23 @@ async fn spawn_stores() -> Stores {
         (handle, dir, client)
     }
 
-    let (h_b, d_b, blocks) = one().await;
-    let (h_t, d_t, transactions) = one().await;
+    let (h_r, d_r, raw) = one().await;
     let (h_s, d_s, sql) = one().await;
     Stores {
-        blocks,
-        transactions,
+        raw,
         sql,
-        _handles: [h_b, h_t, h_s],
-        _dirs: [d_b, d_t, d_s],
+        _handles: [h_r, h_s],
+        _dirs: [d_r, d_s],
     }
 }
 
 /// Convenience constructor that mirrors the validator-side wiring.
 fn make_uploaders(stores: &Stores) -> UploaderHandles {
-    spawn_uploaders(
-        stores.blocks.clone(),
-        stores.transactions.clone(),
-        stores.sql.clone(),
-        16,
-    )
+    spawn_uploaders(stores.raw.clone(), stores.sql.clone(), 16)
 }
 
 fn make_client(stores: &Stores) -> IndexerClient {
-    IndexerClient::new(stores.blocks.clone(), stores.transactions.clone())
+    IndexerClient::new(stores.raw.clone(), stores.raw.clone())
 }
 
 /// Sum of rows visible in `client` across every indexer KV family.
@@ -172,27 +164,23 @@ async fn count_all(client: &StoreClient) -> usize {
 }
 
 #[tokio::test]
-async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores() {
+async fn block_reporter_uploads_block_transactions_and_meta_to_raw_store() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
-    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
+    let mut reporter: BlockReporter<Sha256, PublicKey> =
+        BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
-    // Build, hand off to reporter, and wait for all three uploaders to ack.
+    // Build, hand off to reporter, and wait for both uploaders to ack.
     let block = build_block(7, 3, 0xC0FFEE);
     let (ack, waiter) = Exact::handle();
     reporter.report(Update::Block(block.clone(), ack)).await;
 
     waiter.await.expect("uploader must acknowledge");
 
-    // Verify routing: blocks store has BLOCK + BLOCK_BY_H (= 2 rows), the
-    // tx store has 2 KV rows per tx. SQL metadata is verified separately
+    // Verify routing: raw KV has BLOCK + BLOCK_BY_H (= 2 rows) plus
+    // 2 KV rows per tx. SQL metadata is verified separately
     // by `block_reporter_writes_block_meta_and_tx_meta_rows`.
-    assert_eq!(count_all(&stores.blocks).await, 2);
-    assert_eq!(count_all(&stores.transactions).await, 2 * block.body.len());
+    assert_eq!(count_all(&stores.raw).await, 2 + 2 * block.body.len());
 
     // Verify every row of the logical batch is readable by the typed client.
     let client = make_client(&stores);
@@ -229,7 +217,7 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores()
         assert_eq!(bytes, lazy.encode(), "tx[{idx}] encoding mismatch");
     }
 
-    // Range scan over the blocks store: heights round-trip in order.
+    // Range scan over the raw store: heights round-trip in order.
     let listed = client
         .list_block_heights::<sha256::Digest>(16)
         .await
@@ -245,11 +233,8 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores()
 async fn block_reporter_advances_latest_height_monotonically() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
-    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
+    let mut reporter: BlockReporter<Sha256, PublicKey> =
+        BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
     for height in 1u64..=4 {
         let block = build_block(height, 1, height);
@@ -273,25 +258,20 @@ async fn block_reporter_advances_latest_height_monotonically() {
     drop(uploaders);
 }
 
-/// A block with no transactions must still produce a complete ack — the
-/// transactions-store batch is empty and dispatched as an immediate ack.
+/// A block with no transactions must still produce a complete ack.
 #[tokio::test]
 async fn block_reporter_handles_empty_block_body() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
-    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
+    let mut reporter: BlockReporter<Sha256, PublicKey> =
+        BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
     let block = build_block(1, 0, 0xBABE);
     let (ack, waiter) = Exact::handle();
     reporter.report(Update::Block(block, ack)).await;
     waiter.await.expect("uploader must acknowledge empty body");
 
-    assert_eq!(count_all(&stores.blocks).await, 2);
-    assert_eq!(count_all(&stores.transactions).await, 0);
+    assert_eq!(count_all(&stores.raw).await, 2);
 
     drop(uploaders);
 }
@@ -301,11 +281,8 @@ async fn block_reporter_handles_empty_block_body() {
 async fn block_reporter_ignores_tip_updates() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
-    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
+    let mut reporter: BlockReporter<Sha256, PublicKey> =
+        BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
     reporter
         .report(Update::<TestBlock, Exact>::Tip(
@@ -320,8 +297,7 @@ async fn block_reporter_ignores_tip_updates() {
 
     let client = make_client(&stores);
     assert_eq!(client.latest_height().await.unwrap(), None);
-    assert_eq!(count_all(&stores.blocks).await, 0);
-    assert_eq!(count_all(&stores.transactions).await, 0);
+    assert_eq!(count_all(&stores.raw).await, 0);
 
     drop(uploaders);
 }
@@ -336,11 +312,8 @@ async fn block_reporter_ignores_tip_updates() {
 async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
-    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
-        uploaders.blocks.clone(),
-        uploaders.transactions.clone(),
-        uploaders.sql.clone(),
-    );
+    let mut reporter: BlockReporter<Sha256, PublicKey> =
+        BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
     let block = build_block(42, 3, 0xDECAF);
     let expected_digest: [u8; 32] = block.seal().as_ref().try_into().expect("32-byte digest");
@@ -459,8 +432,7 @@ async fn metadata_only_block_reporter_writes_only_sql_rows() {
     reporter.report(Update::Block(block, ack)).await;
     waiter.await.expect("uploader must acknowledge");
 
-    assert_eq!(count_all(&stores.blocks).await, 0);
-    assert_eq!(count_all(&stores.transactions).await, 0);
+    assert_eq!(count_all(&stores.raw).await, 0);
 
     let ctx = SessionContext::new();
     build_meta_schema(stores.sql.clone())

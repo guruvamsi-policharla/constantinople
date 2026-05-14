@@ -1,13 +1,13 @@
 //! Certificate reporter that uploads simplex notarization and finalization
-//! certificates to the **blocks** store.
+//! certificates to the raw KV store.
 //!
 //! Wired into the engine via the new `simplex_observer` slot on
 //! [`constantinople_engine::Config`]. On every
 //! [`simplex::types::Activity::Notarization`] or
 //! [`simplex::types::Activity::Finalization`] we encode a single-row batch
-//! and dispatch it to the blocks-store uploader. The FINALIZED and NOTARIZED
-//! key families share the blocks store with BLOCK and BLOCK_BY_H. All other
-//! activity variants (votes, Byzantine evidence, etc.) are dropped.
+//! and dispatch it to the raw KV uploader. The FINALIZED and NOTARIZED key
+//! families share the raw store with BLOCK, BLOCK_BY_H, TX, and TX_BY_H. All
+//! other activity variants (votes, Byzantine evidence, etc.) are dropped.
 //!
 //! Like [`super::block::BlockReporter`], certificate uploads are non-blocking
 //! and run on a fresh tokio task.
@@ -26,18 +26,17 @@ use std::marker::PhantomData;
 use tokio::sync::mpsc;
 
 /// Cloneable [`Reporter`] over `Activity<S, D>` that filters notarizations and
-/// finalizations and uploads each as a single atomic row to the blocks store.
+/// finalizations and uploads each as a single atomic row to the raw KV store.
 pub struct CertificateReporter<S, D> {
-    blocks: mpsc::Sender<UploadBatch>,
+    raw: mpsc::Sender<UploadBatch>,
     _marker: PhantomData<fn() -> (S, D)>,
 }
 
 impl<S, D> CertificateReporter<S, D> {
-    /// Build a reporter that forwards certificate batches to the blocks-store
-    /// uploader.
-    pub const fn new(blocks: mpsc::Sender<UploadBatch>) -> Self {
+    /// Build a reporter that forwards certificate batches to the raw uploader.
+    pub const fn new(raw: mpsc::Sender<UploadBatch>) -> Self {
         Self {
-            blocks,
+            raw,
             _marker: PhantomData,
         }
     }
@@ -46,7 +45,7 @@ impl<S, D> CertificateReporter<S, D> {
 impl<S, D> Clone for CertificateReporter<S, D> {
     fn clone(&self) -> Self {
         Self {
-            blocks: self.blocks.clone(),
+            raw: self.raw.clone(),
             _marker: PhantomData,
         }
     }
@@ -68,7 +67,7 @@ where
                 let key = keys::notarized(view).expect("u64 view fits NOTARIZED family payload");
                 let value = notarization.encode();
                 dispatch_batch(
-                    &self.blocks,
+                    &self.raw,
                     UploadBatch {
                         rows: vec![(key, value)],
                         ack: None,
@@ -80,7 +79,7 @@ where
                 let key = keys::finalized(view).expect("u64 view fits FINALIZED family payload");
                 let value = finalization.encode();
                 dispatch_batch(
-                    &self.blocks,
+                    &self.raw,
                     UploadBatch {
                         rows: vec![(key, value)],
                         ack: None,

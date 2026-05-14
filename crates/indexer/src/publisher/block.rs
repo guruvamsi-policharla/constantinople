@@ -1,19 +1,17 @@
-//! Block reporter that fans a finalized block out across the KV stores
-//! and the SQL metadata uploader.
+//! Block reporter that fans a finalized block out to raw KV and SQL metadata.
 //!
 //! Wired into the engine via the existing `marshal` reporter slot. On every
 //! `Update::Block(block, ack)` we:
 //!
-//! 1. Encode three batches:
-//!    - **blocks store** (KV): BLOCK + BLOCK_BY_H rows.
-//!    - **transactions store** (KV): TX + TX_BY_H rows for every contained tx.
+//! 1. Encode two batches:
+//!    - **raw KV**: BLOCK, BLOCK_BY_H, TX, and TX_BY_H rows.
 //!    - **sql metadata** (`block_meta` + `tx_meta`): one row per block plus
 //!      one row per transaction. The latest-finalized-height cursor is
 //!      derived from `MAX(height)` on `block_meta`; the KV path no longer
 //!      maintains a redundant META scalar.
-//! 2. Clone the marshal acknowledgement once per uploader. Each uploader
-//!    fulfills its clone after its own put succeeds; the marshal waiter only
-//!    resolves after every uploader has durably accepted its batch.
+//! 2. Clone the marshal acknowledgement once per backing path. Each path
+//!    fulfills its clone after its own upload succeeds; the marshal waiter only
+//!    resolves after every path has durably accepted its batch.
 //! 3. Forward each batch to its uploader and return immediately so consensus
 //!    is not blocked on the network store — marshal itself back-pressures
 //!    the engine through the still-held ack.
@@ -40,30 +38,24 @@ use tracing::warn;
 
 /// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
 ///
-/// Holds one sender per active backing store. Cloning the reporter is cheap;
+/// Holds one sender per active backing path. Cloning the reporter is cheap;
 /// the senders are reference-counted MPSC channels.
 pub struct BlockReporter<H, P> {
-    blocks: Option<mpsc::Sender<UploadBatch>>,
-    transactions: Option<mpsc::Sender<UploadBatch>>,
+    raw: Option<mpsc::Sender<UploadBatch>>,
     sql: mpsc::Sender<SqlBatch>,
     _marker: PhantomData<fn() -> (H, P)>,
 }
 
 impl<H, P> BlockReporter<H, P> {
-    /// Build a reporter that forwards batches to the per-store uploader channels.
+    /// Build a reporter that forwards raw KV and SQL metadata batches.
     ///
-    /// Two KV channels (`blocks`, `transactions`) carry pre-encoded rows
-    /// to the existing exoware Stores. The third (`sql`) feeds the SQL
-    /// metadata uploader, which writes typed rows into the `block_meta`
-    /// and `tx_meta` tables declared by [`crate::sql_schema`].
-    pub const fn new(
-        blocks: mpsc::Sender<UploadBatch>,
-        transactions: mpsc::Sender<UploadBatch>,
-        sql: mpsc::Sender<SqlBatch>,
-    ) -> Self {
+    /// The raw KV channel carries pre-encoded BLOCK, BLOCK_BY_H, TX, and
+    /// TX_BY_H rows to the existing exoware Store. The SQL channel feeds the
+    /// metadata uploader, which writes typed rows into the `block_meta` and
+    /// `tx_meta` tables declared by [`crate::sql_schema`].
+    pub const fn new(raw: mpsc::Sender<UploadBatch>, sql: mpsc::Sender<SqlBatch>) -> Self {
         Self {
-            blocks: Some(blocks),
-            transactions: Some(transactions),
+            raw: Some(raw),
             sql,
             _marker: PhantomData,
         }
@@ -72,8 +64,7 @@ impl<H, P> BlockReporter<H, P> {
     /// Build a reporter that uploads only SQL metadata rows.
     pub const fn metadata_only(sql: mpsc::Sender<SqlBatch>) -> Self {
         Self {
-            blocks: None,
-            transactions: None,
+            raw: None,
             sql,
             _marker: PhantomData,
         }
@@ -83,8 +74,7 @@ impl<H, P> BlockReporter<H, P> {
 impl<H, P> Clone for BlockReporter<H, P> {
     fn clone(&self) -> Self {
         Self {
-            blocks: self.blocks.clone(),
-            transactions: self.transactions.clone(),
+            raw: self.raw.clone(),
             sql: self.sql.clone(),
             _marker: PhantomData,
         }
@@ -107,31 +97,16 @@ where
                 // are dispatched onto background tasks so this method never
                 // blocks consensus — see `dispatch_batch` for back-pressure
                 // semantics.
-                let EncodedRows {
-                    blocks,
-                    transactions,
-                    sql,
-                } = encode_block_rows(&block);
+                let EncodedRows { raw, sql } = encode_block_rows(&block);
 
-                // Clone the ack once per uploader. `Exact::clone` increments
-                // the remaining count, so the marshal waiter only resolves
-                // after each uploader's clone has been acknowledged. If a
-                // batch is empty (e.g. a block with no transactions) the
-                // dispatcher fulfills its clone immediately.
-                if let Some(blocks_tx) = &self.blocks {
+                // Clone the ack once per backing path. `Exact::clone`
+                // increments the remaining count, so the marshal waiter only
+                // resolves after each path has acknowledged.
+                if let Some(raw_tx) = &self.raw {
                     dispatch_batch(
-                        blocks_tx,
+                        raw_tx,
                         UploadBatch {
-                            rows: blocks,
-                            ack: Some(ack.clone()),
-                        },
-                    );
-                }
-                if let Some(transactions_tx) = &self.transactions {
-                    dispatch_batch(
-                        transactions_tx,
-                        UploadBatch {
-                            rows: transactions,
+                            rows: raw,
                             ack: Some(ack.clone()),
                         },
                     );
@@ -150,12 +125,11 @@ where
 
 /// Encoded rows split by destination store.
 struct EncodedRows {
-    blocks: Vec<(Key, Bytes)>,
-    transactions: Vec<(Key, Bytes)>,
+    raw: Vec<(Key, Bytes)>,
     sql: Vec<crate::publisher::SqlRow>,
 }
 
-/// Build every key-value row for a finalized block, partitioned by destination store.
+/// Build every row for a finalized block, partitioned by destination store.
 fn encode_block_rows<H, P>(block: &EngineBlock<H, P>) -> EncodedRows
 where
     H: Hasher,
@@ -183,21 +157,17 @@ where
     let mut tx_digests: Vec<[u8; 32]> = Vec::with_capacity(body_len);
     let mut tx_qmdb_locations: Vec<u64> = Vec::with_capacity(body_len);
 
-    // BLOCK family: digest -> encoded SealedBlock (which serializes the inner Block).
-    // BLOCK_BY_H family: height -> block digest (32 bytes).
-    let blocks = vec![
-        (
-            keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
-            block.encode(),
-        ),
-        (
-            keys::block_by_height(height).expect("u64 height fits family payload"),
-            Bytes::copy_from_slice(block_digest.as_ref()),
-        ),
-    ];
+    let mut raw = Vec::with_capacity(2 + 2 * body_len);
+    raw.push((
+        keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
+        block.encode(),
+    ));
+    raw.push((
+        keys::block_by_height(height).expect("u64 height fits family payload"),
+        Bytes::copy_from_slice(block_digest.as_ref()),
+    ));
 
     // Per-transaction rows: TX (digest -> encoded tx) and TX_BY_H ((height, idx) -> tx digest).
-    let mut transactions = Vec::with_capacity(2 * body_len);
     for (idx, lazy) in block.body.iter().enumerate() {
         let Some(tx) = lazy.get() else {
             // Marshal must have already verified each tx upstream, so a decode
@@ -213,11 +183,11 @@ where
         let tx_bytes = lazy.encode();
         let idx_u32 = u32::try_from(idx).expect("transaction index fits u32");
 
-        transactions.push((
+        raw.push((
             keys::tx(tx_digest.as_ref()).expect("tx digest fits family payload"),
             tx_bytes,
         ));
-        transactions.push((
+        raw.push((
             keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
             Bytes::copy_from_slice(tx_digest.as_ref()),
         ));
@@ -255,9 +225,5 @@ where
         &tx_qmdb_locations,
     );
 
-    EncodedRows {
-        blocks,
-        transactions,
-        sql,
-    }
+    EncodedRows { raw, sql }
 }

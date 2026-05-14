@@ -105,17 +105,9 @@ async fn maybe_build_indexer(
     );
     match cfg.mode {
         IndexerMode::Full => {
-            let blocks_store =
-                constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let transactions_store =
-                constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let raw_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
             let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let uploaders = spawn_uploaders(
-                blocks_store,
-                transactions_store,
-                sql_store,
-                cfg.upload_buffer,
-            );
+            let uploaders = spawn_uploaders(raw_store, sql_store, cfg.upload_buffer);
             let qmd_publisher = if cfg.qmdb_upload {
                 Some(Arc::new(
                     QmdbPublisher::connect(&cfg.chain_indexer_url, cfg.upload_buffer)
@@ -126,12 +118,10 @@ async fn maybe_build_indexer(
                 None
             };
             let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
-                uploaders.blocks.clone(),
-                uploaders.transactions.clone(),
+                uploaders.raw.clone(),
                 uploaders.sql.clone(),
             );
-            // Certificates (FINALIZED, NOTARIZED) live in the blocks store.
-            let cert_reporter = Some(EngineCertReporter::new(uploaders.blocks.clone()));
+            let cert_reporter = Some(EngineCertReporter::new(uploaders.raw.clone()));
             Some(IndexerHandle {
                 block_reporter,
                 cert_reporter,
