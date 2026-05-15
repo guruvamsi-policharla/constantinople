@@ -6,6 +6,7 @@
     "scripts": {
         "build:wasm": "wasm-pack build ../crates/explorer-crypto --target web --out-dir ../../explorer/src/crypto-wasm",
         "dev": "vite",
+        "test": "node --test --experimental-strip-types tests/*.test.ts",
         "build": "npm run build:wasm && tsc -b && vite build",
         "preview": "vite preview"
     },

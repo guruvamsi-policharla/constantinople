@@ -15,6 +15,7 @@
 
 import { Code, ConnectError } from '@connectrpc/connect';
 import { type DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
+import { collectNewBlocks, createBlockSequenceCursor } from './blockSequence';
 
 /** `block_meta` column names (mirror `crates/indexer/src/sql_schema.rs`). */
 const COL_HEIGHT = 'height';
@@ -65,7 +66,7 @@ export async function* subscribeBlocks(
     const MAX_TRANSIENT_RETRIES = 10;
     let transientRetries = 0;
     let nextSequence: bigint | undefined;
-    let latestHeight: bigint | null = null;
+    const cursor = createBlockSequenceCursor();
 
     while (!signal?.aborted) {
         try {
@@ -84,21 +85,9 @@ export async function* subscribeBlocks(
             for await (const frame of stream) {
                 transientRetries = 0;
                 const frameNextSequence = frame.sequenceNumber + 1n;
-                for (const block of decodeFrame(frame)) {
-                    if (latestHeight !== null && block.height <= latestHeight) {
-                        continue;
-                    }
-                    if (latestHeight !== null && block.height > latestHeight + 1n) {
-                        yield* (await fetchMissingBlocks(
-                            sql,
-                            latestHeight + 1n,
-                            block.height - 1n,
-                            signal,
-                        ));
-                    }
-                    latestHeight = block.height;
-                    yield block;
-                }
+                yield* await collectNewBlocks(cursor, decodeFrame(frame), (fromHeight, toHeight) =>
+                    fetchMissingBlocks(sql, fromHeight, toHeight, signal),
+                );
                 nextSequence = frameNextSequence;
             }
             // Server-streaming RPC ended cleanly (no more frames). Loop
