@@ -52,6 +52,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 commonware-coding.workspace = true
 commonware-math.workspace = true
+criterion.workspace = true
 rand.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
@@ -72,3 +73,7 @@ path = "src/bin/qmdb.rs"
 [lib]
 name = "constantinople_indexer"
 path = "src/lib.rs"
+
+[[bench]]
+name = "publisher"
+harness = false

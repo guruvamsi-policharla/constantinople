@@ -1581,6 +1581,7 @@ dependencies = [
  "constantinople-application",
  "constantinople-engine",
  "constantinople-primitives",
+ "criterion",
  "datafusion",
  "exoware-qmdb",
  "exoware-sdk",
