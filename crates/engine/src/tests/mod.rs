@@ -184,9 +184,7 @@ impl EngineDefinition for TestEngineDefinition {
                 .partition(|pk| self.shares.get(pk).is_some_and(|share| share.is_some()));
             let primary: Set<TestPublicKey> = primary.into_iter().try_collect().unwrap();
             let secondary: Set<TestPublicKey> = secondary.into_iter().try_collect().unwrap();
-            manager
-                .track(0, TrackedPeers::new(primary, secondary))
-                .await;
+            manager.track(0, TrackedPeers::new(primary, secondary));
         }
 
         let handle = context.child("validator").spawn(move |context| async move {

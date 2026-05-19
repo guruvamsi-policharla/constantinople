@@ -2,11 +2,15 @@
 
 use super::actor::{BatchStatus, IngestStatus, TxStatus};
 use crate::TransactionSource;
+use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::channel::fallible::AsyncFallibleExt;
 use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
+};
 
 /// Opaque receiver handle produced by [`Mailbox::channel`] and consumed by
 /// [`Actor::new`](super::Actor::new).
@@ -181,13 +185,24 @@ where
 
 impl<C, P, H> Reporter for Mailbox<C, P, H>
 where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
+    C: Digest + Send + 'static,
+    P: PublicKey + Send + 'static,
+    H: Hasher + Send + 'static,
+    H::Digest: Send,
 {
     type Activity = Update<SealedBlock<C, P, H>>;
 
-    async fn report(&mut self, activity: Self::Activity) {
-        self.sender.send_lossy(Message::Report(activity)).await;
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        match self.sender.try_send(Message::Report(activity)) {
+            Ok(()) => Feedback::Ok,
+            Err(TrySendError::Full(message)) => {
+                let sender = self.sender.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(message).await;
+                });
+                Feedback::Backoff
+            }
+            Err(TrySendError::Closed(_)) => Feedback::Closed,
+        }
     }
 }

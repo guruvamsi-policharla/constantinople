@@ -1,10 +1,25 @@
 use super::{
-    TransactionHistoryTarget, genesis_block, history::parent_transactions_inactivity_floor,
+    StateSyncTarget, TransactionHistoryTarget, genesis_block,
+    history::parent_transactions_inactivity_floor,
 };
 use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
+use commonware_storage::{merkle::mmr, qmdb::current::proof::OpsRootWitness};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{Block, Sealable, Signable, Transaction};
 use std::num::NonZeroU64;
+
+fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
+    StateSyncTarget::new(
+        sha256::Digest::EMPTY,
+        sha256::Digest::EMPTY,
+        OpsRootWitness {
+            grafted_root: sha256::Digest::EMPTY,
+            pending_chunk_digest: Default::default(),
+            partial_chunk: None,
+        },
+        non_empty_range!(mmr::Location::new(0), mmr::Location::new(1)),
+    )
+}
 
 #[test]
 fn parent_inactivity_floor_skips_the_parent_commit() {
@@ -18,9 +33,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
         &mut sha256::Sha256::default(),
         leader.public_key(),
         0,
-        sha256::Digest::EMPTY,
-        sha256::Digest::EMPTY,
-        non_empty_range!(0, 1),
+        empty_state_target(),
         genesis_target,
     )
     .into_inner()
@@ -66,9 +79,7 @@ fn genesis_block_uses_the_initialized_transaction_target() {
         &mut sha256::Sha256::default(),
         leader,
         0,
-        sha256::Digest::EMPTY,
-        sha256::Digest::EMPTY,
-        non_empty_range!(0, 1),
+        empty_state_target(),
         target.clone(),
     );
 

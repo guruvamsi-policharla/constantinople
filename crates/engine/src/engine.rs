@@ -66,7 +66,7 @@ use tracing::{error, info, warn};
 pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::Scheme<P, V>;
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
-const MAILBOX_SIZE: usize = 1024;
+const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
@@ -77,7 +77,7 @@ const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
-const SHARD_BACKGROUND_CHANNEL_CAPACITY: usize = 1024;
+const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(1_048_576);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
@@ -386,7 +386,6 @@ where
         )
         .await
         .expect("state db must initialize for genesis target");
-        let genesis_state_root = genesis_state_db.root();
         let genesis_state_target =
             <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(&genesis_state_db)
                 .await;
@@ -406,12 +405,7 @@ where
             config.hash_strategy.clone(),
             config.genesis_leader.clone(),
             config.transaction_namespace,
-            genesis_state_root,
-            genesis_state_target.root,
-            commonware_utils::non_empty_range!(
-                *genesis_state_target.range.start(),
-                *genesis_state_target.range.end()
-            ),
+            genesis_state_target,
             genesis_transactions_target,
             config.prune_cadence_blocks,
             Arc::new({
@@ -419,7 +413,7 @@ where
                 move |height| {
                     let marshal = marshal.clone();
                     Box::pin(async move {
-                        marshal.prune(height).await;
+                        marshal.prune(height);
                     })
                 }
             }),
@@ -438,8 +432,8 @@ where
                     transaction_db_config,
                 ),
                 input_provider: config.input,
-                marshal: marshal_mailbox.clone(),
-                mailbox_size: MAILBOX_SIZE,
+                marshal: EngineBlockProvider::from(marshal_mailbox.clone()),
+                mailbox_size: MAILBOX_SIZE.get(),
                 partition_prefix: format!("{}_stateful", config.partition_prefix),
                 startup: config.startup,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -492,7 +486,7 @@ where
                 fetch_timeout: Duration::from_secs(4),
                 activity_timeout: ACTIVITY_TIMEOUT,
                 skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: 32,
+                fetch_concurrent: NZUsize!(32),
                 forwarding: simplex::ForwardingPolicy::Disabled,
             },
         );

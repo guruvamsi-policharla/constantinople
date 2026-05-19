@@ -556,7 +556,6 @@ async fn new_application(
     hash_strategy: Rayon,
 ) -> TestApplication {
     let (state_target, transaction_target) = databases.committed_targets().await;
-    let state_root = databases.0.read().await.root();
     let genesis_transactions_target =
         constantinople_application::consensus::TransactionHistoryTarget {
             root: transaction_target.root,
@@ -569,9 +568,7 @@ async fn new_application(
         hash_strategy,
         leader,
         TRANSACTION_NAMESPACE,
-        state_root,
-        state_target.root,
-        non_empty_range!(*state_target.range.start(), *state_target.range.end()),
+        state_target,
         genesis_transactions_target,
         NZU64!(1024),
         Arc::new(|_| Box::pin(async {})),
@@ -585,14 +582,14 @@ fn bench_strategy(runtime: &RuntimeContext) -> Rayon {
 
 async fn parent_block(leader: TestPublicKey, databases: &TestDatabases) -> TestBlock {
     let (state_target, transaction_target) = databases.committed_targets().await;
-    let state_root = databases.0.read().await.root();
     let header = Header {
         context: block_context(leader),
         parent: sha256::Digest::EMPTY,
         height: 0,
         timestamp: 0,
-        state_root,
-        state_sync_root: state_target.root,
+        state_root: state_target.root,
+        state_ops_root: state_target.ops_root,
+        state_ops_witness: state_target.witness,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transaction_target.root,
         transactions_range: non_empty_range!(0, *transaction_target.leaf_count),

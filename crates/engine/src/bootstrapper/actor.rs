@@ -440,11 +440,9 @@ where
                     id,
                     tip: Box::new(tip),
                 };
-                if let Err(error) = sender
-                    .send(Recipients::One(peer), wire.encode(), false)
-                    .await
-                {
-                    warn!(?error, "bootstrapper failed to send response");
+                let sent = sender.send(Recipients::One(peer), wire.encode(), false);
+                if sent.is_empty() {
+                    warn!("bootstrapper failed to send response");
                 }
             }
             WireMessage::Response { id, tip } => {
@@ -603,10 +601,11 @@ where
         S: Sender<PublicKey = P>,
     {
         let message = WireMessage::<H, P, V>::Request { id };
-        sender
-            .send(Recipients::Some(peers), message.encode(), false)
-            .await
-            .ok()
+        let sent = sender.send(Recipients::Some(peers), message.encode(), false);
+        if sent.is_empty() {
+            return None;
+        }
+        Some(sent)
     }
 
     /// Clear the current round and wait before trying again.

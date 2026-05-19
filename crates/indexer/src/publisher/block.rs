@@ -24,6 +24,7 @@ use crate::{
     },
 };
 use bytes::Bytes;
+use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Hasher, PublicKey};
@@ -88,7 +89,7 @@ where
 {
     type Activity = Update<EngineBlock<H, P>>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
             // Tip-only updates carry no block payload; nothing to upload.
             Update::Tip(_, _, _) => {}
@@ -120,6 +121,7 @@ where
                 );
             }
         }
+        Feedback::Ok
     }
 }
 

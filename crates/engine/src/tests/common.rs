@@ -2,6 +2,7 @@ use crate::{
     ThresholdScheme,
     types::{EngineBlock, EngineMarshalMailbox},
 };
+use commonware_actor::Feedback;
 use commonware_consensus::{
     Reporter,
     marshal::{self, Identifier},
@@ -39,10 +40,11 @@ pub(crate) struct NoopReporter;
 impl Reporter for NoopReporter {
     type Activity = marshal::Update<TestBlock>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let marshal::Update::Block(_, response) = activity {
             Acknowledgement::acknowledge(response);
         }
+        Feedback::Ok
     }
 }
 
@@ -79,19 +81,18 @@ where
 {
     type Activity = marshal::Update<TestBlock>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let marshal::Update::Tip(_, height, digest) = &activity {
-            let _ = self
-                .monitor
-                .send(FinalizationUpdate {
-                    pk: self.public_key.clone(),
-                    view: View::new(height.get()),
-                    block_digest: digest.as_ref().to_vec(),
-                })
-                .await;
+            let monitor = self.monitor.clone();
+            let update = FinalizationUpdate {
+                pk: self.public_key.clone(),
+                view: View::new(height.get()),
+                block_digest: digest.as_ref().to_vec(),
+            };
+            let _ = monitor.try_send(update);
         }
 
-        self.inner.report(activity).await;
+        self.inner.report(activity)
     }
 }
 

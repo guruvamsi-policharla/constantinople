@@ -65,7 +65,12 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         height,
         timestamp: 1_000 + height,
         state_root: sha256::Digest::EMPTY,
-        state_sync_root: sha256::Digest::EMPTY,
+        state_ops_root: sha256::Digest::EMPTY,
+        state_ops_witness: commonware_storage::qmdb::current::proof::OpsRootWitness {
+            grafted_root: sha256::Digest::EMPTY,
+            pending_chunk_digest: Default::default(),
+            partial_chunk: None,
+        },
         state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
         transactions_root: sha256::Digest::EMPTY,
         transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
@@ -173,7 +178,11 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_raw_store() {
     // Build, hand off to reporter, and wait for both uploaders to ack.
     let block = build_block(7, 3, 0xC0FFEE);
     let (ack, waiter) = Exact::handle();
-    reporter.report(Update::Block(block.clone(), ack)).await;
+    assert!(
+        reporter
+            .report(Update::Block(block.clone(), ack))
+            .accepted()
+    );
 
     waiter.await.expect("uploader must acknowledge");
 
@@ -239,7 +248,7 @@ async fn block_reporter_advances_latest_height_monotonically() {
     for height in 1u64..=4 {
         let block = build_block(height, 1, height);
         let (ack, waiter) = Exact::handle();
-        reporter.report(Update::Block(block, ack)).await;
+        assert!(reporter.report(Update::Block(block, ack)).accepted());
         waiter
             .await
             .expect("uploader must acknowledge each height in order");
@@ -268,7 +277,7 @@ async fn block_reporter_handles_empty_block_body() {
 
     let block = build_block(1, 0, 0xBABE);
     let (ack, waiter) = Exact::handle();
-    reporter.report(Update::Block(block, ack)).await;
+    assert!(reporter.report(Update::Block(block, ack)).accepted());
     waiter.await.expect("uploader must acknowledge empty body");
 
     assert_eq!(count_all(&stores.raw).await, 2);
@@ -284,13 +293,11 @@ async fn block_reporter_ignores_tip_updates() {
     let mut reporter: BlockReporter<Sha256, PublicKey> =
         BlockReporter::new(uploaders.raw.clone(), uploaders.sql.clone());
 
-    reporter
-        .report(Update::<TestBlock, Exact>::Tip(
-            Round::new(Epoch::zero(), View::new(99)),
-            commonware_consensus::types::Height::new(99),
-            sha256::Digest::EMPTY,
-        ))
-        .await;
+    reporter.report(Update::<TestBlock, Exact>::Tip(
+        Round::new(Epoch::zero(), View::new(99)),
+        commonware_consensus::types::Height::new(99),
+        sha256::Digest::EMPTY,
+    ));
 
     // Give the uploaders a moment to (not) write anything.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -320,7 +327,11 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
     let expected_tx_count = block.body.len() as u64;
 
     let (ack, waiter) = Exact::handle();
-    reporter.report(Update::Block(block.clone(), ack)).await;
+    assert!(
+        reporter
+            .report(Update::Block(block.clone(), ack))
+            .accepted()
+    );
     waiter.await.expect("uploader must acknowledge");
 
     // Register a fresh DataFusion session against the SQL store; the
@@ -429,7 +440,7 @@ async fn metadata_only_block_reporter_writes_only_sql_rows() {
 
     let block = build_block(9, 2, 0x51A9);
     let (ack, waiter) = Exact::handle();
-    reporter.report(Update::Block(block, ack)).await;
+    assert!(reporter.report(Update::Block(block, ack)).accepted());
     waiter.await.expect("uploader must acknowledge");
 
     assert_eq!(count_all(&stores.raw).await, 0);

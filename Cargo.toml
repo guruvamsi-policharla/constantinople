@@ -47,6 +47,7 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
+commonware-actor = "2026.4.0"
 commonware-p2p = "2026.4.0"
 commonware-glue = "2026.4.0"
 commonware-math = "2026.4.0"
@@ -96,6 +97,7 @@ prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
 
 [patch.crates-io]
+commonware-actor = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-broadcast = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-codec = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-coding = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
@@ -120,6 +122,7 @@ commonware-stream = { git = "https://git@github.com/commonwarexyz/monorepo.git",
 commonware-utils = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 
 [patch."https://github.com/commonwarexyz/monorepo"]
+commonware-actor = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-broadcast = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-codec = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-coding = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }

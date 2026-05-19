@@ -13,6 +13,7 @@ use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_storage::{merkle::mmr, qmdb::current::proof::OpsRootWitness};
 use commonware_utils::range::NonEmptyRange;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
@@ -33,8 +34,10 @@ where
     pub timestamp: u64,
     /// The canonical root of the chain state after applying this block.
     pub state_root: D,
-    /// The root used for state sync.
-    pub state_sync_root: D,
+    /// The QMDB operation root used by state sync.
+    pub state_ops_root: D,
+    /// Witness authenticating the state operation root against the canonical state root.
+    pub state_ops_witness: OpsRootWitness<mmr::Family, D>,
     /// The retained range needed to sync the state database.
     pub state_range: NonEmptyRange<u64>,
     /// A root of all transactions in the history, including those within this block.
@@ -68,7 +71,8 @@ where
             + self.height.encode_size()
             + self.timestamp.encode_size()
             + self.state_root.encode_size()
-            + self.state_sync_root.encode_size()
+            + self.state_ops_root.encode_size()
+            + self.state_ops_witness.encode_size()
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
             + self.transactions_range.encode_size()
@@ -87,7 +91,8 @@ where
         self.height.write(buf);
         self.timestamp.write(buf);
         self.state_root.write(buf);
-        self.state_sync_root.write(buf);
+        self.state_ops_root.write(buf);
+        self.state_ops_witness.write(buf);
         self.state_range.write(buf);
         self.transactions_root.write(buf);
         self.transactions_range.write(buf);
@@ -109,7 +114,8 @@ where
             height: u64::read(buf)?,
             timestamp: u64::read(buf)?,
             state_root: D::read(buf)?,
-            state_sync_root: D::read(buf)?,
+            state_ops_root: D::read(buf)?,
+            state_ops_witness: OpsRootWitness::read(buf)?,
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
             transactions_range: NonEmptyRange::read(buf)?,
@@ -131,7 +137,8 @@ where
             height: u.arbitrary()?,
             timestamp: u.arbitrary()?,
             state_root: u.arbitrary()?,
-            state_sync_root: u.arbitrary()?,
+            state_ops_root: u.arbitrary()?,
+            state_ops_witness: u.arbitrary()?,
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
             transactions_range: u.arbitrary()?,
@@ -352,7 +359,12 @@ mod tests {
             height: 42,
             timestamp: 1000,
             state_root: sha256::Digest::EMPTY,
-            state_sync_root: sha256::Digest::EMPTY,
+            state_ops_root: sha256::Digest::EMPTY,
+            state_ops_witness: OpsRootWitness {
+                grafted_root: sha256::Digest::EMPTY,
+                pending_chunk_digest: Default::default(),
+                partial_chunk: None,
+            },
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),

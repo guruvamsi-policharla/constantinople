@@ -14,7 +14,7 @@ use commonware_storage::{
             operation::Operation as AnyOperation, unordered::Update as UnorderedUpdate,
             value::FixedEncoding,
         },
-        current::unordered::fixed,
+        current::{sync::Target as CurrentTarget, unordered::fixed},
         keyless::fixed as keyless_fixed,
         sync::compact::Target as CompactTarget,
     },
@@ -39,6 +39,7 @@ pub type TransactionHistoryDb<E, H, S> =
 pub type TransactionHistoryOperation<H> =
     keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
 
+pub type StateSyncTarget<D> = CurrentTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.

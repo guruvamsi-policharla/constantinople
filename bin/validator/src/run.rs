@@ -7,6 +7,7 @@ use crate::{
     },
     state_reader::StateDbReader,
 };
+use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
     Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
@@ -73,10 +74,10 @@ enum BlockUpdateReporter {
 impl Reporter for BlockUpdateReporter {
     type Activity = Update<EngineBlock<Sha256, PublicKey>>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         match self {
-            Self::Mempool(m) => m.report(activity).await,
-            Self::Indexer(i) => i.report(activity).await,
+            Self::Mempool(m) => m.report(activity),
+            Self::Indexer(i) => i.report(activity),
         }
     }
 }
@@ -261,7 +262,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .into_iter()
             .try_collect()
             .unwrap();
-        oracle.track(0, TrackedPeers::new(primary, secondary)).await;
+        oracle.track(0, TrackedPeers::new(primary, secondary));
 
         // TODO: Add reasonable RL
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);

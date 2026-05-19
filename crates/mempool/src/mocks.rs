@@ -1,6 +1,7 @@
 //! Mock transaction sources for tests.
 
 use crate::TransactionSource;
+use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
@@ -66,10 +67,11 @@ where
 {
     type Activity = Update<crate::SealedBlock<C, P, H>>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let Update::Block(_, acknowledgement) = activity {
             acknowledgement.acknowledge();
         }
+        Feedback::Ok
     }
 }
 
@@ -134,7 +136,12 @@ mod tests {
             height: 0,
             timestamp: 0,
             state_root: sha256::Digest::EMPTY,
-            state_sync_root: sha256::Digest::EMPTY,
+            state_ops_root: sha256::Digest::EMPTY,
+            state_ops_witness: commonware_storage::qmdb::current::proof::OpsRootWitness {
+                grafted_root: sha256::Digest::EMPTY,
+                pending_chunk_digest: Default::default(),
+                partial_chunk: None,
+            },
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),

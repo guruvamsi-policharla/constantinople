@@ -1,16 +1,15 @@
 //! `commonware_glue::stateful` trait integration.
 
 use super::{Application, db::Databases, genesis_block, history::header_range_to_target};
-use commonware_consensus::marshal::ancestry::{AncestorStream, BlockProvider};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
-use commonware_storage::{mmr, qmdb::sync::Target, translator::EightCap};
+use commonware_storage::{mmr, qmdb::current::sync::Target as CurrentTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use rand::Rng;
 use rand_core::CryptoRngCore;
 
@@ -35,13 +34,15 @@ where
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
-            Target {
-                root: block.header.state_sync_root,
-                range: non_empty_range!(
+            CurrentTarget::new(
+                block.header.state_root,
+                block.header.state_ops_root,
+                block.header.state_ops_witness.clone(),
+                non_empty_range!(
                     mmr::Location::new(block.header.state_range.start()),
                     mmr::Location::new(block.header.state_range.end())
                 ),
-            },
+            ),
             header_range_to_target(
                 block.header.transactions_root,
                 block.header.transactions_range.clone(),
@@ -54,30 +55,30 @@ where
             &mut H::default(),
             self.genesis_leader.clone(),
             0,
-            self.genesis_state_root,
-            self.genesis_state_sync_root,
-            self.genesis_state_range.clone(),
+            self.genesis_state_target.clone(),
             self.genesis_transactions_target.clone(),
         )
     }
 
-    async fn propose<A: BlockProvider<Block = Self::Block>>(
+    async fn propose(
         &mut self,
         context: (E, Self::Context),
-        mut ancestry: AncestorStream<A, Self::Block>,
+        ancestry: impl Stream<Item = Self::Block> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
+        let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
         self.propose_child(context, &parent, batches, input).await
     }
 
-    async fn verify<A: BlockProvider<Block = Self::Block>>(
+    async fn verify(
         &mut self,
         context: (E, Self::Context),
-        mut ancestry: AncestorStream<A, Self::Block>,
+        ancestry: impl Stream<Item = Self::Block> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
+        let mut ancestry = Box::pin(ancestry);
         let block = ancestry.next().await?;
         let parent = ancestry.next().await?;
         self.verify_child(context, block, &parent, batches).await

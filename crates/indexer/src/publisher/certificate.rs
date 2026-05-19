@@ -16,6 +16,7 @@ use crate::{
     keys,
     publisher::{UploadBatch, dispatch_batch},
 };
+use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
     Reporter,
@@ -60,7 +61,7 @@ where
 {
     type Activity = Activity<S, D>;
 
-    async fn report(&mut self, activity: Self::Activity) {
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
             Activity::Notarization(notarization) => {
                 let view = notarization.round().view().get();
@@ -90,5 +91,6 @@ where
             // are not indexed.
             _ => {}
         }
+        Feedback::Ok
     }
 }

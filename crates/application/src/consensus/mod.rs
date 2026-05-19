@@ -26,8 +26,8 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, STATE_BITMAP_CHUNK_BYTES, StateDatabase, TransactionDatabase, TransactionHistoryDb,
-    TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, STATE_BITMAP_CHUNK_BYTES, StateDatabase, StateSyncTarget, TransactionDatabase,
+    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use genesis::genesis_block;
 
@@ -63,9 +63,7 @@ where
     hash_strategy: HashSt,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
-    genesis_state_root: H::Digest,
-    genesis_state_sync_root: H::Digest,
-    genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
+    genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     prune_cadence_blocks: NonZeroU64,
     finalized_pruner: FinalizedPruneFn,
@@ -90,9 +88,7 @@ where
             hash_strategy: self.hash_strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
-            genesis_state_root: self.genesis_state_root,
-            genesis_state_sync_root: self.genesis_state_sync_root,
-            genesis_state_range: self.genesis_state_range.clone(),
+            genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             prune_cadence_blocks: self.prune_cadence_blocks,
             finalized_pruner: self.finalized_pruner.clone(),
@@ -122,9 +118,7 @@ where
         hash_strategy: HashSt,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
-        genesis_state_root: H::Digest,
-        genesis_state_sync_root: H::Digest,
-        genesis_state_range: commonware_utils::range::NonEmptyRange<u64>,
+        genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         prune_cadence_blocks: NonZeroU64,
         finalized_pruner: FinalizedPruneFn,
@@ -140,9 +134,7 @@ where
             hash_strategy,
             genesis_leader,
             transaction_namespace,
-            genesis_state_root,
-            genesis_state_sync_root,
-            genesis_state_range,
+            genesis_state_target,
             genesis_transactions_target,
             prune_cadence_blocks,
             finalized_pruner,
