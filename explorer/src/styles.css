@@ -87,15 +87,8 @@ body {
     min-height: 0;
 }
 
-/*
- * Centered max-width container so header, summary, histogram and table all
- * align to the same gutters regardless of viewport width. The histogram's
- * responsive column count (see App.tsx) keys off the chart's clientWidth, so
- * everything visually scales together up to this max-width.
- */
 .app__container {
     width: 100%;
-    max-width: 1400px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
@@ -251,36 +244,65 @@ body {
 
 .app__main {
     flex: 1 1 auto;
-    overflow: auto;
-    padding: 1ch 2ch 4ch;
+    overflow: hidden;
 }
 
-.summary {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 3ch;
-    padding: 1ch 2ch;
-    border-bottom: 1px solid var(--theme-border);
-    align-items: flex-end;
+.app__main--minimal {
+    display: grid;
+    place-items: center;
+    padding: clamp(3rem, 6vw, 7rem) clamp(1.25rem, 4vw, 5rem);
 }
 
-.summary__stat {
+.explorer-stage {
+    width: min(1180px, 100%);
+    min-height: min(68vh, 720px);
+    display: grid;
+    grid-template-rows: minmax(240px, 1fr) auto;
+    gap: clamp(2rem, 4vw, 4rem);
+    align-items: center;
+}
+
+.histogram {
+    width: max-content;
+    max-width: 100%;
+    height: clamp(260px, 54vh, 560px);
+    margin: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.3ch;
-    min-width: 0;
+    justify-content: flex-end;
+    padding: 0 0 clamp(0.75rem, 1.4vw, 1.5rem);
+    border-bottom: 1px solid var(--theme-border);
+    font-family: var(--font-family-mono);
+    font-size: 9px;
+    line-height: 1;
+    letter-spacing: 0;
+    overflow: hidden;
+    white-space: pre;
+    justify-self: center;
 }
 
-.summary__label {
+.histogram__line {
+    display: block;
+}
+
+.observed-rate {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.35rem;
+    text-align: center;
+}
+
+.observed-rate__value {
+    color: var(--theme-text);
+    font-size: 6rem;
+    line-height: 0.9;
+}
+
+.observed-rate__label {
     color: var(--theme-text-dim);
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    font-size: 0.85em;
-}
-
-.summary__value {
-    color: var(--theme-text);
-    font-size: 1em;
 }
 
 .wallet,
@@ -619,138 +641,25 @@ body {
     display: block;
 }
 
-.histogram {
-    border-bottom: 1px solid var(--theme-border);
-    padding: 1ch 2ch 1ch;
-    display: grid;
-    grid-template-columns: auto 1fr;
-    grid-template-rows: auto auto;
-    column-gap: 1ch;
-    row-gap: 0.4ch;
-}
-
-.histogram__y-axis {
-    grid-column: 1;
-    grid-row: 1;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    align-items: flex-end;
-    color: var(--theme-text-dim);
-    font-size: 0.85em;
-}
-
-.histogram__chart {
-    grid-column: 2;
-    grid-row: 1;
-    margin: 0;
-    width: 100%;
-    color: var(--theme-accent);
-    font-family: var(--font-family-mono);
-    line-height: 1;
-    letter-spacing: 0;
-    white-space: pre;
-    border-left: 1px solid var(--theme-border);
-    padding-left: 1ch;
-    overflow: hidden;
-    position: relative;
-}
-
-/*
- * Hidden 1ch ruler used by the Histogram component to convert the chart's
- * pixel width into a column count. Stays inside the chart so it inherits
- * the exact same font metrics, but doesn't take any layout space.
- */
-.histogram__measure {
-    position: absolute;
-    visibility: hidden;
-    pointer-events: none;
-    white-space: pre;
-    top: 0;
-    left: 0;
-}
-
-.histogram__caption {
-    grid-column: 2;
-    grid-row: 2;
-    color: var(--theme-text-dim);
-    font-size: 0.85em;
-    padding-left: 1ch;
-}
-
-.block-table {
-    width: 100%;
-    border-collapse: collapse;
-    table-layout: fixed;
-}
-
-.block-table th,
-.block-table td {
-    text-align: left;
-    padding: 0.6ch 1ch;
-    border-bottom: 1px solid var(--theme-border);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.block-table th {
-    color: var(--theme-text-dim);
-    font-weight: 400;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-size: 0.85em;
-    position: sticky;
-    top: 0;
-    background: var(--theme-background);
-}
-
-.block-table tbody tr:nth-child(even) {
-    background: var(--theme-row-alt);
-}
-
-.block-table tbody tr:hover {
-    background: var(--theme-row-hover);
-}
-
-.block-table tbody tr.is-fresh {
-    animation: flash 700ms ease-out;
-}
-
-@keyframes flash {
-    from {
-        background: rgba(255, 178, 0, 0.18);
-    }
-    to {
-        background: transparent;
-    }
-}
-
-.col-height {
-    width: 14ch;
-}
-
-.col-txs {
-    width: 12ch;
-    text-align: right;
-}
-
-.col-cert {
-    width: 8ch;
-}
-
-.col-time {
-    width: 16ch;
-    color: var(--theme-text-dim);
-}
-
-.empty {
-    padding: 4ch 2ch;
-    color: var(--theme-text-dim);
-    text-align: center;
-}
-
 @media (max-width: 760px) {
+    .app__main--minimal {
+        padding: 2rem 1rem;
+    }
+
+    .explorer-stage {
+        min-height: min(62vh, 560px);
+        grid-template-rows: minmax(180px, 1fr) auto;
+    }
+
+    .histogram {
+        height: clamp(200px, 48vh, 420px);
+        font-size: 5px;
+    }
+
+    .observed-rate__value {
+        font-size: 3.5rem;
+    }
+
     .wallet__grid {
         grid-template-columns: 1fr;
     }

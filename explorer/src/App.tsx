@@ -1,16 +1,17 @@
-import { memo, startTransition, useEffect, useMemo, useRef, useState } from 'react';
+import {
+    memo,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type CSSProperties,
+} from 'react';
 import {
     encodeSignedTransaction,
     encodeTransactionBatch,
     parsePublicKeyHex,
     parseU64,
 } from './codec';
-import {
-    configureCertificateVerification,
-    subscribeCertificateVerification,
-    watchBlockCertificates,
-} from './certificateClient';
-import type { CertificateWorkerResult } from './certificateWorkerTypes';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
@@ -31,20 +32,9 @@ import {
     type ActiveWallet,
 } from './wallet';
 
-/** Most recent batches to keep in the live feed. Old entries fall off the table. */
-const MAX_ROWS = 200;
-/** Height (rows) of the throughput histogram at the top of the page. */
-const HISTOGRAM_HEIGHT = 8;
-/**
- * Upper bound on the responsive histogram column count. We measure the
- * container width and divide by 1ch to derive the actual column count, but
- * keep an absolute ceiling so each column still represents a meaningful
- * slice of recent history on ultra-wide displays.
- */
-const HISTOGRAM_MAX_COLUMNS = 400;
-/** Initial column count used before the ResizeObserver fires its first measurement. */
-const HISTOGRAM_INITIAL_COLUMNS = 80;
-/** 8-step unicode block ramp; index 0 is empty so unused cells stay blank. */
+/** Most recent finalized blocks to keep for the centered throughput histogram. */
+const HISTOGRAM_COLUMNS = 180;
+const HISTOGRAM_HEIGHT = 36;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_STATUS_TEXT = '>>> live';
@@ -52,8 +42,6 @@ const LIVE_STATUS_STAGGER_MS = 50;
 const LIVE_STATUS_BLANK_MS = 100;
 const LIVE_STATUS_PAUSE_MS = 550;
 const BLOCK_FLUSH_INTERVAL_MS = 50;
-const CERTIFICATE_FLUSH_INTERVAL_MS = 250;
-const MAX_CERTIFICATE_CACHE = 1_000;
 
 type Status =
     | { kind: 'connecting' }
@@ -135,26 +123,17 @@ interface ObservedRateWindow {
     readonly latestBlockAt: number | null;
 }
 
-type BlockCertificateByHeight = Record<string, BlockCertificateState>;
-
-interface CertificateUpdate {
-    readonly height: number;
-    readonly certificate: BlockCertificateState;
-}
-
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
-    // Cumulative counters across every block we've ever observed on the
-    // stream. Tracked independently of `blocks` so the "observed" stats
-    // keep climbing when older entries roll off the MAX_ROWS buffer.
-    const [blocksObserved, setBlocksObserved] = useState(0);
+    // Cumulative counter across every block observed on the stream. Tracked
+    // independently of `blocks` so the rate keeps climbing when older entries
+    // roll off the histogram buffer.
     const [totalTxObserved, setTotalTxObserved] = useState(0);
     const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
         firstBlockAt: null,
         latestBlockAt: null,
     });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
-    const [blockCertificates, setBlockCertificates] = useState<BlockCertificateByHeight>({});
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
@@ -170,13 +149,6 @@ export default function App() {
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
-    const certificateCacheRef = useRef<BlockCertificateByHeight>({});
-    const certificateCacheOrderRef = useRef<string[]>([]);
-    const visibleBlockHeightsRef = useRef<Set<string>>(new Set());
-    const historyFinalizedHeightsRef = useRef<Set<number>>(new Set());
-    const pendingCertificatesRef = useRef<CertificateUpdate[]>([]);
-    const certificateFlushTimeoutRef = useRef<number | null>(null);
-    const requestedCertificateHeightsRef = useRef<Set<number>>(new Set());
     const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
@@ -185,20 +157,6 @@ export default function App() {
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
-
-    const watchCertificatesForBlocks = (blocks: Iterable<ObservedBlock>) => {
-        if (!verifyCertificates) return;
-
-        const next: { height: number; digest: Uint8Array }[] = [];
-        for (const block of blocks) {
-            const height = Number(block.height);
-            if (!Number.isSafeInteger(height) || height < 0) continue;
-            if (requestedCertificateHeightsRef.current.has(height)) continue;
-            requestedCertificateHeightsRef.current.add(height);
-            next.push({ height, digest: block.digest });
-        }
-        watchBlockCertificates(next);
-    };
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
@@ -212,15 +170,7 @@ export default function App() {
             pendingBlocksRef.current = [];
             if (flushed.length === 0) return;
 
-            watchCertificatesForBlocks(flushed);
-            setBlocks((current) => {
-                const next = upsertBoundedBatch(flushed, current);
-                visibleBlockHeightsRef.current = new Set(
-                    next.map((block) => block.height.toString()),
-                );
-                return next;
-            });
-            setBlocksObserved((current) => current + flushed.length);
+            setBlocks((current) => upsertBoundedBatch(flushed, current));
             setTotalTxObserved(
                 (current) =>
                     current + flushed.reduce((total, block) => total + block.txCount, 0),
@@ -232,98 +182,6 @@ export default function App() {
             setStatus({ kind: 'live' });
         }, BLOCK_FLUSH_INTERVAL_MS);
     };
-
-    const queueCertificateUpdate = (update: CertificateUpdate) => {
-        rememberCertificate(update);
-        if (!visibleBlockHeightsRef.current.has(String(update.height))) {
-            return;
-        }
-
-        pendingCertificatesRef.current.push(update);
-        if (certificateFlushTimeoutRef.current !== null) return;
-
-        certificateFlushTimeoutRef.current = window.setTimeout(() => {
-            certificateFlushTimeoutRef.current = null;
-            const flushed = pendingCertificatesRef.current;
-            pendingCertificatesRef.current = [];
-            if (flushed.length === 0) return;
-
-            startTransition(() =>
-                setBlockCertificates((current) => applyCertificateUpdates(current, flushed)),
-            );
-        }, CERTIFICATE_FLUSH_INTERVAL_MS);
-    };
-
-    const rememberCertificate = (update: CertificateUpdate) => {
-        const key = String(update.height);
-        if (!Object.prototype.hasOwnProperty.call(certificateCacheRef.current, key)) {
-            certificateCacheOrderRef.current.push(key);
-        }
-        certificateCacheRef.current[key] = update.certificate;
-        pruneCertificateCache();
-    };
-
-    const pruneCertificateCache = () => {
-        let rotations = 0;
-        while (certificateCacheOrderRef.current.length > MAX_CERTIFICATE_CACHE) {
-            const key = certificateCacheOrderRef.current.shift();
-            if (key === undefined) return;
-            if (shouldKeepCachedCertificate(key)) {
-                certificateCacheOrderRef.current.push(key);
-                rotations++;
-                if (rotations >= certificateCacheOrderRef.current.length) return;
-                continue;
-            }
-            delete certificateCacheRef.current[key];
-            rotations = 0;
-        }
-    };
-
-    const shouldKeepCachedCertificate = (key: string) =>
-        visibleBlockHeightsRef.current.has(key) ||
-        historyFinalizedHeightsRef.current.has(Number(key));
-
-    const applyCertificateResult = (result: CertificateWorkerResult) => {
-        if (result.height === 0) return;
-
-        const certificate =
-            result.kind === 'verified'
-                ? ({
-                      status: 'verified',
-                      detail: `verified at height ${result.height}`,
-                      height: String(result.height),
-                      view: result.view,
-                  } satisfies BlockCertificateState)
-                : ({
-                      status: 'error',
-                      detail: result.detail,
-                  } satisfies BlockCertificateState);
-
-        queueCertificateUpdate({ height: result.height, certificate });
-        if (!historyFinalizedHeightsRef.current.has(result.height)) return;
-
-        setHistory((current) =>
-            updateBlockCertificateByHeight(result.height, certificate, current),
-        );
-    };
-
-    useEffect(() => {
-        if (!verifyCertificates) return;
-        configureCertificateVerification({
-            storeUrl,
-            simplexVerificationMaterial,
-        });
-    }, []);
-
-    useEffect(() => {
-        if (!verifyCertificates) return;
-        return subscribeCertificateVerification((response) => {
-            const results = response.kind === 'batch' ? response.results : [response];
-            for (const result of results) {
-                applyCertificateResult(result);
-            }
-        });
-    }, []);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -357,21 +215,7 @@ export default function App() {
 
     useEffect(() => {
         writeHistory(history);
-        historyFinalizedHeightsRef.current = finalizedHeights(history);
     }, [history]);
-
-    useEffect(() => {
-        visibleBlockHeightsRef.current = new Set(blocks.map((block) => block.height.toString()));
-        startTransition(() => {
-            setBlockCertificates((current) =>
-                projectVisibleCertificates(
-                    blocks,
-                    current,
-                    certificateCacheRef.current,
-                ),
-            );
-        });
-    }, [blocks]);
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
@@ -396,19 +240,11 @@ export default function App() {
         })
             .then((proof) => {
                 const certificate = verifiedBlockCertificateState(proof);
-                rememberCertificate({ height: Number(proof.height), certificate });
                 setHistory((current) =>
                     updateBlockCertificateByHeight(
                         Number(proof.height),
                         certificate,
                         updateTransactionProof(tx.digest, verifiedProofState(proof), current),
-                    ),
-                );
-                startTransition(() =>
-                    setBlockCertificates((current) =>
-                        applyCertificateUpdates(current, [
-                            { height: Number(proof.height), certificate },
-                        ]),
                     ),
                 );
             })
@@ -450,9 +286,6 @@ export default function App() {
         return () => {
             if (blockFlushTimeoutRef.current !== null) {
                 window.clearTimeout(blockFlushTimeoutRef.current);
-            }
-            if (certificateFlushTimeoutRef.current !== null) {
-                window.clearTimeout(certificateFlushTimeoutRef.current);
             }
             if (copiedValueTimeoutRef.current !== null) {
                 window.clearTimeout(copiedValueTimeoutRef.current);
@@ -616,7 +449,6 @@ export default function App() {
                         accepted,
                         'accepted by relayer',
                         current,
-                        certificateCacheRef.current,
                     ),
                 );
                 setSubmitMessage('accepted by relayer');
@@ -631,7 +463,6 @@ export default function App() {
                     txStatus,
                     detail,
                     current,
-                    certificateCacheRef.current,
                 ),
             );
             setSubmitMessage(detail);
@@ -660,19 +491,14 @@ export default function App() {
                         </button>
                     </div>
                 </header>
-                <SummaryPanel
-                    blocks={blocks}
-                    blocksObserved={blocksObserved}
-                    totalTxObserved={totalTxObserved}
-                    observedRateWindow={observedRateWindow}
-                />
-                <Histogram blocks={blocks} />
-                <main className="app__main">
-                    <BlockTable
-                        blocks={blocks}
-                        certificates={blockCertificates}
-                        verifyCertificates={verifyCertificates}
-                    />
+                <main className="app__main app__main--minimal">
+                    <section className="explorer-stage" aria-label="live transaction throughput">
+                        <Histogram blocks={blocks} />
+                        <ObservedTxRate
+                            observedRateWindow={observedRateWindow}
+                            totalTxObserved={totalTxObserved}
+                        />
+                    </section>
                 </main>
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
@@ -1171,8 +997,8 @@ function upsertBoundedBatch(
 
     const next = Array.from(byHeight.values());
     next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
-    if (next.length > MAX_ROWS) {
-        next.length = MAX_ROWS;
+    if (next.length > HISTOGRAM_COLUMNS) {
+        next.length = HISTOGRAM_COLUMNS;
     }
     return next;
 }
@@ -1181,88 +1007,6 @@ function compareBlockHeightDesc(a: bigint, b: bigint): number {
     if (a > b) return -1;
     if (a < b) return 1;
     return 0;
-}
-
-function blockCertificateForHeight(
-    height: bigint,
-    certificates: BlockCertificateByHeight,
-): BlockCertificateState {
-    return certificates[height.toString()] ?? defaultBlockCertificate(Number(height));
-}
-
-function pruneBlockCertificates(
-    blocks: ObservedBlock[],
-    certificates: BlockCertificateByHeight,
-): BlockCertificateByHeight {
-    const visibleHeights = new Set(blocks.map((block) => block.height.toString()));
-    const entries = Object.entries(certificates)
-        .filter(([height]) => visibleHeights.has(height))
-        .concat(recentCertificateEntries(certificates, visibleHeights));
-    if (entries.length === Object.keys(certificates).length) {
-        return certificates;
-    }
-    return Object.fromEntries(entries);
-}
-
-function recentCertificateEntries(
-    certificates: BlockCertificateByHeight,
-    visibleHeights: Set<string>,
-): [string, BlockCertificateState][] {
-    return Object.entries(certificates)
-        .filter(([height]) => !visibleHeights.has(height))
-        .sort(([a], [b]) => Number(b) - Number(a))
-        .slice(0, MAX_CERTIFICATE_CACHE);
-}
-
-function projectVisibleCertificates(
-    blocks: ObservedBlock[],
-    current: BlockCertificateByHeight,
-    cache: BlockCertificateByHeight,
-): BlockCertificateByHeight {
-    return pruneBlockCertificates(blocks, applyCachedVisibleCertificates(blocks, current, cache));
-}
-
-function applyCachedVisibleCertificates(
-    blocks: ObservedBlock[],
-    current: BlockCertificateByHeight,
-    cache: BlockCertificateByHeight,
-): BlockCertificateByHeight {
-    const updates: CertificateUpdate[] = [];
-    for (const block of blocks) {
-        const height = Number(block.height);
-        const certificate = cache[String(height)];
-        if (certificate) {
-            updates.push({ height, certificate });
-        }
-    }
-    return applyCertificateUpdates(current, updates);
-}
-
-function applyCertificateUpdates(
-    current: BlockCertificateByHeight,
-    updates: readonly CertificateUpdate[],
-): BlockCertificateByHeight {
-    let next = current;
-    for (const { height, certificate } of updates) {
-        const key = String(height);
-        const existing = next[key];
-        if (existing && sameBlockCertificate(existing, certificate)) continue;
-        if (next === current) {
-            next = { ...current };
-        }
-        next[key] = certificate;
-    }
-    return next;
-}
-
-function finalizedHeights(transactions: readonly SubmittedTransaction[]): Set<number> {
-    const heights = new Set<number>();
-    for (const tx of transactions) {
-        if (tx.finalizedHeight !== null) {
-            heights.add(tx.finalizedHeight);
-        }
-    }
-    return heights;
 }
 
 function prependTransaction(
@@ -1277,7 +1021,6 @@ function updateTransactionStatus(
     status: TxStatus,
     detail: string,
     current: SubmittedTransaction[],
-    certificates: BlockCertificateByHeight,
 ): SubmittedTransaction[] {
     return current.map((tx) => {
         if (tx.digest !== digest) return tx;
@@ -1291,8 +1034,7 @@ function updateTransactionStatus(
             certificate:
                 finalizedHeight === null
                     ? nextBlockCertificateState(status, tx.certificate)
-                    : certificates[String(finalizedHeight)] ??
-                      nextBlockCertificateState(status, tx.certificate),
+                    : nextBlockCertificateState(status, tx.certificate),
             proof: nextProofState(status, digest, tx.proof),
         };
     });
@@ -1666,64 +1408,22 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
     );
 }
 
-const SummaryPanel = memo(function SummaryPanel({
-    blocks,
-    blocksObserved,
+const ObservedTxRate = memo(function ObservedTxRate({
     totalTxObserved,
     observedRateWindow,
 }: {
-    blocks: ObservedBlock[];
-    blocksObserved: number;
     totalTxObserved: number;
     observedRateWindow: ObservedRateWindow;
 }) {
-    const stats = useMemo(() => computeStats(blocks), [blocks]);
-    const observedTxPerSecond = formatObservedTxPerSecond(totalTxObserved, observedRateWindow);
     return (
-        <section className="summary">
-            <Stat label="latest height" value={stats.latestHeight ?? '—'} />
-            <Stat label="blocks observed" value={blocksObserved.toLocaleString()} />
-            <Stat label="total txs observed" value={totalTxObserved.toLocaleString()} />
-            <Stat label="observed tx/sec" value={observedTxPerSecond} />
-            <Stat label="peak txs/block" value={stats.peakTx.toLocaleString()} />
-            <Stat label="avg txs/block" value={stats.avgTx.toLocaleString()} />
-        </section>
-    );
-});
-
-function Stat({ label, value }: { label: string; value: React.ReactNode }) {
-    return (
-        <div className="summary__stat">
-            <div className="summary__label">{label}</div>
-            <div className="summary__value">{value}</div>
+        <div className="observed-rate">
+            <div className="observed-rate__value">
+                {formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
+            </div>
+            <div className="observed-rate__label">observed tx/sec</div>
         </div>
     );
-}
-
-interface DerivedStats {
-    latestHeight: string | null;
-    peakTx: number;
-    avgTx: number;
-}
-
-function computeStats(blocks: ObservedBlock[]): DerivedStats {
-    if (blocks.length === 0) {
-        return { latestHeight: null, peakTx: 0, avgTx: 0 };
-    }
-    let totalTx = 0;
-    let peakTx = 0;
-    let maxHeight = blocks[0].height;
-    for (const block of blocks) {
-        totalTx += block.txCount;
-        if (block.txCount > peakTx) peakTx = block.txCount;
-        if (block.height > maxHeight) maxHeight = block.height;
-    }
-    return {
-        latestHeight: maxHeight.toString(),
-        peakTx,
-        avgTx: Math.round(totalTx / blocks.length),
-    };
-}
+});
 
 function formatObservedTxPerSecond(
     totalTxObserved: number,
@@ -1747,201 +1447,69 @@ function formatObservedTxPerSecond(
     });
 }
 
-/**
- * ASCII histogram of `txCount` for the most recent blocks. Each column is
- * one block (oldest left → newest right) and uses an 8-step vertical block
- * ramp so a column can be partially filled with sub-row resolution.
- *
- * The column count is responsive: we measure 1ch in the chart's font via a
- * hidden `<span>x</span>` and divide the chart's content width by it on
- * mount and on every resize, so the histogram always fills the available
- * width without changing the monospace cell aesthetic.
- *
- * The y-axis is auto-scaled to the peak in the visible window so a quiet
- * stretch of empty blocks doesn't compress later activity into the baseline.
- */
 const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
-    const chartRef = useRef<HTMLPreElement>(null);
-    const measureRef = useRef<HTMLSpanElement>(null);
-    const [columns, setColumns] = useState<number>(HISTOGRAM_INITIAL_COLUMNS);
-
-    useEffect(() => {
-        const chart = chartRef.current;
-        const measure = measureRef.current;
-        if (!chart || !measure) return;
-
-        const recompute = () => {
-            const chWidth = measure.getBoundingClientRect().width;
-            if (chWidth <= 0) return;
-            const style = window.getComputedStyle(chart);
-            const padLeft = parseFloat(style.paddingLeft) || 0;
-            const padRight = parseFloat(style.paddingRight) || 0;
-            const contentWidth = chart.clientWidth - padLeft - padRight;
-            if (contentWidth <= 0) return;
-            const cols = Math.max(
-                1,
-                Math.min(HISTOGRAM_MAX_COLUMNS, Math.floor(contentWidth / chWidth)),
-            );
-            setColumns((prev) => (prev === cols ? prev : cols));
-        };
-
-        recompute();
-        const observer = new ResizeObserver(recompute);
-        observer.observe(chart);
-        return () => observer.disconnect();
-    }, []);
-
-    const { lines, peak } = useMemo(
-        () => buildHistogram(blocks, columns),
-        [blocks, columns],
-    );
+    const lines = useMemo(() => buildHistogram(blocks), [blocks]);
     return (
-        <section className="histogram">
-            <div className="histogram__y-axis">
-                <span>{peak > 0 ? peak.toLocaleString() : ''}</span>
-                <span>0</span>
-            </div>
-            <pre
-                ref={chartRef}
-                className="histogram__chart"
-                aria-label="recent block tx count histogram"
-            >
-                <span ref={measureRef} className="histogram__measure" aria-hidden="true">
-                    x
+        <pre className="histogram" aria-label="recent block transaction count histogram">
+            {lines.map((line, index) => (
+                <span
+                    className="histogram__line"
+                    key={index}
+                    style={histogramLineStyle(index)}
+                >
+                    {line}
                 </span>
-                {lines.join('\n')}
-            </pre>
-            <div className="histogram__caption">
-                tx count per block · last {Math.min(blocks.length, columns)} blocks ·
-                oldest → newest
-            </div>
-        </section>
+            ))}
+        </pre>
     );
 });
 
-function buildHistogram(
-    blocks: ObservedBlock[],
-    width: number,
-): { lines: string[]; peak: number } {
-    // Newest-first → oldest-first so the histogram reads left=old, right=new.
-    const recent = blocks.slice(0, width).reverse();
+function buildHistogram(blocks: ObservedBlock[]): string[] {
+    const recent = blocks.slice(0, HISTOGRAM_COLUMNS).reverse();
     let peak = 0;
     for (const block of recent) {
         if (block.txCount > peak) peak = block.txCount;
     }
+
     if (peak === 0) {
-        const blank = ' '.repeat(width);
-        return { lines: Array.from({ length: HISTOGRAM_HEIGHT }, () => blank), peak };
+        const blank = ' '.repeat(HISTOGRAM_COLUMNS);
+        return Array.from({ length: HISTOGRAM_HEIGHT }, () => blank);
     }
 
-    // Total fill in 1/8th steps for the entire HISTOGRAM_HEIGHT-tall column.
-    const ramp = BLOCK_GLYPHS.length - 1; // 8
-    const eighthsPerColumn = HISTOGRAM_HEIGHT * ramp;
-
-    const columnEighths = recent.map((block) =>
-        Math.min(eighthsPerColumn, Math.max(1, Math.round((block.txCount / peak) * eighthsPerColumn))),
-    );
-    // Pad the left side with empty columns when we don't have enough history.
-    while (columnEighths.length < width) {
-        columnEighths.unshift(0);
+    const ramp = BLOCK_GLYPHS.length - 1;
+    const stepsPerColumn = HISTOGRAM_HEIGHT * ramp;
+    const columnSteps = recent.map((block) => {
+        const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
+        return Math.min(stepsPerColumn, Math.max(1, scaledSteps));
+    });
+    while (columnSteps.length < HISTOGRAM_COLUMNS) {
+        columnSteps.unshift(0);
     }
 
-    // Render top-to-bottom. For each row (top=0, bottom=HEIGHT-1), the slot
-    // for column j gets the 1/8 step left after subtracting the rows below it.
     const lines: string[] = [];
     for (let row = 0; row < HISTOGRAM_HEIGHT; row++) {
         const rowsBelow = HISTOGRAM_HEIGHT - 1 - row;
         let line = '';
-        for (const eighths of columnEighths) {
-            const remainingForThisRow = Math.max(0, Math.min(ramp, eighths - rowsBelow * ramp));
-            line += BLOCK_GLYPHS[remainingForThisRow];
+        for (const steps of columnSteps) {
+            const glyphIndex = Math.max(0, Math.min(ramp, steps - rowsBelow * ramp));
+            line += BLOCK_GLYPHS[glyphIndex];
         }
         lines.push(line);
     }
-    return { lines, peak };
+    return lines;
 }
 
-const BlockTable = memo(function BlockTable({
-    blocks,
-    certificates,
-    verifyCertificates,
-}: {
-    blocks: ObservedBlock[];
-    certificates: BlockCertificateByHeight;
-    verifyCertificates: boolean;
-}) {
-    const formatter = useMemo(
-        () =>
-            new Intl.DateTimeFormat(undefined, {
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                fractionalSecondDigits: 3,
-            }),
-        [],
-    );
+function histogramLineStyle(rowIndex: number): CSSProperties {
+    const ratio = 1 - rowIndex / Math.max(1, HISTOGRAM_HEIGHT - 1);
+    return { color: histogramLineColor(ratio) };
+}
 
-    if (blocks.length === 0) {
-        return (
-            <div className="empty">
-                waiting for blocks… (start the spammer to see them stream in)
-            </div>
-        );
-    }
-    return (
-        <table className="block-table">
-            <thead>
-                <tr>
-                    <th className="col-height">height</th>
-                    <th className="col-txs">txs</th>
-                    <th className="col-cert">cert</th>
-                    <th className="col-time">arrived</th>
-                </tr>
-            </thead>
-            <tbody>
-                {blocks.map((block, index) => {
-                    const height = block.height.toString();
-                    return (
-                        <BlockRow
-                            key={height}
-                            block={block}
-                            certificate={blockCertificateForHeight(block.height, certificates)}
-                            formatter={formatter}
-                            isFresh={index === 0}
-                            verifyCertificates={verifyCertificates}
-                        />
-                    );
-                })}
-            </tbody>
-        </table>
+function histogramLineColor(ratio: number): string {
+    const start = [14, 15, 16];
+    const end = [255, 178, 0];
+    const mix = Math.max(0, Math.min(1, ratio));
+    const channels = start.map((value, index) =>
+        Math.round(value + (end[index] - value) * mix),
     );
-});
-
-const BlockRow = memo(function BlockRow({
-    block,
-    certificate,
-    formatter,
-    isFresh,
-    verifyCertificates,
-}: {
-    block: ObservedBlock;
-    certificate: BlockCertificateState;
-    formatter: Intl.DateTimeFormat;
-    isFresh: boolean;
-    verifyCertificates: boolean;
-}) {
-    return (
-        <tr className={isFresh ? 'is-fresh' : undefined}>
-            <td className="col-height">{block.height.toString()}</td>
-            <td className="col-txs">{block.txCount.toLocaleString()}</td>
-            <td className="col-cert">
-                <CertificateCell
-                    certificate={certificate}
-                    finalizedHeight={Number(block.height)}
-                    verifyCertificates={verifyCertificates}
-                />
-            </td>
-            <td className="col-time">{formatter.format(block.arrivedAt)}</td>
-        </tr>
-    );
-});
+    return `rgb(${channels[0]}, ${channels[1]}, ${channels[2]})`;
+}
