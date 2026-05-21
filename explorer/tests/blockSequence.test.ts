@@ -60,6 +60,15 @@ test('live collection does not wait for missing heights', () => {
     assert.equal(cursor.latestHeight, 9n);
 });
 
+test('live cursor keeps duplicate tracking bounded', () => {
+    const cursor = createBlockSequenceCursor(3);
+
+    collectLiveBlocks(cursor, [block(1n), block(2n), block(3n), block(4n)]);
+
+    assert.equal(cursor.seenHeights.size, 3);
+    assert.deepEqual(Array.from(cursor.seenHeights), ['2', '3', '4']);
+});
+
 function block(height: bigint): TestBlock {
     return {
         height,
