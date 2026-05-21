@@ -1,4 +1,5 @@
-import { SimplexClient, SimplexRecordKind } from '@exowarexyz/simplex';
+import { Client as ExowareClient, type StoreClient } from '@exowarexyz/sdk';
+import { finalizedByHeightKey } from '@exowarexyz/simplex';
 import initCrypto, { verifyBlockCertificate } from './crypto-wasm/constantinople_explorer_crypto';
 import type {
     CertificateWorkerRequest,
@@ -6,10 +7,9 @@ import type {
     WatchedBlockCertificate,
 } from './certificateWorkerTypes';
 
-const STREAM_RETRY_DELAY_MS = 1_000;
-const FINALIZATION_FETCH_RETRY_DELAY_MS = 1_000;
-const FINALIZATION_FETCH_CONCURRENCY = 4;
-const RAW_CACHE_LIMIT = 4_096;
+const FETCH_BATCH_SIZE = 32;
+const FETCH_DEBOUNCE_MS = 25;
+const FETCH_RETRY_DELAY_MS = 1_000;
 
 interface CertificateWorkerConfig {
     readonly storeUrl: string;
@@ -22,17 +22,13 @@ interface FinalizedTransactionTarget {
 
 const wanted = new Map<number, Uint8Array>();
 const verified = new Set<number>();
-const queued = new Set<number>();
-const rawByHeight = new Map<number, Uint8Array>();
-const pendingFetches = new Set<number>();
-const inFlightFetches = new Set<number>();
-const verifyQueue: number[] = [];
+const queuedFetches = new Set<number>();
+const fetchQueue: number[] = [];
 let cryptoReady: Promise<unknown> | null = null;
 let config: CertificateWorkerConfig | null = null;
-let streamController: AbortController | null = null;
-let streamRetryTimer: number | null = null;
+let store: StoreClient | null = null;
 let fetchTimer: number | null = null;
-let verifying = false;
+let fetching = false;
 
 const workerScope = self as unknown as {
     onmessage: ((event: MessageEvent<CertificateWorkerRequest>) => void) | null;
@@ -56,26 +52,17 @@ workerScope.onmessage = (event) => {
 
 function configure(nextConfig: CertificateWorkerConfig) {
     config = nextConfig;
+    store = new ExowareClient(trimTrailingSlash(nextConfig.storeUrl)).store();
     wanted.clear();
     verified.clear();
-    queued.clear();
-    rawByHeight.clear();
-    pendingFetches.clear();
-    inFlightFetches.clear();
-    verifyQueue.length = 0;
-    verifying = false;
+    queuedFetches.clear();
+    fetchQueue.length = 0;
+    fetching = false;
 
-    streamController?.abort();
-    streamController = null;
-    if (streamRetryTimer !== null) {
-        workerScope.clearTimeout(streamRetryTimer);
-        streamRetryTimer = null;
-    }
     if (fetchTimer !== null) {
         workerScope.clearTimeout(fetchTimer);
         fetchTimer = null;
     }
-    startStream(nextConfig);
 }
 
 function watchBlocks(blocks: readonly WatchedBlockCertificate[]) {
@@ -84,166 +71,100 @@ function watchBlocks(blocks: readonly WatchedBlockCertificate[]) {
         if (!Number.isSafeInteger(height) || height < 0 || digest.length !== 32) continue;
         if (verified.has(height)) continue;
         wanted.set(height, digest);
-        if (rawByHeight.has(height)) {
-            enqueueVerification(height);
-        } else {
-            scheduleFinalizationFetch(height, 0);
-        }
-    }
-    scheduleVerification();
-}
-
-function startStream(activeConfig: CertificateWorkerConfig) {
-    streamController = new AbortController();
-    void runStream(activeConfig, streamController.signal);
-}
-
-async function runStream(activeConfig: CertificateWorkerConfig, signal: AbortSignal) {
-    try {
-        await loadCrypto();
-        const simplex = new SimplexClient(trimTrailingSlash(activeConfig.storeUrl));
-        for await (const batch of simplex.subscribeRaw(
-            SimplexRecordKind.FinalizedByHeight,
-            {},
-            { signal },
-        )) {
-            for (const entry of batch.entries) {
-                if (entry.type !== 'finalization' || entry.index !== 'height') continue;
-                const height = Number(entry.height);
-                if (!Number.isSafeInteger(height) || height < 0 || verified.has(height)) continue;
-                rememberRawFinalization(height, entry.finalized);
-                if (wanted.has(height)) {
-                    pendingFetches.delete(height);
-                    enqueueVerification(height);
-                }
-            }
-            scheduleVerification();
-        }
-        if (!signal.aborted) {
-            scheduleStreamRetry(activeConfig);
-        }
-    } catch (error) {
-        if (signal.aborted) return;
-        const detail = error instanceof Error ? error.message : String(error);
-        if (!isRetryableCertificateError(detail)) {
-            workerScope.postMessage({ kind: 'error', height: 0, detail });
-            return;
-        }
-        scheduleStreamRetry(activeConfig);
+        enqueueFetch(height);
     }
 }
 
-function rememberRawFinalization(height: number, finalized: Uint8Array) {
-    rawByHeight.set(height, finalized);
-    while (rawByHeight.size > RAW_CACHE_LIMIT) {
-        let evicted = false;
-        for (const cachedHeight of rawByHeight.keys()) {
-            if (wanted.has(cachedHeight) && !verified.has(cachedHeight)) continue;
-            rawByHeight.delete(cachedHeight);
-            evicted = true;
-            break;
-        }
-        if (!evicted) return;
-    }
+function enqueueFetch(height: number) {
+    if (verified.has(height) || queuedFetches.has(height)) return;
+    queuedFetches.add(height);
+    fetchQueue.push(height);
+    scheduleFetch(FETCH_DEBOUNCE_MS);
 }
 
-function enqueueVerification(height: number) {
-    if (verified.has(height) || queued.has(height)) return;
-    queued.add(height);
-    verifyQueue.push(height);
-}
-
-function scheduleFinalizationFetch(height: number, delayMs: number) {
-    if (verified.has(height) || rawByHeight.has(height) || inFlightFetches.has(height)) return;
-    pendingFetches.add(height);
-    scheduleFetchPump(delayMs);
-}
-
-function scheduleFetchPump(delayMs: number) {
-    if (fetchTimer !== null) return;
+function scheduleFetch(delayMs: number) {
+    if (fetching || fetchTimer !== null) return;
     fetchTimer = workerScope.setTimeout(() => {
         fetchTimer = null;
-        pumpFinalizationFetches();
+        void processFetchQueue();
     }, delayMs);
 }
 
-function pumpFinalizationFetches() {
+async function processFetchQueue() {
     const activeConfig = config;
-    if (!activeConfig) return;
+    const activeStore = store;
+    if (!activeConfig || !activeStore || fetching) return;
 
-    while (
-        inFlightFetches.size < FINALIZATION_FETCH_CONCURRENCY &&
-        pendingFetches.size > 0
-    ) {
-        const height = pendingFetches.values().next().value;
-        if (height === undefined) return;
-        pendingFetches.delete(height);
-        if (!wanted.has(height) || verified.has(height) || rawByHeight.has(height)) continue;
-
-        inFlightFetches.add(height);
-        void fetchFinalizationByHeight(activeConfig, height).finally(() => {
-            inFlightFetches.delete(height);
-            if (pendingFetches.size > 0) {
-                scheduleFetchPump(0);
-            }
-        });
+    fetching = true;
+    try {
+        await loadCrypto();
+        while (config === activeConfig && store === activeStore && fetchQueue.length > 0) {
+            const heights = takeFetchBatch();
+            if (heights.length === 0) continue;
+            await fetchAndVerifyBatch(activeConfig, activeStore, heights);
+            await yieldToWorker();
+        }
+    } finally {
+        fetching = false;
+        if (fetchQueue.length > 0) {
+            scheduleFetch(0);
+        }
     }
 }
 
-async function fetchFinalizationByHeight(activeConfig: CertificateWorkerConfig, height: number) {
-    if (config !== activeConfig || !wanted.has(height) || verified.has(height)) return;
+function takeFetchBatch(): number[] {
+    const heights: number[] = [];
+    while (heights.length < FETCH_BATCH_SIZE) {
+        const height = fetchQueue.shift();
+        if (height === undefined) break;
+        queuedFetches.delete(height);
+        if (!wanted.has(height) || verified.has(height)) continue;
+        heights.push(height);
+    }
+    return heights;
+}
+
+async function fetchAndVerifyBatch(
+    activeConfig: CertificateWorkerConfig,
+    activeStore: StoreClient,
+    heights: readonly number[],
+) {
+    const keys = heights.map(finalizedByHeightKey);
 
     try {
-        const simplex = new SimplexClient(trimTrailingSlash(activeConfig.storeUrl));
-        const finalized = await simplex.getFinalizationByHeightRaw(String(height));
-        if (!finalized) {
-            retryFinalizationFetch(activeConfig, height);
-            return;
+        const results = await activeStore.getMany(keys, FETCH_BATCH_SIZE);
+        const byKey = new Map(results.map((result) => [bytesKey(result.key), result.value]));
+        for (let index = 0; index < heights.length; index++) {
+            const height = heights[index];
+            const finalized = byKey.get(bytesKey(keys[index]));
+            if (!finalized) {
+                retryFetch(height);
+                continue;
+            }
+            verifyFetchedFinalization(activeConfig, height, finalized);
         }
-
-        rememberRawFinalization(height, finalized);
-        enqueueVerification(height);
-        scheduleVerification();
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         if (isRetryableCertificateError(detail)) {
-            retryFinalizationFetch(activeConfig, height);
+            for (const height of heights) {
+                retryFetch(height);
+            }
             return;
         }
-        wanted.delete(height);
-        workerScope.postMessage({ kind: 'error', height, detail });
+        for (const height of heights) {
+            wanted.delete(height);
+            workerScope.postMessage({ kind: 'error', height, detail });
+        }
     }
 }
 
-function retryFinalizationFetch(activeConfig: CertificateWorkerConfig, height: number) {
-    if (config !== activeConfig || !wanted.has(height) || verified.has(height)) return;
-    scheduleFinalizationFetch(height, FINALIZATION_FETCH_RETRY_DELAY_MS);
-}
-
-function scheduleVerification() {
-    if (verifying) return;
-    verifying = true;
-    void processVerificationQueue();
-}
-
-async function processVerificationQueue() {
-    for (;;) {
-        const height = verifyQueue.shift();
-        if (height === undefined) {
-            verifying = false;
-            return;
-        }
-        queued.delete(height);
-        await verifyHeight(height);
-        await yieldToWorker();
-    }
-}
-
-async function verifyHeight(height: number) {
-    const activeConfig = config;
-    const finalized = rawByHeight.get(height);
+function verifyFetchedFinalization(
+    activeConfig: CertificateWorkerConfig,
+    height: number,
+    finalized: Uint8Array,
+) {
     const expectedDigest = wanted.get(height);
-    if (!activeConfig || !finalized || !expectedDigest || verified.has(height)) return;
+    if (!expectedDigest || verified.has(height)) return;
 
     try {
         const target = verifyBlockCertificate(
@@ -253,7 +174,6 @@ async function verifyHeight(height: number) {
         ) as FinalizedTransactionTarget;
         verified.add(height);
         wanted.delete(height);
-        rawByHeight.delete(height);
         workerScope.postMessage({
             kind: 'verified',
             height,
@@ -262,18 +182,13 @@ async function verifyHeight(height: number) {
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         wanted.delete(height);
-        rawByHeight.delete(height);
         workerScope.postMessage({ kind: 'error', height, detail });
     }
 }
 
-function scheduleStreamRetry(activeConfig: CertificateWorkerConfig) {
-    if (streamRetryTimer !== null) return;
-    streamRetryTimer = workerScope.setTimeout(() => {
-        streamRetryTimer = null;
-        if (config !== activeConfig) return;
-        startStream(activeConfig);
-    }, STREAM_RETRY_DELAY_MS);
+function retryFetch(height: number) {
+    if (!wanted.has(height) || verified.has(height)) return;
+    workerScope.setTimeout(() => enqueueFetch(height), FETCH_RETRY_DELAY_MS);
 }
 
 async function loadCrypto() {
@@ -302,6 +217,14 @@ function fromHex(value: string): Uint8Array {
 
 function trimTrailingSlash(value: string): string {
     return value.replace(/\/+$/, '');
+}
+
+function bytesKey(bytes: Uint8Array): string {
+    let key = '';
+    for (const byte of bytes) {
+        key += String.fromCharCode(byte);
+    }
+    return key;
 }
 
 function yieldToWorker(): Promise<void> {
