@@ -152,51 +152,6 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
     yield* blocks;
 }
 
-export async function fetchBlocksByHeightRange(
-    sqlUrl: string,
-    fromHeight: bigint,
-    toHeight: bigint,
-    signal?: AbortSignal,
-): Promise<ObservedBlock[]> {
-    return fetchMissingBlocks(new SqlClient(sqlUrl), fromHeight, toHeight, signal);
-}
-
-async function fetchMissingBlocks(
-    sql: SqlClient,
-    fromHeight: bigint,
-    toHeight: bigint,
-    signal?: AbortSignal,
-): Promise<ObservedBlock[]> {
-    if (fromHeight > toHeight) {
-        return [];
-    }
-    const result = await sql.query(
-        `SELECT ${COL_HEIGHT}, ${COL_TX_COUNT} FROM ${BLOCK_META_TABLE} WHERE ${COL_HEIGHT} >= ${fromHeight.toString()} AND ${COL_HEIGHT} <= ${toHeight.toString()} ORDER BY ${COL_HEIGHT} ASC`,
-        { signal },
-    );
-    const heightIdx = result.columns.indexOf(COL_HEIGHT);
-    const txCountIdx = result.columns.indexOf(COL_TX_COUNT);
-    if (heightIdx < 0 || txCountIdx < 0) {
-        return [];
-    }
-    const arrivedAt = Date.now();
-    const blocks: ObservedBlock[] = [];
-    for (const row of result.rows) {
-        const heightCell = row.cells[heightIdx];
-        const txCountCell = row.cells[txCountIdx];
-        if (typeof heightCell !== 'bigint' || typeof txCountCell !== 'bigint') {
-            continue;
-        }
-        blocks.push({
-            height: heightCell,
-            txCount: Number(txCountCell),
-            arrivedAt,
-            sequence: 0n,
-        });
-    }
-    return blocks;
-}
-
 function compareBigint(a: bigint, b: bigint): number {
     if (a < b) return -1;
     if (a > b) return 1;

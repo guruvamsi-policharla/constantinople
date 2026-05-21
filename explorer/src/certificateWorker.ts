@@ -1,4 +1,4 @@
-import { SimplexClient } from '@exowarexyz/simplex';
+import { SimplexClient, SimplexRecordKind } from '@exowarexyz/simplex';
 import initCrypto, { verifyFinalization } from './crypto-wasm/constantinople_explorer_crypto';
 import type {
     CertificateWorkerRequest,
@@ -7,10 +7,9 @@ import type {
 
 const RETRY_DELAY_MS = 1_000;
 
-interface CertificateJob {
+interface CertificateStreamConfig {
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
-    readonly height: number;
 }
 
 interface FinalizedTransactionTarget {
@@ -18,12 +17,11 @@ interface FinalizedTransactionTarget {
     readonly view: bigint;
 }
 
-const queued = new Map<number, CertificateJob>();
 const verified = new Set<number>();
-const inFlight = new Set<number>();
-const retryTimers = new Map<number, number>();
-let active = false;
 let cryptoReady: Promise<unknown> | null = null;
+let streamController: AbortController | null = null;
+let streamRetryTimer: number | null = null;
+let streamConfig: CertificateStreamConfig | null = null;
 
 const workerScope = self as unknown as {
     onmessage: ((event: MessageEvent<CertificateWorkerRequest>) => void) | null;
@@ -34,57 +32,65 @@ const workerScope = self as unknown as {
 
 workerScope.onmessage = (event) => {
     const request = event.data;
-    for (const height of request.heights) {
-        if (verified.has(height) || queued.has(height) || inFlight.has(height)) continue;
-        queued.set(height, {
-            storeUrl: request.storeUrl,
-            simplexVerificationMaterial: request.simplexVerificationMaterial,
-            height,
-        });
-    }
-    drainQueue();
+    startStream({
+        storeUrl: request.storeUrl,
+        simplexVerificationMaterial: request.simplexVerificationMaterial,
+    });
 };
 
-async function drainQueue() {
-    if (active) return;
-    active = true;
+function startStream(config: CertificateStreamConfig) {
+    streamConfig = config;
+    streamController?.abort();
+    if (streamRetryTimer !== null) {
+        workerScope.clearTimeout(streamRetryTimer);
+        streamRetryTimer = null;
+    }
+
+    streamController = new AbortController();
+    void runStream(config, streamController.signal);
+}
+
+async function runStream(config: CertificateStreamConfig, signal: AbortSignal) {
     try {
-        while (queued.size > 0) {
-            const job = nextJob();
-            if (!job) return;
-            queued.delete(job.height);
-            if (verified.has(job.height)) continue;
-            inFlight.add(job.height);
-            retryTimers.delete(job.height);
-            try {
-                await verifyJob(job);
-            } finally {
-                inFlight.delete(job.height);
+        await loadCrypto();
+        const simplex = new SimplexClient(trimTrailingSlash(config.storeUrl));
+        for await (const batch of simplex.subscribeRaw(
+            SimplexRecordKind.FinalizedByHeight,
+            {},
+            { signal },
+        )) {
+            for (const entry of batch.entries) {
+                if (entry.type !== 'finalization' || entry.index !== 'height') continue;
+                verifyFinalizationEntry(config, Number(entry.height), entry.finalized);
             }
         }
-    } finally {
-        active = false;
+        if (!signal.aborted) {
+            scheduleStreamRetry(config);
+        }
+    } catch (error) {
+        if (signal.aborted) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        if (!isRetryableCertificateError(detail)) {
+            workerScope.postMessage({ kind: 'error', height: 0, detail });
+            return;
+        }
+        scheduleStreamRetry(config);
     }
 }
 
-function nextJob(): CertificateJob | null {
-    const first = queued.values().next();
-    return first.done ? null : first.value;
-}
+function verifyFinalizationEntry(
+    config: CertificateStreamConfig,
+    height: number,
+    finalized: Uint8Array,
+) {
+    if (verified.has(height)) return;
 
-async function verifyJob(job: CertificateJob) {
     try {
-        await loadCrypto();
-        const simplex = new SimplexClient(trimTrailingSlash(job.storeUrl));
-        const finalized = await simplex.getFinalizationByHeightRaw(String(job.height));
-        if (!finalized) {
-            throw new Error(`finalization missing at height ${job.height}`);
-        }
         const target = verifyFinalization(
-            fromHex(job.simplexVerificationMaterial),
+            fromHex(config.simplexVerificationMaterial),
             finalized,
         ) as FinalizedTransactionTarget;
-        verified.add(job.height);
+        verified.add(height);
         workerScope.postMessage({
             kind: 'verified',
             height: Number(target.height),
@@ -92,24 +98,17 @@ async function verifyJob(job: CertificateJob) {
         });
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        if (isRetryableCertificateError(detail)) {
-            scheduleRetry(job);
-            return;
-        }
-        workerScope.postMessage({ kind: 'error', height: job.height, detail });
+        workerScope.postMessage({ kind: 'error', height, detail });
     }
 }
 
-function scheduleRetry(job: CertificateJob) {
-    if (retryTimers.has(job.height)) return;
-    const timer = workerScope.setTimeout(() => {
-        retryTimers.delete(job.height);
-        if (!verified.has(job.height)) {
-            queued.set(job.height, job);
-            drainQueue();
-        }
+function scheduleStreamRetry(config: CertificateStreamConfig) {
+    if (streamRetryTimer !== null) return;
+    streamRetryTimer = workerScope.setTimeout(() => {
+        streamRetryTimer = null;
+        if (streamConfig !== config) return;
+        startStream(config);
     }, RETRY_DELAY_MS);
-    retryTimers.set(job.height, timer);
 }
 
 async function loadCrypto() {

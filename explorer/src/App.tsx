@@ -6,10 +6,10 @@ import {
     parseU64,
 } from './codec';
 import {
-    enqueueCertificateVerification,
+    startCertificateVerificationStream,
     subscribeCertificateVerification,
 } from './certificateClient';
-import { fetchBlocksByHeightRange, type ObservedBlock, subscribeBlocks } from './indexer';
+import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
     fetchTransactionStatus,
@@ -53,7 +53,7 @@ const LIVE_STATUS_BLANK_MS = 100;
 const LIVE_STATUS_PAUSE_MS = 550;
 const BLOCK_FLUSH_INTERVAL_MS = 50;
 const CERTIFICATE_FLUSH_INTERVAL_MS = 100;
-const GAP_FILL_DEBOUNCE_MS = 250;
+const MAX_CERTIFICATE_CACHE = 1_000;
 
 type Status =
     | { kind: 'connecting' }
@@ -155,10 +155,6 @@ export default function App() {
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const pendingCertificatesRef = useRef<CertificateUpdate[]>([]);
     const certificateFlushTimeoutRef = useRef<number | null>(null);
-    const gapFillRef = useRef<{
-        controller: AbortController | null;
-        timeout: number | null;
-    }>({ controller: null, timeout: null });
     const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
@@ -180,11 +176,6 @@ export default function App() {
             pendingBlocksRef.current = [];
             if (flushed.length === 0) return;
 
-            enqueueCertificateVerification({
-                storeUrl,
-                simplexVerificationMaterial,
-                heights: uniqueBlockHeights(flushed),
-            });
             setBlocks((current) => upsertBoundedBatch(flushed, current));
             setBlocksObserved((current) => current + flushed.length);
             setTotalTxObserved(
@@ -224,6 +215,13 @@ export default function App() {
     };
 
     useEffect(() => {
+        startCertificateVerificationStream({
+            storeUrl,
+            simplexVerificationMaterial,
+        });
+    }, []);
+
+    useEffect(() => {
         const controller = new AbortController();
         let cancelled = false;
 
@@ -254,33 +252,6 @@ export default function App() {
     }, []);
 
     useEffect(() => {
-        const range = visibleGapRange(blocks);
-        if (!range || gapFillRef.current.timeout !== null || gapFillRef.current.controller) {
-            return;
-        }
-
-        gapFillRef.current.timeout = window.setTimeout(() => {
-            gapFillRef.current.timeout = null;
-            const controller = new AbortController();
-            gapFillRef.current.controller = controller;
-            fetchBlocksByHeightRange(indexerUrl, range.fromHeight, range.toHeight, controller.signal)
-                .then(queueObservedBlocks)
-                .catch((error) => {
-                    if (controller.signal.aborted) return;
-                    setStatus({
-                        kind: 'error',
-                        message: error instanceof Error ? error.message : String(error),
-                    });
-                })
-                .finally(() => {
-                    if (gapFillRef.current.controller === controller) {
-                        gapFillRef.current.controller = null;
-                    }
-                });
-        }, GAP_FILL_DEBOUNCE_MS);
-    }, [blocks]);
-
-    useEffect(() => {
         writeHistory(history);
     }, [history]);
 
@@ -291,13 +262,6 @@ export default function App() {
     useEffect(() => {
         return subscribeCertificateVerification((response) => {
             if (response.height === 0) return;
-            if (response.kind === 'fetching') {
-                queueCertificateUpdate({
-                    height: response.height,
-                    certificate: fetchingBlockCertificateState(),
-                });
-                return;
-            }
             if (response.kind === 'verified') {
                 queueCertificateUpdate({
                     height: response.height,
@@ -447,10 +411,6 @@ export default function App() {
             if (certificateFlushTimeoutRef.current !== null) {
                 window.clearTimeout(certificateFlushTimeoutRef.current);
             }
-            if (gapFillRef.current.timeout !== null) {
-                window.clearTimeout(gapFillRef.current.timeout);
-            }
-            gapFillRef.current.controller?.abort();
             if (copiedValueTimeoutRef.current !== null) {
                 window.clearTimeout(copiedValueTimeoutRef.current);
             }
@@ -1116,10 +1076,6 @@ function AsciiTooltip({
     );
 }
 
-function uniqueBlockHeights(blocks: readonly ObservedBlock[]): number[] {
-    return Array.from(new Set(blocks.map((block) => Number(block.height))));
-}
-
 function upsertBoundedBatch(
     blocks: readonly ObservedBlock[],
     current: ObservedBlock[],
@@ -1135,25 +1091,6 @@ function upsertBoundedBatch(
         next.length = MAX_ROWS;
     }
     return next;
-}
-
-function visibleGapRange(
-    blocks: readonly ObservedBlock[],
-): { readonly fromHeight: bigint; readonly toHeight: bigint } | null {
-    if (blocks.length < 2) return null;
-
-    const ordered = [...blocks].sort((a, b) => compareBlockHeightDesc(a.height, b.height));
-    for (let index = 0; index < ordered.length - 1; index++) {
-        const higher = ordered[index].height;
-        const lower = ordered[index + 1].height;
-        if (higher <= lower + 1n) continue;
-
-        return {
-            fromHeight: lower + 1n,
-            toHeight: higher - 1n,
-        };
-    }
-    return null;
 }
 
 function compareBlockHeightDesc(a: bigint, b: bigint): number {
@@ -1174,11 +1111,23 @@ function pruneBlockCertificates(
     certificates: BlockCertificateByHeight,
 ): BlockCertificateByHeight {
     const visibleHeights = new Set(blocks.map((block) => block.height.toString()));
-    const entries = Object.entries(certificates).filter(([height]) => visibleHeights.has(height));
+    const entries = Object.entries(certificates)
+        .filter(([height]) => visibleHeights.has(height))
+        .concat(recentCertificateEntries(certificates, visibleHeights));
     if (entries.length === Object.keys(certificates).length) {
         return certificates;
     }
     return Object.fromEntries(entries);
+}
+
+function recentCertificateEntries(
+    certificates: BlockCertificateByHeight,
+    visibleHeights: Set<string>,
+): [string, BlockCertificateState][] {
+    return Object.entries(certificates)
+        .filter(([height]) => !visibleHeights.has(height))
+        .sort(([a], [b]) => Number(b) - Number(a))
+        .slice(0, MAX_CERTIFICATE_CACHE);
 }
 
 function updateObservedBlockCertificate(

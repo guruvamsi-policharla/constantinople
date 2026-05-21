@@ -1,17 +1,12 @@
-export interface EnqueueCertificateRequest {
-    readonly kind: 'enqueue';
+export interface StartCertificateStreamRequest {
+    readonly kind: 'start';
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
-    readonly heights: number[];
 }
 
-export type CertificateWorkerRequest = EnqueueCertificateRequest;
+export type CertificateWorkerRequest = StartCertificateStreamRequest;
 
 export type CertificateWorkerResponse =
-    | {
-          readonly kind: 'fetching';
-          readonly height: number;
-      }
     | {
           readonly kind: 'verified';
           readonly height: number;

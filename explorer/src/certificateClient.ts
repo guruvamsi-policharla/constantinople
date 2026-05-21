@@ -6,23 +6,24 @@ import type {
 type CertificateListener = (response: CertificateWorkerResponse) => void;
 
 let certificateWorker: Worker | null = null;
+let activeStreamKey = '';
 const listeners = new Set<CertificateListener>();
 
-export function enqueueCertificateVerification({
+export function startCertificateVerificationStream({
     storeUrl,
     simplexVerificationMaterial,
-    heights,
 }: {
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
-    readonly heights: number[];
 }) {
-    if (heights.length === 0) return;
+    const streamKey = `${storeUrl}\n${simplexVerificationMaterial}`;
+    if (activeStreamKey === streamKey) return;
+    activeStreamKey = streamKey;
+
     const request: CertificateWorkerRequest = {
-        kind: 'enqueue',
+        kind: 'start',
         storeUrl,
         simplexVerificationMaterial,
-        heights,
     };
     getCertificateWorker().postMessage(request);
 }
@@ -57,6 +58,7 @@ function getCertificateWorker(): Worker {
         }
         certificateWorker?.terminate();
         certificateWorker = null;
+        activeStreamKey = '';
     };
     return certificateWorker;
 }
