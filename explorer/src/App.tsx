@@ -73,6 +73,14 @@ const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
+const verifyCertificates = parseBooleanEnv(import.meta.env.VITE_VERIFY_CERTIFICATES, true);
+
+function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
+    if (typeof value !== 'string') return fallback;
+    if (/^(0|false|off|no)$/i.test(value)) return false;
+    if (/^(1|true|on|yes)$/i.test(value)) return true;
+    return fallback;
+}
 
 interface SubmittedTransaction {
     readonly sender: string | null;
@@ -214,6 +222,7 @@ export default function App() {
     };
 
     useEffect(() => {
+        if (!verifyCertificates) return;
         configureCertificateVerification({
             storeUrl,
             simplexVerificationMaterial,
@@ -221,6 +230,7 @@ export default function App() {
     }, []);
 
     useEffect(() => {
+        if (!verifyCertificates) return;
         requestCertificateVerification(certificateVerificationHeights(blocks, history, blockCertificates));
     }, [blocks, history, blockCertificates]);
 
@@ -263,6 +273,7 @@ export default function App() {
     }, [blocks]);
 
     useEffect(() => {
+        if (!verifyCertificates) return;
         return subscribeCertificateVerification((response) => {
             if (response.height === 0) return;
             if (response.kind === 'verified') {
@@ -563,7 +574,11 @@ export default function App() {
                 />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
-                    <BlockTable blocks={blocks} certificates={blockCertificates} />
+                    <BlockTable
+                        blocks={blocks}
+                        certificates={blockCertificates}
+                        verifyCertificates={verifyCertificates}
+                    />
                 </main>
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
@@ -593,6 +608,7 @@ export default function App() {
                             signedInPublicKey={signedInPublicKey}
                             copiedValue={copiedValue}
                             onCopy={copyValue}
+                            verifyCertificates={verifyCertificates}
                         />
                     </WalletModal>
                 )}
@@ -840,11 +856,13 @@ function TransactionHistory({
     signedInPublicKey,
     copiedValue,
     onCopy,
+    verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
     signedInPublicKey: string | null;
     copiedValue: string;
     onCopy: (value: string) => void;
+    verifyCertificates: boolean;
 }) {
     const formatter = useMemo(
         () =>
@@ -892,6 +910,7 @@ function TransactionHistory({
                             onCopy={onCopy}
                             signedInPublicKey={signedInPublicKey}
                             tx={tx}
+                            verifyCertificates={verifyCertificates}
                         />
                     ))}
                 </tbody>
@@ -906,12 +925,14 @@ function TransactionRow({
     onCopy,
     signedInPublicKey,
     tx,
+    verifyCertificates,
 }: {
     copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
     signedInPublicKey: string | null;
     tx: SubmittedTransaction;
+    verifyCertificates: boolean;
 }) {
     const ownsTx = tx.sender !== null && tx.sender === signedInPublicKey;
     return (
@@ -926,7 +947,11 @@ function TransactionRow({
             <td>{tx.nonce}</td>
             <td>{tx.detail}</td>
             <td>
-                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
+                <CertificateCell
+                    certificate={tx.certificate}
+                    finalizedHeight={tx.finalizedHeight}
+                    verifyCertificates={verifyCertificates}
+                />
             </td>
             <td>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
@@ -940,10 +965,23 @@ function TransactionRow({
 function CertificateCell({
     certificate,
     finalizedHeight,
+    verifyCertificates,
 }: {
     certificate: BlockCertificateState;
     finalizedHeight: number | null;
+    verifyCertificates: boolean;
 }) {
+    if (!verifyCertificates) {
+        return (
+            <span
+                className="tx-proof-muted"
+                aria-label="block certificate verification disabled"
+                title="block certificate verification disabled"
+            >
+                -
+            </span>
+        );
+    }
     if (certificate.status === 'verified') {
         return (
             <span
@@ -1706,9 +1744,11 @@ function buildHistogram(
 function BlockTable({
     blocks,
     certificates,
+    verifyCertificates,
 }: {
     blocks: ObservedBlock[];
     certificates: BlockCertificateByHeight;
+    verifyCertificates: boolean;
 }) {
     const formatter = useMemo(
         () =>
@@ -1752,6 +1792,7 @@ function BlockTable({
                                         certificates,
                                     )}
                                     finalizedHeight={Number(block.height)}
+                                    verifyCertificates={verifyCertificates}
                                 />
                             </td>
                             <td className="col-time">{formatter.format(block.arrivedAt)}</td>

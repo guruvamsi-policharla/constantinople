@@ -150,6 +150,8 @@ The printed `mprocs` command list grows by four entries:
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
   certificates in the shared store.
+  Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
+  verification during streaming-performance experiments.
 
 Validators do not upload QMDB data to `qmdb-indexer` directly. The first
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
