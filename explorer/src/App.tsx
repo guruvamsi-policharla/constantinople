@@ -33,7 +33,9 @@ import {
 } from './wallet';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
-const HISTOGRAM_COLUMNS = 180;
+const HISTOGRAM_MAX_COLUMNS = 180;
+const HISTOGRAM_MIN_COLUMNS = 48;
+const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 36;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -997,8 +999,8 @@ function upsertBoundedBatch(
 
     const next = Array.from(byHeight.values());
     next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
-    if (next.length > HISTOGRAM_COLUMNS) {
-        next.length = HISTOGRAM_COLUMNS;
+    if (next.length > HISTOGRAM_MAX_COLUMNS) {
+        next.length = HISTOGRAM_MAX_COLUMNS;
     }
     return next;
 }
@@ -1448,31 +1450,67 @@ function formatObservedTxPerSecond(
 }
 
 const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
-    const lines = useMemo(() => buildHistogram(blocks), [blocks]);
+    const frameRef = useRef<HTMLDivElement>(null);
+    const measureRef = useRef<HTMLSpanElement>(null);
+    const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
+
+    useEffect(() => {
+        const frame = frameRef.current;
+        const measure = measureRef.current;
+        if (!frame || !measure) return;
+
+        const recompute = () => {
+            const columnWidth = measure.getBoundingClientRect().width;
+            if (columnWidth <= 0) return;
+
+            const availableColumns = Math.floor(frame.clientWidth / columnWidth);
+            const nextColumns = Math.max(
+                HISTOGRAM_MIN_COLUMNS,
+                Math.min(HISTOGRAM_MAX_COLUMNS, availableColumns),
+            );
+            setColumns((current) => (current === nextColumns ? current : nextColumns));
+        };
+
+        recompute();
+        const observer = new ResizeObserver(recompute);
+        observer.observe(frame);
+        window.addEventListener('resize', recompute);
+        return () => {
+            observer.disconnect();
+            window.removeEventListener('resize', recompute);
+        };
+    }, []);
+
+    const lines = useMemo(() => buildHistogram(blocks, columns), [blocks, columns]);
     return (
-        <pre className="histogram" aria-label="recent block transaction count histogram">
-            {lines.map((line, index) => (
-                <span
-                    className="histogram__line"
-                    key={index}
-                    style={histogramLineStyle(index)}
-                >
-                    {line}
+        <div className="histogram-frame" ref={frameRef}>
+            <pre className="histogram" aria-label="recent block transaction count histogram">
+                <span className="histogram__measure" ref={measureRef} aria-hidden="true">
+                    █
                 </span>
-            ))}
-        </pre>
+                {lines.map((line, index) => (
+                    <span
+                        className="histogram__line"
+                        key={index}
+                        style={histogramLineStyle(index)}
+                    >
+                        {line}
+                    </span>
+                ))}
+            </pre>
+        </div>
     );
 });
 
-function buildHistogram(blocks: ObservedBlock[]): string[] {
-    const recent = blocks.slice(0, HISTOGRAM_COLUMNS).reverse();
+function buildHistogram(blocks: ObservedBlock[], width: number): string[] {
+    const recent = blocks.slice(0, width).reverse();
     let peak = 0;
     for (const block of recent) {
         if (block.txCount > peak) peak = block.txCount;
     }
 
     if (peak === 0) {
-        const blank = ' '.repeat(HISTOGRAM_COLUMNS);
+        const blank = ' '.repeat(width);
         return Array.from({ length: HISTOGRAM_HEIGHT }, () => blank);
     }
 
@@ -1482,7 +1520,7 @@ function buildHistogram(blocks: ObservedBlock[]): string[] {
         const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
         return Math.min(stepsPerColumn, Math.max(1, scaledSteps));
     });
-    while (columnSteps.length < HISTOGRAM_COLUMNS) {
+    while (columnSteps.length < width) {
         columnSteps.unshift(0);
     }
 
