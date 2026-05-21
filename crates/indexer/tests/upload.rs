@@ -27,8 +27,7 @@ use constantinople_indexer::{
     BlockReporter, IndexerClient, UploaderHandles, keys as indexer_keys, spawn_uploaders,
     sql_schema::{
         BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_ROOT,
-        BLOCK_META_TRANSACTIONS_TIP, BLOCK_META_TX_COUNT, TX_META_QMDB_LOCATION, TX_META_TABLE,
-        build_meta_schema,
+        BLOCK_META_TRANSACTIONS_TIP, BLOCK_META_TX_COUNT, TX_META_TABLE, build_meta_schema,
     },
 };
 use constantinople_primitives::{
@@ -181,8 +180,8 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_raw_store() {
     waiter.await.expect("uploader must acknowledge");
 
     // Verify routing: raw KV has BLOCK + BLOCK_BY_H (= 2 rows) plus
-    // 2 KV rows per tx. SQL metadata is verified separately
-    // by `block_reporter_writes_block_meta_and_tx_meta_rows`.
+    // 2 KV rows per tx. SQL metadata is verified separately by
+    // `block_reporter_writes_block_meta_only`.
     assert_eq!(count_all(&stores.raw).await, 2 + 2 * block.body.len());
 
     // Verify every row of the logical batch is readable by the typed client.
@@ -304,13 +303,13 @@ async fn block_reporter_ignores_tip_updates() {
 }
 
 /// SQL metadata path: a finalized block must produce one `block_meta` row
-/// (with the matching height, digest, and tx_count) and one `tx_meta` row
-/// per contained transaction. This drives the same store URL through both
+/// (with the matching height, digest, and tx_count) and no `tx_meta` rows on
+/// the live upload path. This drives the same store URL through both
 /// the writer (`build_meta_schema(...).batch_writer()`, owned by the
 /// uploader task) and the reader (`SessionContext` registered against the
 /// same schema), confirming the metadata is queryable end-to-end.
 #[tokio::test]
-async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
+async fn block_reporter_writes_block_meta_only() {
     let stores = spawn_stores().await;
     let uploaders = make_uploaders(&stores);
     let mut reporter: BlockReporter<Sha256, PublicKey> =
@@ -386,7 +385,8 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
         .value(0);
     assert_eq!(transactions_tip, block.header.transactions_range.end() - 1);
 
-    // tx_meta: exactly `expected_tx_count` rows, all at height=42.
+    // tx_meta remains queryable for schema compatibility, but the live
+    // publisher no longer writes a global per-transaction SQL index.
     let tx_meta_query = format!("SELECT COUNT(*) FROM {TX_META_TABLE}");
     let agg = ctx
         .sql(&tx_meta_query)
@@ -402,25 +402,7 @@ async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .expect("count col")
         .value(0);
-    assert_eq!(count as u64, expected_tx_count);
-
-    let location_rows = ctx
-        .sql(&format!(
-            "SELECT {TX_META_QMDB_LOCATION} FROM {TX_META_TABLE} ORDER BY {TX_META_QMDB_LOCATION}"
-        ))
-        .await
-        .expect("tx_meta locations query")
-        .collect()
-        .await
-        .expect("collect tx_meta locations");
-    let locations = location_rows[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .expect("qmd location col");
-    assert_eq!(locations.value(0), 1);
-    assert_eq!(locations.value(1), 2);
-    assert_eq!(locations.value(2), 3);
+    assert_eq!(count, 0);
 
     drop(uploaders);
 }

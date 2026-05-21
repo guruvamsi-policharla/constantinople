@@ -3,10 +3,9 @@
 //! This is the metadata-streaming half of the indexer's two-path layout
 //! (see [`crate::sql_schema`] for the table definitions). Per finalized
 //! `Update::Block` the [`BlockReporter`] dispatches a single [`SqlBatch`]
-//! containing one [`crate::sql_schema::BLOCK_META_TABLE`] row plus one
-//! [`crate::sql_schema::TX_META_TABLE`] row per contained transaction. A
-//! dedicated uploader task drains the channel, inserts every queued row into
-//! a reused [`BatchWriter`], and flushes once for the drained batch.
+//! containing one [`crate::sql_schema::BLOCK_META_TABLE`] row. A dedicated
+//! uploader task drains the channel, inserts every queued row into a reused
+//! [`BatchWriter`], and flushes once for the drained batch.
 //!
 //! Failure model: the flush is retried indefinitely with the standard
 //! `retry_backoff` ladder shared with the KV uploaders. The marshal
@@ -18,7 +17,7 @@
 //! [`BatchWriter`]: exoware_sql::BatchWriter
 
 use super::retry_backoff;
-use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE, build_meta_schema};
+use crate::sql_schema::{BLOCK_META_TABLE, build_meta_schema};
 use commonware_utils::{Acknowledgement, acknowledgement::Exact};
 use exoware_sdk::StoreClient;
 use exoware_sql::{BatchWriter, CellValue};
@@ -37,8 +36,7 @@ pub struct SqlRow {
 
 /// SQL rows for one finalized block.
 ///
-/// A single [`SqlBatch`] always contains exactly one `block_meta` row plus
-/// zero or more `tx_meta` rows for the transactions in that block. The
+/// A single [`SqlBatch`] always contains exactly one `block_meta` row. The
 /// uploader may coalesce multiple queued [`SqlBatch`] values into one
 /// `flush().await`; each batch's acknowledgement is still released only after
 /// the coalesced flush succeeds.
@@ -161,7 +159,7 @@ async fn flush_with_retry<'a>(writer: &mut BatchWriter, rows: impl Iterator<Item
 
 /// Encode the SQL rows for a finalized block.
 ///
-/// Returns one `block_meta` row plus one `tx_meta` row per transaction.
+/// Returns one `block_meta` row.
 /// The `finalized_ts_micros` is captured by the reporter at the moment the
 /// block is delivered (wall-clock on this validator).
 ///
@@ -170,18 +168,8 @@ async fn flush_with_retry<'a>(writer: &mut BatchWriter, rows: impl Iterator<Item
 /// that signal. A future enrichment can pipe round/view metadata through
 /// either by joining tables or by extending [`SqlRow`] with an update
 /// path.
-pub(crate) fn encode_sql_rows(
-    block: BlockMetaRow,
-    tx_digests: &[[u8; 32]],
-    tx_qmdb_locations: &[u64],
-) -> Vec<SqlRow> {
-    assert_eq!(
-        tx_digests.len(),
-        tx_qmdb_locations.len(),
-        "each transaction digest must have a QMDB location"
-    );
-    let mut rows = Vec::with_capacity(1 + tx_digests.len());
-    rows.push(SqlRow {
+pub(crate) fn encode_sql_rows(block: BlockMetaRow) -> Vec<SqlRow> {
+    vec![SqlRow {
         table: BLOCK_META_TABLE,
         values: vec![
             CellValue::UInt64(block.height),
@@ -192,17 +180,5 @@ pub(crate) fn encode_sql_rows(
             CellValue::UInt64(block.view),
             CellValue::Timestamp(block.finalized_ts_micros),
         ],
-    });
-    for (idx, (tx_digest, qmd_location)) in tx_digests.iter().zip(tx_qmdb_locations).enumerate() {
-        rows.push(SqlRow {
-            table: TX_META_TABLE,
-            values: vec![
-                CellValue::UInt64(block.height),
-                CellValue::UInt64(idx as u64),
-                CellValue::FixedBinary(tx_digest.to_vec()),
-                CellValue::UInt64(*qmd_location),
-            ],
-        });
-    }
-    rows
+    }]
 }

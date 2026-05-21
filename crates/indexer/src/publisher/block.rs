@@ -5,8 +5,8 @@
 //!
 //! 1. Encode two batches:
 //!    - **raw KV**: BLOCK, BLOCK_BY_H, TX, and TX_BY_H rows.
-//!    - **sql metadata** (`block_meta` + `tx_meta`): one row per block plus
-//!      one row per transaction. The latest-finalized-height cursor is
+//!    - **sql metadata** (`block_meta`): one row per block. The
+//!      latest-finalized-height cursor is
 //!      derived from `MAX(height)` on `block_meta`; the KV path no longer
 //!      maintains a redundant META scalar.
 //! 2. Clone the marshal acknowledgement once per backing path. Each path
@@ -52,8 +52,8 @@ impl<H, P> BlockReporter<H, P> {
     ///
     /// The raw KV channel carries pre-encoded BLOCK, BLOCK_BY_H, TX, and
     /// TX_BY_H rows to the existing exoware Store. The SQL channel feeds the
-    /// metadata uploader, which writes typed rows into the `block_meta` and
-    /// `tx_meta` tables declared by [`crate::sql_schema`].
+    /// metadata uploader, which writes typed rows into the `block_meta` table
+    /// declared by [`crate::sql_schema`].
     pub const fn new(raw: mpsc::Sender<UploadBatch>, sql: mpsc::Sender<SqlBatch>) -> Self {
         Self {
             raw: Some(raw),
@@ -129,7 +129,7 @@ where
 pub(crate) struct IndexedBlockRows {
     /// Raw KV rows for the block and contained transactions.
     pub raw: Vec<(Key, Bytes)>,
-    /// SQL metadata rows for the block and contained transactions.
+    /// SQL metadata row for the block.
     pub sql: Vec<SqlRow>,
 }
 
@@ -151,15 +151,13 @@ where
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
-    // SQL `block_meta.digest` and per-row `tx_meta.tx_digest` are
-    // `FixedSizeBinary(32)` — copy each digest into a `[u8; 32]` for the
-    // typed CellValue path.
+    // SQL `block_meta.digest` is `FixedSizeBinary(32)` — copy it into a
+    // `[u8; 32]` for the typed CellValue path.
     let mut block_digest_arr = [0u8; 32];
     block_digest_arr.copy_from_slice(block_digest.as_ref());
     let mut transactions_root = [0u8; 32];
     transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
-    let mut tx_digests: Vec<[u8; 32]> = Vec::with_capacity(body_len);
-    let mut tx_qmdb_locations: Vec<u64> = Vec::with_capacity(body_len);
+    let mut tx_count = 0u64;
 
     let mut raw = Vec::with_capacity(2 + 2 * body_len);
     raw.push((
@@ -195,39 +193,24 @@ where
             keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
             Bytes::copy_from_slice(tx_digest.as_ref()),
         ));
-        // Collect for SQL `tx_meta` after the per-tx KV rows are recorded.
-        let mut digest_arr = [0u8; 32];
-        digest_arr.copy_from_slice(tx_digest.as_ref());
-        tx_digests.push(digest_arr);
+        tx_count += 1;
     }
 
-    // SQL: one block_meta row + one tx_meta row per surviving transaction.
+    // SQL: one block_meta row per finalized block. Per-transaction proof
+    // lookups use raw `TX_BY_H` rows on demand for the wallet's own
+    // transactions instead of maintaining a global SQL `tx_meta` index.
     // The `latest_finalized_height` cursor that the previous KV META family
     // carried is now derived from `MAX(block_meta.height)` instead.
     // `view` is currently 0; see `encode_sql_rows` docs for why.
-    let tx_count = u64::try_from(tx_digests.len()).expect("tx count fits u64");
-    if tx_count > 0 {
-        let first_qmdb_location = block
-            .header
-            .transactions_range
-            .end()
-            .checked_sub(tx_count + 1)
-            .expect("transaction QMDB range includes block append operations");
-        tx_qmdb_locations.extend((0..tx_count).map(|idx| first_qmdb_location + idx));
-    }
-    let sql = encode_sql_rows(
-        BlockMetaRow {
-            height,
-            digest: block_digest_arr,
-            tx_count,
-            transactions_root,
-            transactions_tip: block.header.transactions_range.end() - 1,
-            view: 0,
-            finalized_ts_micros,
-        },
-        &tx_digests,
-        &tx_qmdb_locations,
-    );
+    let sql = encode_sql_rows(BlockMetaRow {
+        height,
+        digest: block_digest_arr,
+        tx_count,
+        transactions_root,
+        transactions_tip: block.header.transactions_range.end() - 1,
+        view: 0,
+        finalized_ts_micros,
+    });
 
     IndexedBlockRows { raw, sql }
 }

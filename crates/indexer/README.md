@@ -18,7 +18,7 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Full storage** (KV) | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H` | Tools that need full `SignedTransaction` bodies through [`IndexerClient`](src/client.rs). |
-| **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, view, finalized_ts, transactions_root, transactions_tip)` and `tx_meta(height, index, tx_digest, qmdb_location)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
+| **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, view, finalized_ts, transactions_root, transactions_tip)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex artifacts** | `exoware-simplex` header and finalization indexes in the shared Store | The explorer and proof clients that need a browser-verifiable finalization certificate for a block. |
 
@@ -40,9 +40,9 @@ single store can host every index without collision.
 - `KeyCodec` wrappers for the raw KV artifact families (blocks,
   transactions, and height/digest indexes).
 - [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
-  source of truth for the `block_meta` and `tx_meta` table layouts. The
-  explorer's column-name strings live here too, so a schema change is a
-  one-place edit.
+  source of truth for the live `block_meta` table layout and the legacy
+  queryable `tx_meta` table. The explorer's column-name strings live here too,
+  so a schema change is a one-place edit.
 - A [`BlockReporter`](src/publisher/block.rs) that taps marshal
   `Update::Block` events and fans each finalized block out across raw KV and
   SQL uploaders when QMDB upload is disabled.

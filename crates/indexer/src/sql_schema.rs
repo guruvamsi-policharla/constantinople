@@ -8,8 +8,9 @@
 //! - **Metadata streaming (SQL)** — two columnar tables registered onto
 //!   the same `StoreClient` via [`KvSchema`]. The `block_meta` table is
 //!   what the explorer subscribes to over the `store.sql.v1.Service`
-//!   `Subscribe` RPC; the `tx_meta` table is written for future
-//!   drill-down and submitted-transaction proof lookup.
+//!   `Subscribe` RPC. The `tx_meta` table remains in the schema for
+//!   compatibility, but the publisher no longer writes per-transaction SQL
+//!   rows on the live path.
 //! - **Simplex artifacts** — finalization certificates are written through
 //!   `exoware-simplex` beside the raw and SQL rows.
 //!

@@ -296,7 +296,6 @@ export default function App() {
             ),
         );
         fetchAndVerifyTransactionProof({
-            sqlUrl: indexerUrl,
             qmdbUrl,
             storeUrl,
             simplexVerificationMaterial,

@@ -17,7 +17,7 @@
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `raw` (KV)       | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`            |
-//! | `sql` (metadata) | `block_meta`, `tx_meta`                                      |
+//! | `sql` (metadata) | `block_meta`                                                 |
 //!
 //! Simplex certificates are uploaded separately through [`CertificateReporter`]
 //! using `exoware-simplex` indexes in the same Store.
@@ -75,7 +75,7 @@ pub struct UploadBatch {
 pub struct UploaderHandles {
     /// Sender for raw KV rows.
     pub raw: mpsc::Sender<UploadBatch>,
-    /// Sender for the SQL metadata uploader (`block_meta`, `tx_meta`).
+    /// Sender for the SQL metadata uploader (`block_meta`).
     pub sql: mpsc::Sender<SqlBatch>,
     /// Background uploader join handles, kept alive for the lifetime of the
     /// validator process so the tasks are not aborted prematurely.

@@ -1,21 +1,23 @@
 import { create } from '@bufbuild/protobuf';
 import { createClient } from '@connectrpc/connect';
-import { createTransport } from '@exowarexyz/sdk';
-import { fromHex, toHex } from './codec';
+import {
+    createTransport,
+    Client,
+    StoreKeyPrefix,
+    TraversalMode,
+} from '@exowarexyz/sdk';
+import { fromHex } from './codec';
 import { SimplexClient } from '@exowarexyz/simplex';
 import { verifyFinalization, verifyTransactionProof } from './crypto-wasm/constantinople_explorer_crypto';
 import { loadCrypto } from './wallet';
-import { type DecodedRow, SqlClient } from '@exowarexyz/sql';
 import {
     GetOperationRangeRequestSchema,
     OperationLogService,
 } from '../vendor/exoware-qmdb/src/generated/proto/qmdb/v1/operation_log_pb';
 
-const TX_META_TABLE = 'tx_meta';
-const TX_META_HEIGHT = 'height';
-const TX_META_DIGEST = 'tx_digest';
-const TX_META_QMDB_LOCATION = 'qmdb_location';
-const TX_META_HEIGHT_SEARCH_WINDOW = 16;
+const TX_BY_HEIGHT_RESERVED_BITS = 4;
+const TX_BY_HEIGHT_PREFIX = 0x6;
+const MAX_TX_BY_HEIGHT_ROWS = 100_000;
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -44,7 +46,6 @@ interface FinalizedTransactionTarget {
 }
 
 export async function fetchAndVerifyTransactionProof({
-    sqlUrl,
     qmdbUrl,
     storeUrl,
     simplexVerificationMaterial,
@@ -52,7 +53,6 @@ export async function fetchAndVerifyTransactionProof({
     height,
     signal,
 }: {
-    sqlUrl: string;
     qmdbUrl: string;
     storeUrl: string;
     simplexVerificationMaterial: string;
@@ -61,13 +61,13 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     await loadCrypto();
-    const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, height, signal);
     const target = await finalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
-        metadata.height,
+        BigInt(height),
         signal,
     );
+    const metadata = await fetchTransactionProofMetadata(storeUrl, digest, target);
     if (target.height !== metadata.height) {
         throw new Error(`finalized certificate height ${target.height} does not match tx height ${metadata.height}`);
     }
@@ -121,29 +121,34 @@ export async function fetchAndVerifyBlockCertificate({
 }
 
 async function fetchTransactionProofMetadata(
-    sqlUrl: string,
+    storeUrl: string,
     digest: string,
-    height: number,
-    signal?: AbortSignal,
+    target: FinalizedTransactionTarget,
 ): Promise<TransactionProofMetadata> {
-    const sql = new SqlClient(sqlUrl);
-    const minHeight = Math.max(0, height - TX_META_HEIGHT_SEARCH_WINDOW);
-    const maxHeight = height + TX_META_HEIGHT_SEARCH_WINDOW;
-    const digestLiteral = fixedBinarySqlLiteral(digest);
-    const txRows = await sql.query(
-        `SELECT ${TX_META_HEIGHT}, ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION} FROM ${TX_META_TABLE} WHERE ${TX_META_DIGEST} = ${digestLiteral} AND ${TX_META_HEIGHT} >= ${minHeight} AND ${TX_META_HEIGHT} <= ${maxHeight}`,
-        { signal },
+    const digestBytes = fromHex(digest);
+    const store = new Client(trimTrailingSlash(storeUrl)).store(
+        new StoreKeyPrefix(TX_BY_HEIGHT_RESERVED_BITS, TX_BY_HEIGHT_PREFIX),
     );
-    const tx = txRows.rows.find((row) => cellDigestHex(row, TX_META_DIGEST) === digest);
-    if (!tx) {
-        throw new Error(`tx_meta missing ${shortHex(digest)} near height ${height}`);
+    const rows = await store.query(
+        txByHeightKeyPrefix(target.height, 0),
+        txByHeightKeyPrefix(target.height, 0xff_ff_ff_ff),
+        MAX_TX_BY_HEIGHT_ROWS,
+        4096,
+        TraversalMode.FORWARD,
+        undefined,
+    );
+    const match = rows.results.find((row) => bytesEqual(row.value, digestBytes));
+    if (!match) {
+        throw new Error(`tx digest ${shortHex(digest)} missing at height ${target.height}`);
     }
 
-    const location = bigintCell(tx, TX_META_QMDB_LOCATION);
-    const actualHeight = Number(bigintCell(tx, TX_META_HEIGHT));
+    const txCount = BigInt(rows.results.length);
+    const appendStart = target.transactionsTip - (txCount + 1n);
+    const location = appendStart + BigInt(txIndexFromKey(match.key));
+
     return {
         location,
-        height: BigInt(actualHeight),
+        height: target.height,
     };
 }
 
@@ -212,35 +217,50 @@ async function fetchFinalizedTransactionTarget(
     return verifyFinalization(fromHex(simplexVerificationMaterial), finalized) as FinalizedTransactionTarget;
 }
 
-function bytesCell(row: DecodedRow, column: string): Uint8Array {
-    const value = row.values[column];
-    if (!(value instanceof Uint8Array)) {
-        throw new Error(`${column} was not bytes`);
-    }
-    return value;
-}
-
-function bigintCell(row: DecodedRow, column: string): bigint {
-    const value = row.values[column];
-    if (typeof value !== 'bigint') {
-        throw new Error(`${column} was not u64`);
-    }
-    return value;
-}
-
-function cellDigestHex(row: DecodedRow, column: string): string {
-    return toHex(bytesCell(row, column));
-}
-
 function shortHex(value: string): string {
     return value.length <= 18 ? value : `${value.slice(0, 10)}...${value.slice(-8)}`;
 }
 
-function fixedBinarySqlLiteral(value: string): string {
-    if (!/^[0-9a-fA-F]+$/.test(value) || value.length % 2 !== 0) {
-        throw new Error(`invalid fixed binary hex literal ${shortHex(value)}`);
+function txByHeightKeyPrefix(height: bigint, index: number): Uint8Array {
+    const key = new Uint8Array(12);
+    writeU64Be(key, 0, height);
+    writeU32Be(key, 8, index);
+    return key;
+}
+
+function txIndexFromKey(key: Uint8Array): number {
+    if (key.length < 12) {
+        throw new Error('malformed TX_BY_H key');
     }
-    return `X'${value.toUpperCase()}'`;
+    return (
+        key[8] * 0x1_00_00_00 +
+        key[9] * 0x1_00_00 +
+        key[10] * 0x1_00 +
+        key[11]
+    );
+}
+
+function writeU64Be(bytes: Uint8Array, offset: number, value: bigint) {
+    let remaining = value;
+    for (let index = 7; index >= 0; index--) {
+        bytes[offset + index] = Number(remaining & 0xffn);
+        remaining >>= 8n;
+    }
+}
+
+function writeU32Be(bytes: Uint8Array, offset: number, value: number) {
+    bytes[offset] = (value >>> 24) & 0xff;
+    bytes[offset + 1] = (value >>> 16) & 0xff;
+    bytes[offset + 2] = (value >>> 8) & 0xff;
+    bytes[offset + 3] = value & 0xff;
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index++) {
+        if (left[index] !== right[index]) return false;
+    }
+    return true;
 }
 
 function trimTrailingSlash(value: string): string {

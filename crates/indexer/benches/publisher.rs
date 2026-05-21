@@ -2,7 +2,7 @@ use bytes::Bytes;
 use constantinople_indexer::{
     keys,
     publisher::SqlRow,
-    sql_schema::{BLOCK_META_TABLE, TX_META_TABLE, build_meta_schema},
+    sql_schema::{BLOCK_META_TABLE, build_meta_schema},
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use exoware_sdk::{RetryConfig, StoreClient, StoreWriteBatch, keys::Key};
@@ -213,8 +213,7 @@ fn raw_rows(height: u64, tx_count: usize) -> Vec<(Key, Bytes)> {
 }
 
 fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
-    let mut rows = Vec::with_capacity(1 + tx_count);
-    rows.push(SqlRow {
+    vec![SqlRow {
         table: BLOCK_META_TABLE,
         values: vec![
             CellValue::UInt64(height),
@@ -225,19 +224,7 @@ fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
             CellValue::UInt64(0),
             CellValue::Timestamp(height as i64),
         ],
-    });
-    for idx in 0..tx_count {
-        rows.push(SqlRow {
-            table: TX_META_TABLE,
-            values: vec![
-                CellValue::UInt64(height),
-                CellValue::UInt64(idx as u64),
-                CellValue::FixedBinary(digest(height ^ idx as u64).to_vec()),
-                CellValue::UInt64(height.saturating_mul(tx_count as u64 + 1) + idx as u64),
-            ],
-        });
-    }
-    rows
+    }]
 }
 
 fn digest(seed: u64) -> [u8; 32] {
