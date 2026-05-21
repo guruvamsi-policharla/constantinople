@@ -29,7 +29,7 @@ pub use db::{
     Databases, StateDatabase, StateSyncTarget, TransactionDatabase, TransactionHistoryDb,
     TransactionHistoryOperation, TransactionHistoryTarget,
 };
-pub use genesis::genesis_block;
+pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedPruneFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type FinalizedPruneFn = Arc<dyn Fn(Height) -> FinalizedPruneFuture + Send + Sync>;
@@ -62,6 +62,7 @@ where
     signature_strategy: SigSt,
     hash_strategy: HashSt,
     genesis_leader: P,
+    genesis_parent: C,
     transaction_namespace: &'static [u8],
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
@@ -87,6 +88,7 @@ where
             signature_strategy: self.signature_strategy.clone(),
             hash_strategy: self.hash_strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
+            genesis_parent: self.genesis_parent,
             transaction_namespace: self.transaction_namespace,
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
@@ -117,6 +119,7 @@ where
         signature_strategy: SigSt,
         hash_strategy: HashSt,
         genesis_leader: P,
+        genesis_parent: C,
         transaction_namespace: &'static [u8],
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
@@ -133,6 +136,7 @@ where
             signature_strategy,
             hash_strategy,
             genesis_leader,
+            genesis_parent,
             transaction_namespace,
             genesis_state_target,
             genesis_transactions_target,

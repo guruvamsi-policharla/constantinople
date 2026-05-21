@@ -25,6 +25,9 @@
 
 use crate::types::{EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant};
 
+/// Initial state-sync target selected by the bootstrapper.
+pub type InitialTarget<H, P, V> = (EngineBlock<H, P>, EngineFinalization<P, V>);
+
 mod actor;
 pub use actor::{Actor, Config};
 

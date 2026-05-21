@@ -564,6 +564,7 @@ async fn new_application(
         signature_strategy,
         hash_strategy,
         leader,
+        TestCommitment::EMPTY,
         TRANSACTION_NAMESPACE,
         state_target,
         genesis_transactions_target,

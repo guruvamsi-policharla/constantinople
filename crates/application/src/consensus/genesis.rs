@@ -22,11 +22,35 @@ where
     P: PublicKey,
     H: Hasher,
 {
+    genesis_block_with_parent(
+        hasher,
+        leader,
+        (View::zero(), C::EMPTY),
+        timestamp,
+        state_target,
+        transactions_target,
+    )
+}
+
+/// Creates the genesis block with an explicit consensus parent.
+pub fn genesis_block_with_parent<C, P, H>(
+    hasher: &mut H,
+    leader: P,
+    parent: (View, C),
+    timestamp: u64,
+    state_target: StateSyncTarget<H::Digest>,
+    transactions_target: TransactionHistoryTarget<H::Digest>,
+) -> SealedBlock<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
     let header = Header {
         context: Context {
             round: Round::zero(),
             leader,
-            parent: (View::zero(), C::EMPTY),
+            parent,
         },
         parent: H::Digest::EMPTY,
         height: 0,

@@ -19,7 +19,8 @@
 //! without a safe tip stay silent for that round.
 
 use super::{
-    EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant, Mailbox, mailbox::Message,
+    EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant, InitialTarget, Mailbox,
+    mailbox::Message,
 };
 use crate::ThresholdScheme;
 use commonware_codec::{Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
@@ -246,11 +247,11 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    fn majority_block(&self, required: usize) -> Option<EngineBlock<H, P>> {
+    fn majority_tip(&self, required: usize) -> Option<LatestTip<H, P, V>> {
         let mut counts: Vec<(
             <EngineBlock<H, P> as Digestible>::Digest,
             usize,
-            EngineBlock<H, P>,
+            LatestTip<H, P, V>,
         )> = Vec::new();
 
         for (_, response) in &self.responses {
@@ -263,12 +264,12 @@ where
                 continue;
             }
 
-            counts.push((digest, 1, response.block.clone()));
+            counts.push((digest, 1, response.clone()));
         }
 
         counts
             .into_iter()
-            .find_map(|(_, count, block)| (count >= required).then_some(block))
+            .find_map(|(_, count, tip)| (count >= required).then_some(tip))
     }
 }
 
@@ -289,7 +290,7 @@ where
     blocker: B,
     scheme: ThresholdScheme<P, V>,
     marshal: Option<EngineMarshalMailbox<H, P, V>>,
-    pending: Option<oneshot::Sender<EngineBlock<H, P>>>,
+    pending: Option<oneshot::Sender<InitialTarget<H, P, V>>>,
     fetch: Option<Fetch<H, P, V>>,
     retry_deadline: Option<SystemTime>,
     next_request_id: u64,
@@ -467,10 +468,10 @@ where
 
         fetch.record_response(peer, tip);
 
-        let Some(block) = fetch.majority_block(self.quorum) else {
+        let Some(tip) = fetch.majority_tip(self.quorum) else {
             return;
         };
-        self.resolve_pending(block);
+        self.resolve_pending(tip);
     }
 
     /// Verify a peer's finalization certificate and block digest.
@@ -552,7 +553,7 @@ where
             return;
         };
 
-        let Some(target) = fetch.majority_block(self.quorum) else {
+        let Some(target) = fetch.majority_tip(self.quorum) else {
             self.schedule_retry();
             return;
         };
@@ -624,12 +625,12 @@ where
         id
     }
 
-    /// Deliver the selected block to the pending caller.
-    fn resolve_pending(&mut self, block: EngineBlock<H, P>) {
+    /// Deliver the selected tip to the pending caller.
+    fn resolve_pending(&mut self, tip: LatestTip<H, P, V>) {
         self.fetch = None;
         self.retry_deadline = None;
         if let Some(sender) = self.pending.take() {
-            sender.send_lossy(block);
+            sender.send_lossy((tip.block, tip.finalization));
         }
     }
 

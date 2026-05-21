@@ -1,6 +1,8 @@
 //! `commonware_glue::stateful` trait integration.
 
-use super::{Application, db::Databases, genesis_block, history::header_range_to_target};
+use super::{
+    Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
+};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
@@ -49,9 +51,13 @@ where
     }
 
     async fn genesis(&mut self) -> Self::Block {
-        genesis_block(
+        genesis_block_with_parent(
             &mut H::default(),
             self.genesis_leader.clone(),
+            (
+                commonware_consensus::types::View::zero(),
+                self.genesis_parent,
+            ),
             0,
             self.genesis_state_target.clone(),
             self.genesis_transactions_target.clone(),

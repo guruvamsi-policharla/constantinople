@@ -458,21 +458,24 @@ const fn production_sync_config() -> SyncEngineConfig {
     }
 }
 
-async fn resolve_startup_mode<T, F, Fut>(
+async fn resolve_startup_mode<T, Fin, F, Fut>(
     requested: StartupModeConfig,
     fetch_initial_target: F,
-) -> StartupMode<T>
+) -> StartupMode<T, Fin>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<T>>,
+    Fut: Future<Output = Option<(T, Fin)>>,
 {
     match requested {
         StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
         StartupModeConfig::StateSync => {
-            let block = fetch_initial_target()
+            let (block, finalization) = fetch_initial_target()
                 .await
                 .expect("bootstrapper actor exited before selecting a state-sync target");
-            StartupMode::StateSync { block }
+            StartupMode::StateSync {
+                block,
+                finalization,
+            }
         }
     }
 }

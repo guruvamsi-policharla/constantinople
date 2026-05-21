@@ -228,10 +228,16 @@ impl EngineDefinition for TestEngineDefinition {
                 bootstrapper_mailbox
                     .fetch_initial_target()
                     .await
-                    .map(|block| {
+                    .map(|(block, finalization)| {
                         let height = block.height().get();
                         sync_heights.lock().insert(public_key.clone(), height);
-                        (StartupMode::StateSync { block }, Some(height))
+                        (
+                            StartupMode::StateSync {
+                                block,
+                                finalization,
+                            },
+                            Some(height),
+                        )
                     })
                     .expect("bootstrapper actor exited before selecting a state-sync target")
             } else {

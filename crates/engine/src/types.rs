@@ -10,7 +10,10 @@ use commonware_coding::ReedSolomon;
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
-        coding::{Coding, Marshaled, shards, types::StoredCodedBlock},
+        coding::{
+            Coding, Marshaled, shards,
+            types::{CodedBlock, StoredCodedBlock},
+        },
         core::Mailbox as MarshalMailbox,
     },
     simplex::{self, types::Finalization},
@@ -33,6 +36,9 @@ pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
 
 /// The erasure-coding variant used by the marshal for block availability.
 pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
+
+/// A marshal-coded engine block.
+pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
 pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
@@ -136,6 +142,7 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
         StateResolverMailbox<E, H, P, HashT>,
         TransactionResolverMailbox<E, H, HashT>,
     ),
+    EngineFinalization<P, V>,
 >;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, SigT, HashT> = Marshaled<
