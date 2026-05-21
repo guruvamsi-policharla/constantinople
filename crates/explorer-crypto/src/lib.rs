@@ -9,7 +9,10 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{
     Sha256, Signer as _,
-    bls12381::primitives::variant::{MinSig, Variant},
+    bls12381::primitives::{
+        sharing::{ModeVersion, Sharing},
+        variant::{MinSig, Variant},
+    },
     certificate::Scheme as _,
     ed25519, sha256,
 };
@@ -21,12 +24,14 @@ use commonware_storage::{
     },
 };
 use constantinople_primitives::{Block, BlockCfg, Sealed};
+use core::num::NonZeroU32;
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
 use rand::{SeedableRng as _, rngs::StdRng};
 use wasm_bindgen::prelude::*;
 
 const ED25519_PRIVATE_KEY_BYTES: usize = 32;
 const CONSENSUS_NAMESPACE: &[u8] = b"constantinople_CONSENSUS";
+const MAX_SIMPLEX_PARTICIPANTS: u32 = 10_000;
 
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<sha256::Digest>>;
 type ConsensusScheme = threshold_standard::Scheme<ed25519::PublicKey, MinSig>;
@@ -151,14 +156,7 @@ pub fn verify_finalization(
     verification_material: &[u8],
     finalized_artifact: &[u8],
 ) -> Result<JsValue, JsError> {
-    let mut material = verification_material;
-    let identity = <MinSig as Variant>::Public::read(&mut material)
-        .map_err(|error| JsError::new(&format!("failed to decode Simplex identity: {error}")))?;
-    if !material.is_empty() {
-        return Err(JsError::new(
-            "Simplex verification material contains trailing bytes",
-        ));
-    }
+    let identity = simplex_identity(verification_material)?;
 
     let scheme = ConsensusScheme::certificate_verifier(CONSENSUS_NAMESPACE, identity);
     let mut reader = finalized_artifact;
@@ -220,6 +218,31 @@ pub fn verify_finalization(
         Uint8Array::from(block.seal().as_ref()).into(),
     )?;
     Ok(result.into())
+}
+
+fn simplex_identity(verification_material: &[u8]) -> Result<<MinSig as Variant>::Public, JsError> {
+    let mut identity_bytes = verification_material;
+    match <MinSig as Variant>::Public::read(&mut identity_bytes) {
+        Ok(identity) if identity_bytes.is_empty() => return Ok(identity),
+        _ => {}
+    }
+
+    let mut sharing_bytes = verification_material;
+    let max_participants =
+        NonZeroU32::new(MAX_SIMPLEX_PARTICIPANTS).expect("MAX_SIMPLEX_PARTICIPANTS is non-zero");
+    let sharing =
+        Sharing::<MinSig>::read_cfg(&mut sharing_bytes, &(max_participants, ModeVersion::v0()))
+            .map_err(|error| {
+                JsError::new(&format!(
+                    "failed to decode Simplex verification material: {error}"
+                ))
+            })?;
+    if !sharing_bytes.is_empty() {
+        return Err(JsError::new(
+            "Simplex verification material contains trailing bytes",
+        ));
+    }
+    Ok(*sharing.public())
 }
 
 fn decode_digest(bytes: &[u8], label: &str) -> Result<sha256::Digest, JsError> {

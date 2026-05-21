@@ -61,7 +61,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         args,
         local,
         &material.primary_hex(),
-        &hex(&material.dkg_output.public().encode()),
+        &hex(&material.dkg_output.public().public().encode()),
     );
 }
 

@@ -479,6 +479,10 @@ body {
     width: 18ch;
 }
 
+.tx-col-cert {
+    width: 7ch;
+}
+
 .tx-col-proof {
     width: 20ch;
 }
@@ -729,6 +733,10 @@ body {
 .col-txs {
     width: 12ch;
     text-align: right;
+}
+
+.col-cert {
+    width: 8ch;
 }
 
 .col-time {

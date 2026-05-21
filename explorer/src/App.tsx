@@ -14,7 +14,12 @@ import {
     type SubmitResponse,
     type TxStatus,
 } from './mempool';
-import { fetchAndVerifyTransactionProof, type VerifiedTransactionProof } from './qmdb';
+import {
+    fetchAndVerifyBlockCertificate,
+    fetchAndVerifyTransactionProof,
+    type VerifiedBlockCertificate,
+    type VerifiedTransactionProof,
+} from './qmdb';
 import {
     clearSession,
     createWallet,
@@ -74,8 +79,20 @@ interface SubmittedTransaction {
     readonly status: 'pending' | 'accepted' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
     readonly finalizedHeight: number | null;
+    readonly certificate: BlockCertificateState;
     readonly proof: TransactionProofState;
 }
+
+type BlockCertificateState =
+    | { readonly status: 'waiting'; readonly detail: string }
+    | { readonly status: 'fetching'; readonly detail: string }
+    | {
+          readonly status: 'verified';
+          readonly detail: string;
+          readonly height: string;
+          readonly view: string;
+      }
+    | { readonly status: 'error'; readonly detail: string };
 
 type TransactionProofState =
     | { readonly status: 'waiting'; readonly detail: string }
@@ -94,6 +111,8 @@ interface ObservedRateWindow {
     readonly latestBlockAt: number | null;
 }
 
+type BlockCertificateByHeight = Record<string, BlockCertificateState>;
+
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
     // Cumulative counters across every block we've ever observed on the
@@ -106,6 +125,7 @@ export default function App() {
         latestBlockAt: null,
     });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
+    const [blockCertificates, setBlockCertificates] = useState<BlockCertificateByHeight>({});
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
@@ -170,6 +190,58 @@ export default function App() {
     }, [history]);
 
     useEffect(() => {
+        setBlockCertificates((current) => pruneBlockCertificates(blocks, current));
+    }, [blocks]);
+
+    useEffect(() => {
+        if (hasFetchingObservedBlockCertificate(blockCertificates)) return;
+
+        const block = blocks.find((entry) =>
+            shouldFetchObservedBlockCertificate(entry, blockCertificates),
+        );
+        if (!block) return;
+
+        const height = Number(block.height);
+        setBlockCertificates((current) =>
+            updateObservedBlockCertificate(height, fetchingBlockCertificateState(), current),
+        );
+        fetchAndVerifyBlockCertificate({
+            storeUrl,
+            simplexVerificationMaterial,
+            height,
+        })
+            .then((certificate) => {
+                setBlockCertificates((current) =>
+                    updateObservedBlockCertificate(
+                        Number(certificate.height),
+                        verifiedBlockCertificateState(certificate),
+                        current,
+                    ),
+                );
+            })
+            .catch((error) => {
+                const detail = error instanceof Error ? error.message : String(error);
+                const nextCertificate: BlockCertificateState = isRetryableCertificateError(detail)
+                    ? { status: 'fetching', detail: 'waiting for block certificate' }
+                    : { status: 'error', detail };
+                setBlockCertificates((current) =>
+                    updateObservedBlockCertificate(height, nextCertificate, current),
+                );
+                if (!isRetryableCertificateError(detail)) return;
+
+                window.setTimeout(() => {
+                    setBlockCertificates((current) =>
+                        updateObservedBlockCertificate(
+                            height,
+                            { status: 'waiting', detail: 'waiting for block certificate' },
+                            current,
+                        ),
+                    );
+                }, 1_000);
+            });
+    }, [blocks, blockCertificates]);
+
+    useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
         if (hasFetchingProof(history, signedInSender)) return;
 
@@ -193,7 +265,18 @@ export default function App() {
         })
             .then((proof) => {
                 setHistory((current) =>
-                    updateTransactionProof(tx.digest, verifiedProofState(proof), current),
+                    updateBlockCertificateByHeight(
+                        Number(proof.height),
+                        verifiedBlockCertificateState(proof),
+                        updateTransactionProof(tx.digest, verifiedProofState(proof), current),
+                    ),
+                );
+                setBlockCertificates((current) =>
+                    updateObservedBlockCertificate(
+                        Number(proof.height),
+                        verifiedBlockCertificateState(proof),
+                        current,
+                    ),
                 );
             })
             .catch((error) => {
@@ -229,6 +312,56 @@ export default function App() {
                 );
             });
     }, [history, wallet]);
+
+    useEffect(() => {
+        if (hasFetchingBlockCertificate(history)) return;
+
+        const tx = history.find(shouldFetchBlockCertificate);
+        if (!tx) return;
+
+        const height = tx.finalizedHeight;
+        setHistory((current) =>
+            updateBlockCertificateByHeight(
+                height,
+                fetchingBlockCertificateState(),
+                current,
+            ),
+        );
+        fetchAndVerifyBlockCertificate({
+            storeUrl,
+            simplexVerificationMaterial,
+            height,
+        })
+            .then((certificate) => {
+                setHistory((current) =>
+                    updateBlockCertificateByHeight(
+                        Number(certificate.height),
+                        verifiedBlockCertificateState(certificate),
+                        current,
+                    ),
+                );
+            })
+            .catch((error) => {
+                const detail = error instanceof Error ? error.message : String(error);
+                const nextCertificate: BlockCertificateState = isRetryableCertificateError(detail)
+                    ? { status: 'fetching', detail: 'waiting for block certificate' }
+                    : { status: 'error', detail };
+                setHistory((current) =>
+                    updateBlockCertificateByHeight(height, nextCertificate, current),
+                );
+                if (!isRetryableCertificateError(detail)) return;
+
+                window.setTimeout(() => {
+                    setHistory((current) =>
+                        updateBlockCertificateByHeight(
+                            height,
+                            { status: 'waiting', detail: 'waiting for block certificate' },
+                            current,
+                        ),
+                    );
+                }, 1_000);
+            });
+    }, [history]);
 
     useEffect(() => {
         return () => {
@@ -378,6 +511,7 @@ export default function App() {
                 status: 'pending',
                 detail: 'submitted to mempool',
                 finalizedHeight: null,
+                certificate: { status: 'waiting', detail: 'waiting for finalization' },
                 proof: { status: 'waiting', detail: 'waiting for finalization' },
             };
             setHistory((current) => prependTransaction(pending, current));
@@ -431,7 +565,7 @@ export default function App() {
                 />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
-                    <BlockTable blocks={blocks} />
+                    <BlockTable blocks={blocks} certificates={blockCertificates} />
                 </main>
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
@@ -739,6 +873,7 @@ function TransactionHistory({
                         <th className="tx-col-amount">amount</th>
                         <th className="tx-col-nonce">nonce</th>
                         <th className="tx-col-status">status</th>
+                        <th className="tx-col-cert">cert</th>
                         <th className="tx-col-proof">proof</th>
                         <th className="tx-col-latency">
                             <AsciiTooltip
@@ -793,11 +928,51 @@ function TransactionRow({
             <td>{tx.nonce}</td>
             <td>{tx.detail}</td>
             <td>
+                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
+            </td>
+            <td>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
             </td>
             <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
             <td>{formatter.format(tx.submittedAt)}</td>
         </tr>
+    );
+}
+
+function CertificateCell({
+    certificate,
+    finalizedHeight,
+}: {
+    certificate: BlockCertificateState;
+    finalizedHeight: number | null;
+}) {
+    if (certificate.status === 'verified') {
+        return (
+            <span
+                className="tx-proof-check"
+                aria-label="block certificate verified"
+                title="block certificate verified"
+            >
+                ✓
+            </span>
+        );
+    }
+    if (certificate.status === 'error') {
+        return (
+            <span className="tx-proof-error" aria-label={certificate.detail} title={certificate.detail}>
+                !
+            </span>
+        );
+    }
+    if (finalizedHeight === null) {
+        return (
+            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
+                -
+            </span>
+        );
+    }
+    return (
+        <span className="tx-proof-spinner" aria-label={certificate.detail} title={certificate.detail} />
     );
 }
 
@@ -870,6 +1045,51 @@ function compareBlockHeightDesc(a: bigint, b: bigint): number {
     return 0;
 }
 
+function blockCertificateForHeight(
+    height: bigint,
+    certificates: BlockCertificateByHeight,
+): BlockCertificateState {
+    return certificates[height.toString()] ?? defaultBlockCertificate(Number(height));
+}
+
+function pruneBlockCertificates(
+    blocks: ObservedBlock[],
+    certificates: BlockCertificateByHeight,
+): BlockCertificateByHeight {
+    const visibleHeights = new Set(blocks.map((block) => block.height.toString()));
+    const entries = Object.entries(certificates).filter(([height]) => visibleHeights.has(height));
+    if (entries.length === Object.keys(certificates).length) {
+        return certificates;
+    }
+    return Object.fromEntries(entries);
+}
+
+function shouldFetchObservedBlockCertificate(
+    block: ObservedBlock,
+    certificates: BlockCertificateByHeight,
+): boolean {
+    const certificate = blockCertificateForHeight(block.height, certificates);
+    return (
+        certificate.status === 'waiting' ||
+        (certificate.status === 'error' && isRetryableCertificateError(certificate.detail))
+    );
+}
+
+function hasFetchingObservedBlockCertificate(certificates: BlockCertificateByHeight): boolean {
+    return Object.values(certificates).some((certificate) => certificate.status === 'fetching');
+}
+
+function updateObservedBlockCertificate(
+    height: number,
+    certificate: BlockCertificateState,
+    certificates: BlockCertificateByHeight,
+): BlockCertificateByHeight {
+    return {
+        ...certificates,
+        [String(height)]: certificate,
+    };
+}
+
 function prependTransaction(
     transaction: SubmittedTransaction,
     current: SubmittedTransaction[],
@@ -891,6 +1111,7 @@ function updateTransactionStatus(
             detail,
             finalizedInMs: status.status === 'accepted' ? null : Date.now() - tx.submittedAt,
             finalizedHeight: statusHasHeight(status) ? status.height : tx.finalizedHeight,
+            certificate: nextBlockCertificateState(status, tx.certificate),
             proof: nextProofState(status, digest, tx.proof),
         };
     });
@@ -902,6 +1123,14 @@ function updateTransactionProof(
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
     return current.map((tx) => (tx.digest === digest ? { ...tx, proof } : tx));
+}
+
+function updateBlockCertificateByHeight(
+    height: number,
+    certificate: BlockCertificateState,
+    current: SubmittedTransaction[],
+): SubmittedTransaction[] {
+    return current.map((tx) => (tx.finalizedHeight === height ? { ...tx, certificate } : tx));
 }
 
 function shouldFetchTransactionProof(
@@ -919,6 +1148,18 @@ function shouldFetchTransactionProof(
     );
 }
 
+function shouldFetchBlockCertificate(
+    tx: SubmittedTransaction,
+): tx is SubmittedTransaction & { readonly finalizedHeight: number } {
+    return (
+        tx.finalizedHeight !== null &&
+        (tx.status === 'finalized' || tx.status === 'partially_finalized') &&
+        (tx.certificate.status === 'waiting' ||
+            (tx.certificate.status === 'error' &&
+                isRetryableCertificateError(tx.certificate.detail)))
+    );
+}
+
 function hasFetchingProof(
     transactions: SubmittedTransaction[],
     signedInSender: string | null,
@@ -927,10 +1168,35 @@ function hasFetchingProof(
     return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
 }
 
+function hasFetchingBlockCertificate(transactions: SubmittedTransaction[]): boolean {
+    return transactions.some((tx) => tx.certificate.status === 'fetching');
+}
+
 function isRetryableProofError(detail: string): boolean {
-    return /tx_meta missing|finalization missing|QMDB transaction proof response missing|out_of_range|unavailable|fetch/i.test(
+    return /tx_meta missing|finalization missing|QMDB transaction proof response missing|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
         detail,
     );
+}
+
+function isRetryableCertificateError(detail: string): boolean {
+    return /finalization missing|not found|missing proof|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
+        detail,
+    );
+}
+
+function fetchingBlockCertificateState(): BlockCertificateState {
+    return { status: 'fetching', detail: 'fetching block certificate' };
+}
+
+function nextBlockCertificateState(
+    status: TxStatus,
+    current: BlockCertificateState,
+): BlockCertificateState {
+    if (status.status === 'accepted') return current;
+    if (status.status === 'dropped') {
+        return { status: 'waiting', detail: 'not finalized' };
+    }
+    return { status: 'waiting', detail: 'waiting for block certificate' };
 }
 
 function nextProofState(
@@ -959,6 +1225,15 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
         location: proof.location.toString(),
         tip: proof.tip.toString(),
         proofSizeBytes: proof.proofSizeBytes,
+    };
+}
+
+function verifiedBlockCertificateState(certificate: VerifiedBlockCertificate): BlockCertificateState {
+    return {
+        status: 'verified',
+        detail: `verified at height ${certificate.height.toString()}`,
+        height: certificate.height.toString(),
+        view: certificate.view.toString(),
     };
 }
 
@@ -1101,6 +1376,8 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     const finalizedInMs =
         typeof transaction.finalizedInMs === 'number' ? transaction.finalizedInMs : null;
+    const finalizedHeight =
+        typeof transaction.finalizedHeight === 'number' ? transaction.finalizedHeight : null;
 
     return {
         digest: transaction.digest,
@@ -1112,10 +1389,49 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         finalizedInMs,
         status: transaction.status as SubmittedTransaction['status'],
         detail: transaction.detail,
-        finalizedHeight:
-            typeof transaction.finalizedHeight === 'number' ? transaction.finalizedHeight : null,
+        finalizedHeight,
+        certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+function normalizeBlockCertificate(
+    value: unknown,
+    finalizedHeight: number | null,
+): BlockCertificateState {
+    if (typeof value !== 'object' || value === null) {
+        return defaultBlockCertificate(finalizedHeight);
+    }
+    const certificate = value as Record<string, unknown>;
+    if (
+        certificate.status === 'verified' &&
+        typeof certificate.detail === 'string' &&
+        typeof certificate.height === 'string' &&
+        typeof certificate.view === 'string'
+    ) {
+        return {
+            status: 'verified',
+            detail: certificate.detail,
+            height: certificate.height,
+            view: certificate.view,
+        };
+    }
+    if (
+        (certificate.status === 'waiting' ||
+            certificate.status === 'fetching' ||
+            certificate.status === 'error') &&
+        typeof certificate.detail === 'string'
+    ) {
+        return { status: certificate.status, detail: certificate.detail };
+    }
+    return defaultBlockCertificate(finalizedHeight);
+}
+
+function defaultBlockCertificate(finalizedHeight: number | null): BlockCertificateState {
+    if (finalizedHeight === null) {
+        return { status: 'waiting', detail: 'waiting for finalization' };
+    }
+    return { status: 'waiting', detail: 'waiting for block certificate' };
 }
 
 function normalizeTransactionProof(value: unknown): TransactionProofState {
@@ -1371,7 +1687,13 @@ function buildHistogram(
     return { lines, peak };
 }
 
-function BlockTable({ blocks }: { blocks: ObservedBlock[] }) {
+function BlockTable({
+    blocks,
+    certificates,
+}: {
+    blocks: ObservedBlock[];
+    certificates: BlockCertificateByHeight;
+}) {
     const formatter = useMemo(
         () =>
             new Intl.DateTimeFormat(undefined, {
@@ -1396,6 +1718,7 @@ function BlockTable({ blocks }: { blocks: ObservedBlock[] }) {
                 <tr>
                     <th className="col-height">height</th>
                     <th className="col-txs">txs</th>
+                    <th className="col-cert">cert</th>
                     <th className="col-time">arrived</th>
                 </tr>
             </thead>
@@ -1406,6 +1729,15 @@ function BlockTable({ blocks }: { blocks: ObservedBlock[] }) {
                         <tr key={block.height.toString()} className={isFresh ? 'is-fresh' : undefined}>
                             <td className="col-height">{block.height.toString()}</td>
                             <td className="col-txs">{block.txCount.toLocaleString()}</td>
+                            <td className="col-cert">
+                                <CertificateCell
+                                    certificate={blockCertificateForHeight(
+                                        block.height,
+                                        certificates,
+                                    )}
+                                    finalizedHeight={Number(block.height)}
+                                />
+                            </td>
                             <td className="col-time">{formatter.format(block.arrivedAt)}</td>
                         </tr>
                     );

@@ -145,7 +145,7 @@ The printed `mprocs` command list grows by four entries:
 - `cargo run -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
   — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
   overrides the port.
-- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<dkg-public-key> npm --prefix explorer run dev`
+- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization

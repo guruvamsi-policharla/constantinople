@@ -25,6 +25,11 @@ export interface VerifiedTransactionProof {
     readonly proofSizeBytes: number;
 }
 
+export interface VerifiedBlockCertificate {
+    readonly height: bigint;
+    readonly view: bigint;
+}
+
 interface TransactionProofMetadata {
     readonly location: bigint;
     readonly height: bigint;
@@ -57,7 +62,7 @@ export async function fetchAndVerifyTransactionProof({
 }): Promise<VerifiedTransactionProof> {
     await loadCrypto();
     const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, height, signal);
-    const target = await fetchFinalizedTransactionTarget(
+    const target = await finalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
         metadata.height,
@@ -88,6 +93,30 @@ export async function fetchAndVerifyTransactionProof({
         height: target.height,
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
+    };
+}
+
+export async function fetchAndVerifyBlockCertificate({
+    storeUrl,
+    simplexVerificationMaterial,
+    height,
+    signal,
+}: {
+    storeUrl: string;
+    simplexVerificationMaterial: string;
+    height: number;
+    signal?: AbortSignal;
+}): Promise<VerifiedBlockCertificate> {
+    await loadCrypto();
+    const target = await finalizedTransactionTarget(
+        storeUrl,
+        simplexVerificationMaterial,
+        BigInt(height),
+        signal,
+    );
+    return {
+        height: target.height,
+        view: target.view,
     };
 }
 
@@ -137,6 +166,33 @@ async function fetchOperationProof(
         throw new Error('QMDB transaction proof response missing proof');
     }
     return response.proof;
+}
+
+const finalizedTargetCache = new Map<string, Promise<FinalizedTransactionTarget>>();
+
+function finalizedTransactionTarget(
+    storeUrl: string,
+    simplexVerificationMaterial: string,
+    height: bigint,
+    signal?: AbortSignal,
+): Promise<FinalizedTransactionTarget> {
+    const key = `${trimTrailingSlash(storeUrl)}:${simplexVerificationMaterial}:${height}`;
+    const cached = finalizedTargetCache.get(key);
+    if (cached) {
+        return cached;
+    }
+
+    const target = fetchFinalizedTransactionTarget(
+        storeUrl,
+        simplexVerificationMaterial,
+        height,
+        signal,
+    ).catch((error: unknown) => {
+        finalizedTargetCache.delete(key);
+        throw error;
+    });
+    finalizedTargetCache.set(key, target);
+    return target;
 }
 
 async function fetchFinalizedTransactionTarget(
