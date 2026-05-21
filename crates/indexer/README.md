@@ -17,16 +17,17 @@ that fits.
 
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
-| **Full storage** (KV) | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`, `FINALIZED`, `NOTARIZED` | Tools that need full `SignedTransaction` bodies or certificate artifacts through [`IndexerClient`](src/client.rs). |
+| **Full storage** (KV) | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H` | Tools that need full `SignedTransaction` bodies through [`IndexerClient`](src/client.rs). |
 | **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, view, finalized_ts, transactions_root, transactions_tip)` and `tx_meta(height, index, tx_digest, qmdb_location)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
+| **Simplex artifacts** | `exoware-simplex` header and finalization indexes in the shared Store | The explorer and proof clients that need a browser-verifiable finalization certificate for a block. |
 
 All paths share the same exoware [`StoreClient`] under the hood. In non-QMDB
 mode, raw KV and SQL uploads run as separate background uploaders. In QMDB
 mode, the owning secondary stages raw KV rows, SQL rows, and both QMDB row
 families into one Store batch before acknowledging the finalized block.
-The KV families are namespaced under
-`reserved_bits=4, prefix=0x1..=0x6` (see [`src/keys.rs`](src/keys.rs));
+The active KV families are namespaced under
+`reserved_bits=4, prefix=0x1,0x2,0x5,0x6` (see [`src/keys.rs`](src/keys.rs));
 the SQL tables use a disjoint prefix range
 (`0x00..=0x0F`, declared in [`exoware-sql`'s `KvSchema`][kvschema]) so a
 single store can host every index without collision.
@@ -36,8 +37,8 @@ single store can host every index without collision.
 
 ## Crate contents
 
-- `KeyCodec` wrappers for the six KV artifact families (blocks,
-  transactions, certificates, height/digest indexes).
+- `KeyCodec` wrappers for the raw KV artifact families (blocks,
+  transactions, and height/digest indexes).
 - [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
   source of truth for the `block_meta` and `tx_meta` table layouts. The
   explorer's column-name strings live here too, so a schema change is a
@@ -46,8 +47,8 @@ single store can host every index without collision.
   `Update::Block` events and fans each finalized block out across raw KV and
   SQL uploaders when QMDB upload is disabled.
 - A [`CertificateReporter`](src/publisher/certificate.rs) that taps
-  simplex `Activity` events and uploads notarization / finalization
-  certificates to the blocks KV store.
+  simplex `Activity` events, pairs certificates with finalized blocks, and
+  uploads `exoware-simplex` artifacts to the shared Store.
 - A [`QmdbPublisher`](src/publisher/qmdb.rs) that runs from the finalized hook
   on the single QMDB-owning secondary and commits raw KV, SQL, account-state
   QMDB, and transaction-hash QMDB rows in one Store batch.

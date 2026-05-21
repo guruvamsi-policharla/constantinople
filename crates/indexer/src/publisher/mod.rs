@@ -11,13 +11,16 @@
 //!   success each task fulfills its clone of the marshal acknowledgement
 //!   bundled with the batch (if any).
 //!
-//! Constantinople's metadata-only and non-QMDB full modes fan data across one
-//! raw KV stream plus one SQL stream:
+//! Constantinople's metadata-only and non-QMDB full modes fan block data across
+//! one raw KV stream plus one SQL stream:
 //!
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
-//! | `raw` (KV)       | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`, `FINALIZED`, `NOTARIZED` |
+//! | `raw` (KV)       | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`            |
 //! | `sql` (metadata) | `block_meta`, `tx_meta`                                      |
+//!
+//! Simplex certificates are uploaded separately through [`CertificateReporter`]
+//! using `exoware-simplex` indexes in the same Store.
 //!
 //! The marshal [`Exact`] acknowledgement is cloned once per uploader so the
 //! waiter resolves only after every path has durably accepted its batch.
@@ -67,8 +70,8 @@ pub struct UploadBatch {
 /// Store. The second carries typed
 /// [`SqlBatch`]es to the SQL metadata uploader, which owns a single
 /// [`exoware_sql::BatchWriter`] over its own [`StoreClient`]. Cloneable
-/// [`BlockReporter`] / [`CertificateReporter`] instances clone these
-/// senders and forward batches to the uploader tasks.
+/// [`BlockReporter`] instances clone these senders and forward batches to the
+/// uploader tasks.
 pub struct UploaderHandles {
     /// Sender for raw KV rows.
     pub raw: mpsc::Sender<UploadBatch>,

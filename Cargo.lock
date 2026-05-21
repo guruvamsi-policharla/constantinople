@@ -1747,9 +1747,13 @@ name = "constantinople-explorer-crypto"
 version = "0.0.0"
 dependencies = [
  "commonware-codec",
+ "commonware-consensus",
  "commonware-cryptography",
+ "commonware-parallel",
  "commonware-storage",
+ "constantinople-primitives",
  "js-sys",
+ "rand 0.8.6",
  "wasm-bindgen",
 ]
 
@@ -1778,6 +1782,7 @@ dependencies = [
  "datafusion",
  "exoware-qmdb",
  "exoware-sdk",
+ "exoware-simplex",
  "exoware-simulator",
  "exoware-sql",
  "futures",
@@ -2991,7 +2996,7 @@ dependencies = [
 [[package]]
 name = "exoware-qmdb"
 version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=296d6423634c2ea7b5f34133c79a7b7386c44f60#296d6423634c2ea7b5f34133c79a7b7386c44f60"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
 dependencies = [
  "axum",
  "buffa",
@@ -3021,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "exoware-sdk"
 version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=296d6423634c2ea7b5f34133c79a7b7386c44f60#296d6423634c2ea7b5f34133c79a7b7386c44f60"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
 dependencies = [
  "anyhow",
  "base64",
@@ -3048,7 +3053,7 @@ dependencies = [
 [[package]]
 name = "exoware-server"
 version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=296d6423634c2ea7b5f34133c79a7b7386c44f60#296d6423634c2ea7b5f34133c79a7b7386c44f60"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3062,9 +3067,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "exoware-simplex"
+version = "2026.4.1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+dependencies = [
+ "bytes",
+ "clap",
+ "commonware-codec",
+ "commonware-consensus",
+ "commonware-cryptography",
+ "commonware-math",
+ "commonware-parallel",
+ "commonware-utils",
+ "exoware-sdk",
+ "futures",
+ "hex",
+ "rand 0.8.6",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "exoware-simulator"
 version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=296d6423634c2ea7b5f34133c79a7b7386c44f60#296d6423634c2ea7b5f34133c79a7b7386c44f60"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
 dependencies = [
  "axum",
  "bytes",
@@ -3083,7 +3111,7 @@ dependencies = [
 [[package]]
 name = "exoware-sql"
 version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=296d6423634c2ea7b5f34133c79a7b7386c44f60#296d6423634c2ea7b5f34133c79a7b7386c44f60"
+source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
 dependencies = [
  "async-trait",
  "axum",

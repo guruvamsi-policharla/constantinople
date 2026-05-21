@@ -32,9 +32,7 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
-use constantinople_indexer::{
-    BlockReporter, CertificateReporter, QmdbPublisher, spawn_raw_uploader, spawn_uploaders,
-};
+use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -58,7 +56,8 @@ const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 /// We always pin `O` to the indexer's certificate publisher so the engine type
 /// stays the same whether or not the indexer is enabled. Validators that opt
 /// out simply pass `simplex_observer: None`.
-type EngineCertReporter = CertificateReporter<ThresholdScheme<PublicKey, MinSig>, Commitment>;
+type EngineCertReporter =
+    CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 
 /// Concrete type the engine sees in `engine.start(_, reporter)`.
 ///
@@ -109,19 +108,20 @@ async fn maybe_build_indexer(
     match cfg.mode {
         IndexerMode::Full => {
             let raw_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+            let (cert_reporter, cert_join) =
+                EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
+            let cert_reporter = Some(cert_reporter);
             if cfg.qmdb_upload {
                 let qmd_publisher = Some(Arc::new(
                     QmdbPublisher::connect(&cfg.chain_indexer_url, cfg.upload_buffer)
                         .await
                         .expect("failed to initialize qmd publisher"),
                 ));
-                let (raw, raw_join) = spawn_raw_uploader(raw_store, cfg.upload_buffer);
-                let cert_reporter = Some(EngineCertReporter::new(raw));
                 Some(IndexerHandle {
                     block_reporter: None,
                     cert_reporter,
                     qmd_publisher,
-                    _uploaders: vec![raw_join],
+                    _uploaders: vec![cert_join],
                 })
             } else {
                 let sql_store =
@@ -131,12 +131,13 @@ async fn maybe_build_indexer(
                     uploaders.raw.clone(),
                     uploaders.sql.clone(),
                 );
-                let cert_reporter = Some(EngineCertReporter::new(uploaders.raw.clone()));
+                let mut joins = Vec::from(uploaders.joins);
+                joins.push(cert_join);
                 Some(IndexerHandle {
                     block_reporter: Some(block_reporter),
                     cert_reporter,
                     qmd_publisher: None,
-                    _uploaders: Vec::from(uploaders.joins),
+                    _uploaders: joins,
                 })
             }
         }
@@ -158,14 +159,25 @@ fn indexer_finalized_hook(
     indexer: Option<&IndexerHandle>,
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
-    let publisher = indexer?.qmd_publisher.clone()?;
+    let indexer = indexer?;
+    let publisher = indexer.qmd_publisher.clone();
+    let cert_reporter = indexer.cert_reporter.clone();
+    if publisher.is_none() && cert_reporter.is_none() {
+        return None;
+    }
     Some(Arc::new(move |block, databases| {
         let publisher = publisher.clone();
+        let cert_reporter = cert_reporter.clone();
         Box::pin(async move {
-            publisher
-                .upload_finalized(block, databases)
-                .await
-                .expect("finalized index upload failed");
+            if let Some(publisher) = publisher {
+                publisher
+                    .upload_finalized(block, databases)
+                    .await
+                    .expect("finalized index upload failed");
+            }
+            if let Some(cert_reporter) = cert_reporter {
+                cert_reporter.publish_block(block).await;
+            }
         })
     }))
 }

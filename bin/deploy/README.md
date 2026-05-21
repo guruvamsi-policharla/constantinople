@@ -145,16 +145,24 @@ The printed `mprocs` command list grows by four entries:
 - `cargo run -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
   — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
   overrides the port.
-- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 npm --prefix explorer run dev`
+- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<dkg-public-key> npm --prefix explorer run dev`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service, streams new finalized blocks live, and verifies
-  submitted-transaction proofs against `qmdb-indexer`.
+  submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
+  certificates in the shared store.
 
 Validators do not upload QMDB data to `qmdb-indexer` directly. The first
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
 Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes
 account-state operation-log APIs under `/state` and transaction-hash
 operation-log APIs under `/transactions`.
+
+Validators also write Simplex finalization artifacts into the shared
+`chain-indexer` store through `exoware-simplex`. The explorer reads those
+artifacts through `VITE_STORE_URL`, verifies them with
+`VITE_SIMPLEX_VERIFICATION_MATERIAL`, checks that the certified marshal
+commitment names the decoded block, and only then uses the block's transaction
+root as the trusted root for the QMDB transaction proof.
 
 If `--relayer` is also enabled, the explorer command receives `VITE_MEMPOOL_URL` pointing at the
 local relayer. Otherwise it uses its default direct mempool URL.
@@ -365,6 +373,8 @@ Topology and defaults:
 - `chain-indexer` is a single shared simulator-backed store instance.
 - `metadata-indexer` is a single shared SQL query/stream service layered on that store.
 - `qmdb-indexer` is a single shared QMDB Connect facade layered on that store.
+- Simplex finalization artifacts are stored in `chain-indexer` and read
+  directly by proof-verifying clients through the Store API.
 - all shared indexer services land in the first remote region.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
@@ -375,6 +385,9 @@ Topology and defaults:
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
 writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
 mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
+Simplex certificates follow the same boundary: validators commit them through
+the shared Store URL, and clients read them from the Store rather than from
+`qmdb-indexer`.
 
 The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
 deployment-wide rather than per-instance.

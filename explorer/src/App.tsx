@@ -50,15 +50,17 @@ type Status =
 
 // The explorer subscribes to `metadata-indexer` for block rows and queries
 // `qmdb-indexer` for submitted-transaction proofs. Defaults match
-// `bin/deploy/src/local.rs`; override via `VITE_SQL_URL` and `VITE_QMDB_URL`
-// for non-default deployments.
+// `bin/deploy/src/local.rs`; override the VITE_* URLs for non-default deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
+const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
 const LOCAL_HISTORY_KEY = 'constantinople.submitted-transactions.v1';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
 const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
+const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
+const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
 
 interface SubmittedTransaction {
@@ -184,6 +186,8 @@ export default function App() {
         fetchAndVerifyTransactionProof({
             sqlUrl: indexerUrl,
             qmdbUrl,
+            storeUrl,
+            simplexVerificationMaterial,
             digest: tx.digest,
             height: tx.finalizedHeight,
         })
@@ -924,7 +928,7 @@ function hasFetchingProof(
 }
 
 function isRetryableProofError(detail: string): boolean {
-    return /tx_meta missing|block_meta missing|QMDB transaction proof response missing|out_of_range|unavailable|fetch/i.test(
+    return /tx_meta missing|finalization missing|QMDB transaction proof response missing|out_of_range|unavailable|fetch/i.test(
         detail,
     );
 }
@@ -951,7 +955,7 @@ function statusHasHeight(status: TxStatus): status is Extract<TxStatus, { readon
 function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
     return {
         status: 'verified',
-        detail: `verified at op ${proof.location.toString()}`,
+        detail: `verified at height ${proof.height.toString()}`,
         location: proof.location.toString(),
         tip: proof.tip.toString(),
         proofSizeBytes: proof.proofSizeBytes,

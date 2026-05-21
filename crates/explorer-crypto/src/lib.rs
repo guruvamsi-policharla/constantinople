@@ -1,19 +1,36 @@
 //! Browser crypto bindings for the explorer.
 
-use commonware_codec::{Decode, DecodeExt as _, Encode as _, FixedSize as _};
-use commonware_cryptography::{Sha256, Signer as _, ed25519, sha256};
+use commonware_codec::{
+    Decode, DecodeExt as _, Encode as _, FixedSize as _, Read as _, ReadExt as _,
+};
+use commonware_consensus::{
+    simplex::{scheme::bls12381_threshold::standard as threshold_standard, types::Finalization},
+    types::coding::Commitment,
+};
+use commonware_cryptography::{
+    Sha256, Signer as _,
+    bls12381::primitives::variant::{MinSig, Variant},
+    certificate::Scheme as _,
+    ed25519, sha256,
+};
+use commonware_parallel::Sequential;
 use commonware_storage::{
     merkle::{self, Location, mmr},
     qmdb::{
         any::value::FixedEncoding, current::proof::OpsRootWitness, keyless, verify::verify_proof,
     },
 };
+use constantinople_primitives::{Block, BlockCfg, Sealed};
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
+use rand::{SeedableRng as _, rngs::StdRng};
 use wasm_bindgen::prelude::*;
 
 const ED25519_PRIVATE_KEY_BYTES: usize = 32;
+const CONSENSUS_NAMESPACE: &[u8] = b"constantinople_CONSENSUS";
 
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<sha256::Digest>>;
+type ConsensusScheme = threshold_standard::Scheme<ed25519::PublicKey, MinSig>;
+type ChainBlock = Sealed<Block<Commitment, ed25519::PublicKey, Sha256>, Sha256>;
 
 /// A Constantinople Ed25519 account key.
 #[wasm_bindgen]
@@ -124,6 +141,83 @@ pub fn verify_transaction_proof(
         &result,
         "operationCount",
         JsValue::from_f64(operations.len() as f64),
+    )?;
+    Ok(result.into())
+}
+
+/// Verifies a Simplex finalization and returns its certified transaction root.
+#[wasm_bindgen(js_name = verifyFinalization)]
+pub fn verify_finalization(
+    verification_material: &[u8],
+    finalized_artifact: &[u8],
+) -> Result<JsValue, JsError> {
+    let mut material = verification_material;
+    let identity = <MinSig as Variant>::Public::read(&mut material)
+        .map_err(|error| JsError::new(&format!("failed to decode Simplex identity: {error}")))?;
+    if !material.is_empty() {
+        return Err(JsError::new(
+            "Simplex verification material contains trailing bytes",
+        ));
+    }
+
+    let scheme = ConsensusScheme::certificate_verifier(CONSENSUS_NAMESPACE, identity);
+    let mut reader = finalized_artifact;
+    let proof = Finalization::<ConsensusScheme, Commitment>::read_cfg(
+        &mut reader,
+        &scheme.certificate_codec_config(),
+    )
+    .map_err(|error| JsError::new(&format!("failed to decode finalization proof: {error}")))?;
+    let mut rng = StdRng::seed_from_u64(0);
+    if !proof.verify(&mut rng, &scheme, &Sequential) {
+        return Err(JsError::new("finalization certificate verification failed"));
+    }
+
+    let commitment = Commitment::read(&mut reader).map_err(|error| {
+        JsError::new(&format!("failed to decode certified commitment: {error}"))
+    })?;
+    if proof.proposal.payload != commitment {
+        return Err(JsError::new(
+            "finalization payload does not match certified commitment",
+        ));
+    }
+
+    let block = ChainBlock::read_cfg(&mut reader, &BlockCfg::default())
+        .map_err(|error| JsError::new(&format!("failed to decode finalized block: {error}")))?;
+    if !reader.is_empty() {
+        return Err(JsError::new("finalized artifact contains trailing bytes"));
+    }
+    if commitment.block::<sha256::Digest>() != *block.seal() {
+        return Err(JsError::new(
+            "certified commitment does not match finalized block digest",
+        ));
+    }
+
+    let result = Object::new();
+    set(&result, "height", BigInt::from(block.header.height).into())?;
+    set(
+        &result,
+        "view",
+        BigInt::from(proof.proposal.round.view().get()).into(),
+    )?;
+    set(
+        &result,
+        "transactionsRoot",
+        Uint8Array::from(block.header.transactions_root.as_ref()).into(),
+    )?;
+    set(
+        &result,
+        "transactionsStart",
+        BigInt::from(block.header.transactions_range.start()).into(),
+    )?;
+    set(
+        &result,
+        "transactionsTip",
+        BigInt::from(block.header.transactions_range.end()).into(),
+    )?;
+    set(
+        &result,
+        "blockDigest",
+        Uint8Array::from(block.seal().as_ref()).into(),
     )?;
     Ok(result.into())
 }

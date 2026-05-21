@@ -5,10 +5,9 @@
 // rows from one atomic ingest batch, and at the indexer's "one flush per
 // finalized block" cadence that is exactly one row per finalized block.
 //
-// This client only talks to the metadata stream. The full-storage KV path
-// (BLOCK / TX / FINALIZED / NOTARIZED) is also published by the indexer for
-// tools that need full transaction bodies; submitted-transaction proofs use
-// the QMDB client in `qmdb.ts`.
+// This client only talks to the metadata stream. Full transaction bodies are
+// also published through raw KV; submitted-transaction proofs use the QMDB and
+// Simplex clients in `qmdb.ts`.
 //
 // Column names mirror `crates/indexer/src/sql_schema.rs` and must stay in
 // sync with `BLOCK_META_*` constants there.

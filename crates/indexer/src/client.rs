@@ -1,9 +1,9 @@
 //! Typed read-only wrapper around the indexer's raw KV [`StoreClient`]s.
 //!
 //! Constantinople writes full-storage KV data to one raw exoware Store.
-//! `IndexerClient` accepts separate handles for block/certificate and
-//! transaction families so older tests can still model split stores, but
-//! production wiring passes the same [`StoreClient`] for both handles.
+//! `IndexerClient` accepts separate handles for block and transaction families
+//! so older tests can still model split stores, but production wiring passes
+//! the same [`StoreClient`] for both handles.
 //! Block-level metadata lives in the SQL `block_meta` table — see
 //! [`crate::sql_schema`] — and is not served by this client.
 //!
@@ -37,7 +37,7 @@ pub enum ReadError {
 ///
 /// | Field          | Families served                                |
 /// | -------------- | ---------------------------------------------- |
-/// | `blocks`       | BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED        |
+/// | `blocks`       | BLOCK, BLOCK_BY_H, legacy FINALIZED/NOTARIZED |
 /// | `transactions` | TX, TX_BY_H                                    |
 #[derive(Clone, Debug)]
 pub struct IndexerClient {

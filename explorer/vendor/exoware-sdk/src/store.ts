@@ -36,8 +36,6 @@ import {
 
 const STREAM_SERVER_PAYLOAD_REGEX = '(?s-u).*';
 
-type Buffer = Uint8Array;
-
 type DetailObserver = (detail: Detail) => void;
 
 export { TraversalMode };
@@ -251,11 +249,11 @@ export class StoreKeyPrefix {
     }
 }
 
-function toUint8Array(value: Uint8Array | Buffer): Uint8Array {
+function toUint8Array(value: Uint8Array): Uint8Array {
     return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
 
-function copyBytes(value: Uint8Array | Buffer): Uint8Array {
+function copyBytes(value: Uint8Array): Uint8Array {
     return new Uint8Array(toUint8Array(value));
 }
 
@@ -284,7 +282,7 @@ function encodeStoreRange(
 export class StoreWriteBatch {
     private readonly kvs: StoreBatchEntry[] = [];
 
-    push(client: StoreClient, key: Uint8Array, value: Uint8Array | Buffer): this {
+    push(client: StoreClient, key: Uint8Array, value: Uint8Array): this {
         this.kvs.push({
             key: client.encodeStoreKey(key),
             value: copyBytes(value),
@@ -990,7 +988,7 @@ export class StoreClient {
         return new SerializableReadSession(this.client, this.keyPrefix, sequence);
     }
 
-    async set(key: Uint8Array, value: Uint8Array | Buffer): Promise<bigint> {
+    async set(key: Uint8Array, value: Uint8Array): Promise<bigint> {
         const req = create(PutRequestSchema, {
             kvs: [
                 create(KvEntrySchema, {
@@ -1007,7 +1005,7 @@ export class StoreClient {
         }
     }
 
-    async setMany(kvs: { key: Uint8Array; value: Uint8Array | Buffer }[]): Promise<bigint> {
+    async setMany(kvs: { key: Uint8Array; value: Uint8Array }[]): Promise<bigint> {
         const req = create(PutRequestSchema, {
             kvs: kvs.map((kv) =>
                 create(KvEntrySchema, {

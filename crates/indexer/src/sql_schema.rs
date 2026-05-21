@@ -2,15 +2,16 @@
 //!
 //! Constantinople fans every finalized block out across two storage paths:
 //!
-//! - **Full storage (KV)** — `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`,
-//!   `FINALIZED`, `NOTARIZED` rows in the existing exoware Stores. Anyone
-//!   can fetch a `SignedTransaction` body or a QMDB proof by digest from
-//!   this path.
+//! - **Full storage (KV)** — `BLOCK`, `BLOCK_BY_H`, `TX`, and `TX_BY_H`
+//!   rows in the existing exoware Store. Tools can fetch full
+//!   `SignedTransaction` bodies by digest from this path.
 //! - **Metadata streaming (SQL)** — two columnar tables registered onto
 //!   the same `StoreClient` via [`KvSchema`]. The `block_meta` table is
 //!   what the explorer subscribes to over the `store.sql.v1.Service`
 //!   `Subscribe` RPC; the `tx_meta` table is written for future
-//!   drill-down but has no consumer yet.
+//!   drill-down and submitted-transaction proof lookup.
+//! - **Simplex artifacts** — finalization certificates are written through
+//!   `exoware-simplex` beside the raw and SQL rows.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the

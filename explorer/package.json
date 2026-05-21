@@ -14,6 +14,7 @@
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
         "@exowarexyz/sdk": "file:vendor/exoware-sdk",
+        "@exowarexyz/simplex": "file:vendor/exoware-simplex",
         "@exowarexyz/sql": "file:vendor/exoware-sql",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"

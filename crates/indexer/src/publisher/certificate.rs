@@ -1,96 +1,391 @@
-//! Certificate reporter that uploads simplex notarization and finalization
-//! certificates to the raw KV store.
+//! Simplex certificate reporter backed by the chain Store.
 //!
-//! Wired into the engine via the new `simplex_observer` slot on
-//! [`constantinople_engine::Config`]. On every
-//! [`simplex::types::Activity::Notarization`] or
-//! [`simplex::types::Activity::Finalization`] we encode a single-row batch
-//! and dispatch it to the raw KV uploader. The FINALIZED and NOTARIZED key
-//! families share the raw store with BLOCK, BLOCK_BY_H, TX, and TX_BY_H. All
-//! other activity variants (votes, Byzantine evidence, etc.) are dropped.
-//!
-//! Like [`super::block::BlockReporter`], certificate uploads are non-blocking
-//! and run on a fresh tokio task.
+//! Consensus finalizes marshal commitments. Each commitment embeds the digest
+//! of the Constantinople block it certifies, so this reporter waits until it
+//! has both the certificate and the finalized block before writing a Simplex
+//! artifact. The browser can then verify the certificate, decode the block,
+//! and check that the commitment points at that block digest.
 
-use crate::{
-    keys,
-    publisher::{UploadBatch, dispatch_batch},
-};
+use bytes::Buf;
 use commonware_actor::Feedback;
-use commonware_codec::Encode;
+use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
-    Reporter,
+    Block, Heightable, Reporter,
     simplex::{self, types::Activity},
+    types::{Height, coding::Commitment},
 };
-use commonware_cryptography::{Digest, certificate::Scheme};
-use std::marker::PhantomData;
-use tokio::sync::mpsc;
+use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
+use constantinople_engine::types::EngineBlock;
+use constantinople_primitives::BlockCfg;
+use exoware_sdk::{StoreClient, StoreWriteBatch};
+use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
+use std::{collections::HashMap, time::Duration};
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use tracing::{debug, warn};
 
-/// Cloneable [`Reporter`] over `Activity<S, D>` that filters notarizations and
-/// finalizations and uploads each as a single atomic row to the raw KV store.
-pub struct CertificateReporter<S, D> {
-    raw: mpsc::Sender<UploadBatch>,
-    _marker: PhantomData<fn() -> (S, D)>,
+/// Cloneable reporter over Simplex activity.
+pub struct CertificateReporter<H, P, S>
+where
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send,
+{
+    tx: mpsc::Sender<SimplexInput<H, P, S>>,
 }
 
-impl<S, D> CertificateReporter<S, D> {
-    /// Build a reporter that forwards certificate batches to the raw uploader.
-    pub const fn new(raw: mpsc::Sender<UploadBatch>) -> Self {
-        Self {
-            raw,
-            _marker: PhantomData,
-        }
+impl<H, P, S> CertificateReporter<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    /// Build a reporter and background uploader.
+    pub fn connect(store_url: &str, buffer: usize) -> (Self, JoinHandle<()>)
+    where
+        H: Hasher + Send + Sync + 'static,
+        P: PublicKey + Send + Sync + 'static,
+        S: Scheme + Send + Sync + 'static,
+        S::Certificate: Send + Sync,
+    {
+        let client = SimplexClient::new(store_url);
+        let (tx, rx) = mpsc::channel(buffer);
+        let join = tokio::spawn(run_uploader::<H, P, S>(client, rx));
+        (Self { tx }, join)
+    }
+
+    /// Queue a finalized block so certificates can be paired with it.
+    pub async fn publish_block(&self, block: &EngineBlock<H, P>)
+    where
+        H: Hasher,
+        P: PublicKey,
+    {
+        let _ = self.tx.send(SimplexInput::Block(block.clone())).await;
     }
 }
 
-impl<S, D> Clone for CertificateReporter<S, D> {
+impl<H, P, S> Clone for CertificateReporter<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
     fn clone(&self) -> Self {
         Self {
-            raw: self.raw.clone(),
-            _marker: PhantomData,
+            tx: self.tx.clone(),
         }
     }
 }
 
-impl<S, D> Reporter for CertificateReporter<S, D>
+impl<H, P, S> Reporter for CertificateReporter<H, P, S>
 where
-    S: Scheme,
-    D: Digest,
-    simplex::types::Notarization<S, D>: Encode,
-    simplex::types::Finalization<S, D>: Encode,
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send,
+    simplex::types::Notarization<S, Commitment>: Send,
+    simplex::types::Finalization<S, Commitment>: Send,
 {
-    type Activity = Activity<S, D>;
+    type Activity = Activity<S, Commitment>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
             Activity::Notarization(notarization) => {
-                let view = notarization.round().view().get();
-                let key = keys::notarized(view).expect("u64 view fits NOTARIZED family payload");
-                let value = notarization.encode();
-                dispatch_batch(
-                    &self.raw,
-                    UploadBatch {
-                        rows: vec![(key, value)],
-                        ack: None,
-                    },
-                );
+                dispatch_input(&self.tx, SimplexInput::Notarization(notarization));
             }
             Activity::Finalization(finalization) => {
-                let view = finalization.round().view().get();
-                let key = keys::finalized(view).expect("u64 view fits FINALIZED family payload");
-                let value = finalization.encode();
-                dispatch_batch(
-                    &self.raw,
-                    UploadBatch {
-                        rows: vec![(key, value)],
-                        ack: None,
-                    },
-                );
+                dispatch_input(&self.tx, SimplexInput::Finalization(finalization));
             }
-            // Votes, certifications, nullifications, and Byzantine evidence
-            // are not indexed.
             _ => {}
         }
         Feedback::Ok
+    }
+}
+
+fn dispatch_input<H, P, S>(tx: &mpsc::Sender<SimplexInput<H, P, S>>, input: SimplexInput<H, P, S>)
+where
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send,
+{
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tx.send(input).await {
+            warn!("simplex certificate uploader stopped; dropping activity: {error}");
+        }
+    });
+}
+
+enum SimplexInput<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    Block(EngineBlock<H, P>),
+    Notarization(simplex::types::Notarization<S, Commitment>),
+    Finalization(simplex::types::Finalization<S, Commitment>),
+}
+
+struct PendingBlockCertificates<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    block: Option<EngineBlock<H, P>>,
+    notarization: Option<simplex::types::Notarization<S, Commitment>>,
+    finalization: Option<simplex::types::Finalization<S, Commitment>>,
+}
+
+impl<H, P, S> Default for PendingBlockCertificates<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    fn default() -> Self {
+        Self {
+            block: None,
+            notarization: None,
+            finalization: None,
+        }
+    }
+}
+
+async fn run_uploader<H, P, S>(client: SimplexClient, mut rx: mpsc::Receiver<SimplexInput<H, P, S>>)
+where
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send + Sync,
+{
+    let mut pending = HashMap::<Vec<u8>, PendingBlockCertificates<H, P, S>>::new();
+    while let Some(input) = rx.recv().await {
+        let key = input.block_digest_key();
+        let entry = pending.entry(key.clone()).or_default();
+        match input {
+            SimplexInput::Block(block) => entry.block = Some(block),
+            SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
+            SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
+        }
+
+        if !prepare_ready_upload(&client, entry).await {
+            continue;
+        }
+        pending.remove(&key);
+    }
+    debug!("simplex certificate uploader task exiting: channel closed");
+}
+
+impl<H, P, S> SimplexInput<H, P, S>
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    fn block_digest_key(&self) -> Vec<u8> {
+        match self {
+            Self::Block(block) => block.seal().as_ref().to_vec(),
+            Self::Notarization(notarization) => {
+                block_digest_key::<H>(&notarization.proposal.payload)
+            }
+            Self::Finalization(finalization) => {
+                block_digest_key::<H>(&finalization.proposal.payload)
+            }
+        }
+    }
+}
+
+fn block_digest_key<H>(commitment: &Commitment) -> Vec<u8>
+where
+    H: Hasher,
+{
+    commitment.block::<H::Digest>().as_ref().to_vec()
+}
+
+async fn prepare_ready_upload<H, P, S>(
+    client: &SimplexClient,
+    entry: &mut PendingBlockCertificates<H, P, S>,
+) -> bool
+where
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send + Sync,
+{
+    let Some(block) = entry.block.clone() else {
+        return false;
+    };
+    let mut prepared = PreparedUpload::new();
+
+    if let Some(notarization) = entry.notarization.take() {
+        let certified = CertifiedBlock::new(notarization.proposal.payload, block.clone());
+        let notarized =
+            Notarized::new(notarization, certified).expect("notarization matches certified block");
+        prepared.extend(
+            client
+                .prepare_notarized(&notarized)
+                .expect("notarization upload must prepare"),
+        );
+    }
+
+    let mut uploaded_finalization = false;
+    if let Some(finalization) = entry.finalization.take() {
+        uploaded_finalization = true;
+        let certified = CertifiedBlock::new(finalization.proposal.payload, block);
+        let finalized =
+            Finalized::new(finalization, certified).expect("finalization matches certified block");
+        prepared.extend(
+            client
+                .prepare_finalized(&finalized)
+                .expect("finalization upload must prepare"),
+        );
+    }
+
+    if prepared.is_empty() {
+        return false;
+    }
+
+    let mut batch = StoreWriteBatch::new();
+    client
+        .stage_upload(&prepared, &mut batch)
+        .expect("prepared simplex upload must stage");
+    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let receipt = client.mark_upload_persisted(prepared, seq).await;
+    debug!(
+        headers = receipt.summary.headers,
+        notarizations = receipt.summary.notarizations,
+        finalizations = receipt.summary.finalizations,
+        store_sequence = receipt.store_sequence_number,
+        "indexer uploaded simplex certificate batch"
+    );
+    uploaded_finalization
+}
+
+async fn commit_with_retry(client: &StoreClient, batch: &StoreWriteBatch) -> u64 {
+    let mut attempt = 0u32;
+    loop {
+        match batch.commit(client).await {
+            Ok(seq) => return seq,
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                warn!(
+                    ?error,
+                    attempt,
+                    rows = batch.len(),
+                    "simplex certificate upload failed, retrying"
+                );
+                sleep(retry_backoff(attempt)).await;
+            }
+        }
+    }
+}
+
+fn retry_backoff(attempt: u32) -> Duration {
+    const INITIAL: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(2);
+    let factor = 1u32 << attempt.min(5);
+    INITIAL.saturating_mul(factor).min(MAX)
+}
+
+/// A finalized block tagged with the marshal commitment certified by Simplex.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    commitment: Commitment,
+    block: EngineBlock<H, P>,
+}
+
+impl<H, P> CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn new(commitment: Commitment, block: EngineBlock<H, P>) -> Self {
+        debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
+        Self { commitment, block }
+    }
+
+    /// Return the certified Constantinople block.
+    pub const fn block(&self) -> &EngineBlock<H, P> {
+        &self.block
+    }
+}
+
+impl<H, P> Heightable for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn height(&self) -> Height {
+        self.block.height()
+    }
+}
+
+impl<H, P> Digestible for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    type Digest = Commitment;
+
+    fn digest(&self) -> Self::Digest {
+        self.commitment
+    }
+}
+
+impl<H, P> Block for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn parent(&self) -> Self::Digest {
+        self.block.header.context.parent.1
+    }
+}
+
+impl<H, P> EncodeSize for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn encode_size(&self) -> usize {
+        self.commitment.encode_size() + self.block.encode_size()
+    }
+}
+
+impl<H, P> Write for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        self.commitment.write(buf);
+        self.block.write(buf);
+    }
+}
+
+impl<H, P> Read for CertifiedBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    type Cfg = BlockCfg;
+
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        let commitment = Commitment::read(buf)?;
+        let block = EngineBlock::<H, P>::read_cfg(buf, cfg)?;
+        if commitment.block::<H::Digest>() != *block.seal() {
+            return Err(CodecError::Invalid(
+                "CertifiedBlock",
+                "commitment block digest does not match block",
+            ));
+        }
+        Ok(Self { commitment, block })
     }
 }

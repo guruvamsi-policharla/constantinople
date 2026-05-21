@@ -56,7 +56,13 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
-    print_local_run_commands(&output_dir, args, local, &material.primary_hex());
+    print_local_run_commands(
+        &output_dir,
+        args,
+        local,
+        &material.primary_hex(),
+        &hex(&material.dkg_output.public().encode()),
+    );
 }
 
 fn build_validators(
@@ -250,8 +256,15 @@ fn print_local_run_commands(
     args: &GenerateArgs,
     local: &LocalArgs,
     relayer_targets: &[String],
+    simplex_verification_material: &str,
 ) {
-    let commands = local_run_commands(output_dir, args, local, relayer_targets);
+    let commands = local_run_commands(
+        output_dir,
+        args,
+        local,
+        relayer_targets,
+        simplex_verification_material,
+    );
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
@@ -272,6 +285,7 @@ fn local_run_commands(
     args: &GenerateArgs,
     local: &LocalArgs,
     relayer_targets: &[String],
+    simplex_verification_material: &str,
 ) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let mut commands: Vec<String> = (0..args.validators)
@@ -338,8 +352,12 @@ fn local_run_commands(
             String::new()
         };
         commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{}{} npm --prefix explorer run dev",
-            local.metadata_indexer_port, local.qmdb_indexer_port, relayer_env,
+            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
+            local.metadata_indexer_port,
+            local.qmdb_indexer_port,
+            local.chain_indexer_port,
+            simplex_verification_material,
+            relayer_env,
         ));
     }
 
@@ -380,6 +398,8 @@ mod tests {
         generate_local_cluster_material,
     };
     use std::path::{Path, PathBuf};
+
+    const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
 
     fn test_args(spammer: bool) -> GenerateArgs {
         GenerateArgs {
@@ -423,7 +443,13 @@ mod tests {
     #[test]
     fn local_run_commands_only_start_validators() {
         let args = test_args(false);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
@@ -432,7 +458,13 @@ mod tests {
     #[test]
     fn local_run_commands_include_spammer_when_enabled() {
         let args = test_args(true);
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-spammer"));
@@ -447,7 +479,13 @@ mod tests {
     fn local_run_commands_include_optional_relayer_when_enabled() {
         let mut args = test_args(false);
         args.relayer = true;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople-relayer"));
@@ -463,6 +501,7 @@ mod tests {
             &args,
             local_args(&args),
             &targets,
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
         assert_eq!(commands.len(), 4);
@@ -478,7 +517,13 @@ mod tests {
     fn local_run_commands_propagate_accounts_jitter_to_spammer() {
         let mut args = test_args(true);
         args.spammer_accounts_jitter = 0.25;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert!(commands[2].contains("--accounts-jitter 0.25"));
     }
@@ -487,7 +532,13 @@ mod tests {
     fn local_run_commands_include_secondaries_and_indexer_stack() {
         let mut args = test_args(false);
         args.secondaries = 2;
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert_eq!(commands.len(), 8);
         assert!(commands[2].contains("secondary-0.yaml"));
@@ -499,7 +550,13 @@ mod tests {
         let mut args = test_args(true);
         args.secondaries = 1;
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert!(
             commands.iter().all(|command| !command.contains("sleep ")),
@@ -522,7 +579,13 @@ mod tests {
         args.secondaries = 1;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         // 2 validators + 1 secondary + 1 store + 1 sql + 1 qmd + 1 explorer = 7.
         assert_eq!(commands.len(), 7);
@@ -540,7 +603,13 @@ mod tests {
         args.secondaries = 1;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         let metadata_cmd = commands
             .iter()
@@ -557,7 +626,13 @@ mod tests {
         args.secondaries = 1;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         let qmdb_cmd = commands
             .iter()
@@ -573,7 +648,13 @@ mod tests {
         args.secondaries = 1;
         set_local_ports(&mut args, 18_090, 18_091, 18_092);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         let explorer_cmd = commands
             .iter()
@@ -581,6 +662,8 @@ mod tests {
             .expect("explorer dev server command should be present");
         assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:18091"));
         assert!(explorer_cmd.contains("VITE_QMDB_URL=http://127.0.0.1:18092"));
+        assert!(explorer_cmd.contains("VITE_STORE_URL=http://127.0.0.1:18090"));
+        assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
     }
@@ -589,7 +672,13 @@ mod tests {
     fn local_run_commands_omit_explorer_without_secondaries() {
         let args = test_args(false);
 
-        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
 
         assert!(
             commands
