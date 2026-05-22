@@ -175,49 +175,28 @@ where
     Some(overlay.into_changeset())
 }
 
-pub(crate) fn execute_loaded<P, H>(
-    state: &State<P>,
+pub(crate) fn execute_unique<P, H>(
     transfers: &[PreparedTransfer<P, H>],
-    all_accounts_unique: bool,
+    accounts: &[Account],
 ) -> Option<Changeset<P>>
 where
     H: Hasher,
     P: PublicKey,
 {
-    if all_accounts_unique {
-        return execute_unique(state, transfers);
+    if accounts.len() != transfers.len().saturating_mul(2) {
+        return None;
     }
-
-    execute(state, transfers)
-}
-
-fn execute_unique<P, H>(
-    state: &State<P>,
-    transfers: &[PreparedTransfer<P, H>],
-) -> Option<Changeset<P>>
-where
-    H: Hasher,
-    P: PublicKey,
-{
     let mut changeset = Vec::with_capacity(transfers.len().saturating_mul(2));
 
-    for transfer in transfers {
-        let Some(mut sender) = state.get(&transfer.sender).copied() else {
-            return None;
-        };
+    for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
+        let mut sender = accounts[0];
         if sender.nonce != transfer.nonce || sender.balance < transfer.value {
             return None;
         }
-        let Some(next_nonce) = sender.nonce.checked_add(1) else {
-            return None;
-        };
+        let next_nonce = sender.nonce.checked_add(1)?;
 
-        let Some(mut recipient) = state.get(&transfer.recipient).copied() else {
-            return None;
-        };
-        let Some(recipient_balance) = recipient.balance.checked_add(transfer.value) else {
-            return None;
-        };
+        let mut recipient = accounts[1];
+        let recipient_balance = recipient.balance.checked_add(transfer.value)?;
 
         sender.nonce = next_nonce;
         sender.balance -= transfer.value;

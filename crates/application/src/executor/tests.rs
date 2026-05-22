@@ -1,4 +1,4 @@
-use super::{ProposalOutput, State, execute, execute_loaded, prepare_transfer, propose};
+use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
@@ -130,9 +130,13 @@ fn unique_loaded_execution_matches_overlay_execution() {
         .map(prepare_transfer)
         .collect::<Option<Vec<_>>>()
         .expect("test transactions should prepare");
+    let loaded = transfers
+        .iter()
+        .flat_map(|transfer| [accounts[&transfer.sender], accounts[&transfer.recipient]])
+        .collect::<Vec<_>>();
 
     assert_eq!(
-        execute_loaded(&accounts, &transfers, true),
+        execute_unique(&transfers, &loaded),
         execute(&accounts, &transfers)
     );
 }

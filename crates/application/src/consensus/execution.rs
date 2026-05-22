@@ -14,7 +14,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Header, SealedBlock, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
 use hashbrown::HashSet;
 use std::time::Instant;
 
@@ -44,9 +44,9 @@ where
     pub(super) timings: Timings,
 }
 
-struct LoadedState<P> {
-    accounts: State<P>,
-    all_accounts_unique: bool,
+enum LoadedState<P> {
+    Unique(Vec<Account>),
+    Shared(State<P>),
 }
 
 impl<E, H, P, S> BlockExecution<E, H, P, S>
@@ -106,7 +106,7 @@ where
     let load_state_ms = load_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let output = executor::propose_prepared(&state.accounts, input);
+    let output = executor::propose_prepared(&state, input);
     let execute_ms = execute_started_at.elapsed().as_millis();
     let transfers = output
         .valid
@@ -155,15 +155,13 @@ where
     let prepare_ms = prepare_started_at.elapsed().as_millis();
 
     let load_started_at = Instant::now();
-    let state = load_state(&state_batch, &transfers)
+    let state = load_execution_state(&state_batch, &transfers)
         .await
         .expect("block state loading must succeed");
     let load_state_ms = load_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset =
-        executor::execute_loaded(&state.accounts, &transfers, state.all_accounts_unique)
-            .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = execute_loaded(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
     let digests = transfer_digests(&transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
@@ -193,11 +191,10 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let state = load_state(&state_batch, transfers)
+    let state = load_execution_state(&state_batch, transfers)
         .await
         .expect("state loading must succeed for certified apply");
-    let changeset = executor::execute_loaded(&state.accounts, transfers, state.all_accounts_unique)
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = execute_loaded(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
     let digests = transfer_digests(transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
@@ -242,6 +239,29 @@ where
 async fn load_state<E, H, P, S>(
     batch: &StateBatch<E, H, P, EightCap, S>,
     transfers: &[PreparedTransfer<P, H>],
+) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    if transfers.is_empty() {
+        return Ok(State::new());
+    }
+
+    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
+    for transfer in transfers {
+        account_keys.insert(transfer.sender.clone());
+        account_keys.insert(transfer.recipient.clone());
+    }
+
+    load_accounts(batch, account_keys.into_iter().collect()).await
+}
+
+async fn load_execution_state<E, H, P, S>(
+    batch: &StateBatch<E, H, P, EightCap, S>,
+    transfers: &[PreparedTransfer<P, H>],
 ) -> core::result::Result<LoadedState<P>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -250,31 +270,67 @@ where
     S: Strategy,
 {
     if transfers.is_empty() {
-        return Ok(LoadedState {
-            accounts: State::new(),
-            all_accounts_unique: true,
-        });
+        return Ok(LoadedState::Unique(Vec::new()));
     }
 
-    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
+    let mut account_keys = Vec::with_capacity(transfers.len().saturating_mul(2));
+    let mut unique = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
-        account_keys.insert(transfer.sender.clone());
-        account_keys.insert(transfer.recipient.clone());
+        account_keys.push(&transfer.sender);
+        account_keys.push(&transfer.recipient);
+        unique.insert(&transfer.sender);
+        unique.insert(&transfer.recipient);
     }
-    let all_accounts_unique = account_keys.len() == transfers.len().saturating_mul(2);
 
-    let account_keys = account_keys.into_iter().collect::<Vec<_>>();
+    if unique.len() == account_keys.len() {
+        let values = batch.get_many(&account_keys).await?;
+        let accounts = values
+            .into_iter()
+            .map(|account| account.unwrap_or_default())
+            .collect();
+        return Ok(LoadedState::Unique(accounts));
+    }
+
+    load_accounts(batch, unique.into_iter().cloned().collect())
+        .await
+        .map(LoadedState::Shared)
+}
+
+async fn load_accounts<E, H, P, S>(
+    batch: &StateBatch<E, H, P, EightCap, S>,
+    account_keys: Vec<AccountKey<P>>,
+) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    if account_keys.is_empty() {
+        return Ok(State::new());
+    }
+
     let keys = account_keys.iter().collect::<Vec<_>>();
     let values = batch.get_many(&keys).await?;
-    let accounts = account_keys
+    Ok(account_keys
         .into_iter()
         .zip(values)
         .map(|(account_key, account)| (account_key, account.unwrap_or_default()))
-        .collect();
-    Ok(LoadedState {
-        accounts,
-        all_accounts_unique,
-    })
+        .collect())
+}
+
+fn execute_loaded<P, H>(
+    state: &LoadedState<P>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> Option<executor::Changeset<P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    match state {
+        LoadedState::Unique(accounts) => executor::execute_unique(transfers, accounts),
+        LoadedState::Shared(accounts) => executor::execute(accounts, transfers),
+    }
 }
 
 async fn finalize_child<E, C, P, H, S>(
