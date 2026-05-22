@@ -1,4 +1,4 @@
-use super::{ProposalOutput, State, execute, prepare_transfer, propose};
+use super::{ProposalOutput, State, execute, execute_loaded, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
@@ -105,6 +105,35 @@ fn proposal_and_replay_match_for_transfer_batch() {
     assert_eq!(
         changeset_account(&changeset, recipient.public_key),
         Some(account(15, 0))
+    );
+}
+
+#[test]
+fn unique_loaded_execution_matches_overlay_execution() {
+    let sender_a = TestSigner::from_seed(20);
+    let sender_b = TestSigner::from_seed(21);
+    let recipient_a = TestSigner::from_seed(22);
+    let recipient_b = TestSigner::from_seed(23);
+
+    let mut accounts = State::new();
+    accounts.insert(account_key(&sender_a.public_key), account(11, 0));
+    accounts.insert(account_key(&sender_b.public_key), account(13, 0));
+    accounts.insert(account_key(&recipient_a.public_key), account(5, 0));
+    accounts.insert(account_key(&recipient_b.public_key), account(7, 0));
+
+    let transactions = [
+        sender_a.sign(recipient_a.public_key, 4, 0),
+        sender_b.sign(recipient_b.public_key, 6, 0),
+    ];
+    let transfers = transactions
+        .iter()
+        .map(prepare_transfer)
+        .collect::<Option<Vec<_>>>()
+        .expect("test transactions should prepare");
+
+    assert_eq!(
+        execute_loaded(&accounts, &transfers, true),
+        execute(&accounts, &transfers)
     );
 }
 

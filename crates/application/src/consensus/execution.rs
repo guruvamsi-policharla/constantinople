@@ -44,6 +44,11 @@ where
     pub(super) timings: Timings,
 }
 
+struct LoadedState<P> {
+    accounts: State<P>,
+    all_accounts_unique: bool,
+}
+
 impl<E, H, P, S> BlockExecution<E, H, P, S>
 where
     E: Storage + Clock + Metrics,
@@ -101,7 +106,7 @@ where
     let load_state_ms = load_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let output = executor::propose_prepared(&state, input);
+    let output = executor::propose_prepared(&state.accounts, input);
     let execute_ms = execute_started_at.elapsed().as_millis();
     let transfers = output
         .valid
@@ -156,7 +161,9 @@ where
     let load_state_ms = load_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset = executor::execute(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset =
+        executor::execute_loaded(&state.accounts, &transfers, state.all_accounts_unique)
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
     let digests = transfer_digests(&transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
@@ -189,7 +196,8 @@ where
     let state = load_state(&state_batch, transfers)
         .await
         .expect("state loading must succeed for certified apply");
-    let changeset = executor::execute(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = executor::execute_loaded(&state.accounts, transfers, state.all_accounts_unique)
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
     let digests = transfer_digests(transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
@@ -234,7 +242,7 @@ where
 async fn load_state<E, H, P, S>(
     batch: &StateBatch<E, H, P, EightCap, S>,
     transfers: &[PreparedTransfer<P, H>],
-) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+) -> core::result::Result<LoadedState<P>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -242,7 +250,10 @@ where
     S: Strategy,
 {
     if transfers.is_empty() {
-        return Ok(State::new());
+        return Ok(LoadedState {
+            accounts: State::new(),
+            all_accounts_unique: true,
+        });
     }
 
     let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
@@ -250,15 +261,20 @@ where
         account_keys.insert(transfer.sender.clone());
         account_keys.insert(transfer.recipient.clone());
     }
+    let all_accounts_unique = account_keys.len() == transfers.len().saturating_mul(2);
 
     let account_keys = account_keys.into_iter().collect::<Vec<_>>();
     let keys = account_keys.iter().collect::<Vec<_>>();
     let values = batch.get_many(&keys).await?;
-    Ok(account_keys
+    let accounts = account_keys
         .into_iter()
         .zip(values)
         .map(|(account_key, account)| (account_key, account.unwrap_or_default()))
-        .collect())
+        .collect();
+    Ok(LoadedState {
+        accounts,
+        all_accounts_unique,
+    })
 }
 
 async fn finalize_child<E, C, P, H, S>(

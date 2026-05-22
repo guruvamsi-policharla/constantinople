@@ -175,6 +175,61 @@ where
     Some(overlay.into_changeset())
 }
 
+pub(crate) fn execute_loaded<P, H>(
+    state: &State<P>,
+    transfers: &[PreparedTransfer<P, H>],
+    all_accounts_unique: bool,
+) -> Option<Changeset<P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    if all_accounts_unique {
+        return execute_unique(state, transfers);
+    }
+
+    execute(state, transfers)
+}
+
+fn execute_unique<P, H>(
+    state: &State<P>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> Option<Changeset<P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let mut changeset = Vec::with_capacity(transfers.len().saturating_mul(2));
+
+    for transfer in transfers {
+        let Some(mut sender) = state.get(&transfer.sender).copied() else {
+            return None;
+        };
+        if sender.nonce != transfer.nonce || sender.balance < transfer.value {
+            return None;
+        }
+        let Some(next_nonce) = sender.nonce.checked_add(1) else {
+            return None;
+        };
+
+        let Some(mut recipient) = state.get(&transfer.recipient).copied() else {
+            return None;
+        };
+        let Some(recipient_balance) = recipient.balance.checked_add(transfer.value) else {
+            return None;
+        };
+
+        sender.nonce = next_nonce;
+        sender.balance -= transfer.value;
+        recipient.balance = recipient_balance;
+        changeset.push((transfer.sender.clone(), sender));
+        changeset.push((transfer.recipient.clone(), recipient));
+    }
+
+    changeset.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    Some(changeset)
+}
+
 fn account_key_from_sender<P>(
     sender: &commonware_codec::types::lazy::Lazy<P>,
 ) -> Option<AccountKey<P>>
