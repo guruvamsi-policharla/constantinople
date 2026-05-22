@@ -9,7 +9,8 @@ use commonware_cryptography::{BatchVerifier, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner};
 use constantinople_primitives::{
-    SignedTransaction, materialize_transaction_chunks, verify_transaction_chunks,
+    SignedTransaction, materialize_transaction_chunks, preload_transaction_chunks,
+    verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
@@ -37,15 +38,17 @@ where
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
             let started_at = Instant::now();
-            let result = verify_transaction_chunks::<P, H, B, _, _>(
-                &signature_strategy,
-                &hash_strategy,
-                namespace,
-                &mut runtime,
-                body.as_ref().clone(),
-            )
-            .map(|_| started_at.elapsed().as_millis())
-            .ok_or(INVALID_SIGNATURE);
+            let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
+                .filter(|transactions| {
+                    verify_transaction_batch::<P, H, B, _>(
+                        &signature_strategy,
+                        namespace,
+                        &mut runtime,
+                        transactions,
+                    )
+                })
+                .map(|_| started_at.elapsed().as_millis())
+                .ok_or(INVALID_SIGNATURE);
             let _ = result_tx.send(result);
         }
         .instrument(info_span!(
