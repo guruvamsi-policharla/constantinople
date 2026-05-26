@@ -12,6 +12,7 @@ import {
     parsePublicKeyHex,
     parseU64,
 } from './codec';
+import { submittedTransactionHistoryKey } from './historyKey';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
@@ -68,7 +69,6 @@ const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
 const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
-const LOCAL_HISTORY_KEY = 'constantinople.submitted-transactions.v1';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
 const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
@@ -162,6 +162,7 @@ export default function App() {
     });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const [isWalletOpen, setIsWalletOpen] = useState(false);
+    const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
@@ -171,7 +172,8 @@ export default function App() {
     const [nonce, setNonce] = useState('0');
     const [submitMessage, setSubmitMessage] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
-    const [history, setHistory] = useState<SubmittedTransaction[]>(() => readHistory());
+    const [history, setHistory] = useState<SubmittedTransaction[]>([]);
+    const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [accountInput, setAccountInput] = useState(() => accountFromLocation());
     const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
@@ -182,6 +184,7 @@ export default function App() {
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
+    const [searchMessage, setSearchMessage] = useState('');
     const [copiedValue, setCopiedValue] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
@@ -194,6 +197,16 @@ export default function App() {
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
+    const historyKey = submittedTransactionHistoryKey(
+        {
+            indexerUrl,
+            qmdbUrl,
+            storeUrl,
+            mempoolUrl,
+            simplexVerificationMaterial,
+        },
+        signedInPublicKey,
+    );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
@@ -252,8 +265,15 @@ export default function App() {
     }, []);
 
     useEffect(() => {
-        writeHistory(history);
-    }, [history]);
+        setHistory(historyKey === null ? [] : readHistory(historyKey));
+        setLoadedHistoryKey(historyKey);
+    }, [historyKey]);
+
+    useEffect(() => {
+        if (historyKey === null) return;
+        if (loadedHistoryKey !== historyKey) return;
+        writeHistory(historyKey, history);
+    }, [historyKey, loadedHistoryKey, history]);
 
     useEffect(() => {
         const onPopState = () => {
@@ -557,21 +577,24 @@ export default function App() {
     const submitAccountLookup = () => {
         const normalized = normalizeAccountInput(accountInput);
         if (!normalized) {
-            setAccountProof({ status: 'error', detail: 'expected a 32-byte hex account public key' });
+            setSearchMessage('expected a 32-byte hex account public key');
             return;
         }
+        setSearchMessage('');
         setLookupAccount(normalized);
         setAccountInput(normalized);
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
         url.searchParams.set('account', normalized);
         window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+        setIsSearchOpen(false);
     };
 
     const clearAccountLookup = () => {
         setLookupAccount('');
         setAccountInput('');
         setAccountCursorStack([null]);
+        setSearchMessage('');
         const url = new URL(window.location.href);
         url.searchParams.delete('account');
         window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
@@ -668,25 +691,9 @@ export default function App() {
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
-                        <form
-                            className="account-lookup"
-                            onSubmit={(event) => {
-                                event.preventDefault();
-                                submitAccountLookup();
-                            }}
-                        >
-                            <label>
-                                <span>account&gt;</span>
-                                <input
-                                    value={accountInput}
-                                    onChange={(event) => setAccountInput(event.target.value)}
-                                    placeholder="public key"
-                                    spellCheck={false}
-                                />
-                            </label>
-                            <button type="submit">open</button>
-                            {lookupAccount && <button type="button" onClick={clearAccountLookup}>clear</button>}
-                        </form>
+                        <button className="wallet-trigger" onClick={() => setIsSearchOpen(true)}>
+                            search
+                        </button>
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
@@ -710,6 +717,7 @@ export default function App() {
                                 hasNext={accountNextCursor !== null}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
+                                onBack={clearAccountLookup}
                             />
                         ) : (
                             <>
@@ -756,6 +764,19 @@ export default function App() {
                         />
                     </WalletModal>
                 )}
+                {isSearchOpen && (
+                    <SearchModal onClose={() => setIsSearchOpen(false)}>
+                        <AccountSearchPanel
+                            accountInput={accountInput}
+                            message={searchMessage}
+                            onAccountInputChange={(value) => {
+                                setAccountInput(value);
+                                setSearchMessage('');
+                            }}
+                            onSubmit={submitAccountLookup}
+                        />
+                    </SearchModal>
+                )}
                 {copyToast && <TerminalToast message={copyToast} />}
             </div>
         </div>
@@ -774,6 +795,7 @@ function AccountPage({
     hasNext,
     onPrevious,
     onNext,
+    onBack,
 }: {
     account: string;
     copiedValue: string;
@@ -786,10 +808,14 @@ function AccountPage({
     hasNext: boolean;
     onPrevious: () => void;
     onNext: () => void;
+    onBack: () => void;
 }) {
     return (
         <section className="account-page" aria-label="account proof">
-            <div className="account-page__title">account</div>
+            <div className="account-page__title">
+                <span>account</span>
+                <button onClick={onBack}>back</button>
+            </div>
             <div className="account-page__line">
                 <span className="account-page__prompt">key</span>
                 <CopyableValue copiedValue={copiedValue} value={account} onCopy={onCopy} />
@@ -850,6 +876,80 @@ function ProofMark({ proof }: { proof: TransactionProofState }) {
         return <span className="tx-proof-error" title={proof.detail}>!</span>;
     }
     return <span className="tx-proof-spinner" title={proof.detail} />;
+}
+
+function SearchModal({
+    children,
+    onClose,
+}: {
+    children: React.ReactNode;
+    onClose: () => void;
+}) {
+    useEffect(() => {
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape') return;
+            onClose();
+        };
+        window.addEventListener('keydown', closeOnEscape);
+        return () => window.removeEventListener('keydown', closeOnEscape);
+    }, [onClose]);
+
+    return (
+        <div
+            className="modal"
+            role="presentation"
+            onMouseDown={(event) => {
+                if (event.target === event.currentTarget) onClose();
+            }}
+        >
+            <section className="modal__panel modal__panel--search" role="dialog" aria-modal="true" aria-label="account search">
+                <header className="modal__header">
+                    <h2>search</h2>
+                    <button className="modal__close" onClick={onClose}>
+                        close
+                    </button>
+                </header>
+                {children}
+            </section>
+        </div>
+    );
+}
+
+function AccountSearchPanel({
+    accountInput,
+    message,
+    onAccountInputChange,
+    onSubmit,
+}: {
+    accountInput: string;
+    message: string;
+    onAccountInputChange: (value: string) => void;
+    onSubmit: () => void;
+}) {
+    return (
+        <section className="account-search">
+            <form
+                className="account-lookup"
+                onSubmit={(event) => {
+                    event.preventDefault();
+                    onSubmit();
+                }}
+            >
+                <label>
+                    <span>account&gt;</span>
+                    <input
+                        autoFocus
+                        value={accountInput}
+                        onChange={(event) => onAccountInputChange(event.target.value)}
+                        placeholder="public key"
+                        spellCheck={false}
+                    />
+                </label>
+                <button type="submit">open</button>
+            </form>
+            {message && <div className="account-search__message">{message}</div>}
+        </section>
+    );
 }
 
 function WalletModal({
@@ -1521,8 +1621,8 @@ function accountFromLocation(): string {
     return pathMatch ? normalizeAccountInput(pathMatch[1]) ?? '' : '';
 }
 
-function readHistory(): SubmittedTransaction[] {
-    const raw = window.localStorage.getItem(LOCAL_HISTORY_KEY);
+function readHistory(key: string): SubmittedTransaction[] {
+    const raw = window.localStorage.getItem(key);
     if (!raw) return [];
 
     try {
@@ -1539,8 +1639,8 @@ function readHistory(): SubmittedTransaction[] {
     }
 }
 
-function writeHistory(history: SubmittedTransaction[]) {
-    window.localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
+function writeHistory(key: string, history: SubmittedTransaction[]) {
+    window.localStorage.setItem(key, JSON.stringify(history));
 }
 
 function useBrailleSpinner(active: boolean): string {

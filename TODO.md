@@ -1,0 +1,7 @@
+- [ ] ? - Filter the stream of uploaded state - look into exoware docs
+- [ ] received txs
+- [ ] reduce e2e latency by removing polling, sub instead (!!!)
+- [ ] rss stable metric in dashboard (!)
+- [ ] adjust relayer to run simplex - it's currently way too slow.
+- [ ] add secondary key scheme, use passkeys to actually sign txs.
+- [ ] change style back to a block explorer

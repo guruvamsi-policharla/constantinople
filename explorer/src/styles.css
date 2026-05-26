@@ -212,7 +212,7 @@ body {
 }
 
 .account-lookup {
-    min-width: min(52ch, 100%);
+    width: 100%;
     display: flex;
     align-items: center;
     gap: 0.7ch;
@@ -249,6 +249,20 @@ body {
 .account-page button:disabled {
     cursor: default;
     opacity: 0.45;
+}
+
+.modal__panel--search {
+    width: min(86ch, calc(100vw - 4ch));
+}
+
+.account-search {
+    padding: 2ch;
+}
+
+.account-search__message {
+    color: var(--theme-text-dim);
+    padding-top: 1ch;
+    overflow-wrap: anywhere;
 }
 
 .wallet-trigger {
@@ -713,6 +727,13 @@ body {
     margin-bottom: 0.5ch;
 }
 
+.account-page__title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1ch;
+}
+
 .account-page__line {
     display: grid;
     grid-template-columns: 8ch minmax(0, 1fr);
@@ -894,11 +915,6 @@ body {
         justify-content: space-between;
     }
 
-    .account-lookup {
-        order: 3;
-        flex: 1 1 100%;
-    }
-
     .app__status {
         flex: 1 1 auto;
     }
@@ -977,6 +993,16 @@ body {
 
     .account-page__line {
         grid-template-columns: 1fr;
+    }
+
+    .account-lookup {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .account-lookup label {
+        align-items: stretch;
+        flex-direction: column;
     }
 
     .account-tx-row__main {
