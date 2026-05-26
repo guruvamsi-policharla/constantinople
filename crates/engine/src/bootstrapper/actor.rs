@@ -1,37 +1,28 @@
 //! Bootstrapper actor.
 //!
 //! This actor stays online for the lifetime of the engine so other peers can
-//! query our latest finalized block. It also supports one higher-level control
-//! request: wait until a safe initial state-sync target is available.
+//! query our latest finalization. It also supports one higher-level control
+//! request: wait until a safe initial state-sync floor is available.
 //!
 //! Fetch requests are retried periodically inside the actor. Callers should not
 //! loop on the mailbox themselves because repeated fanout requests will run into
 //! peer rate limits.
 //!
 //! Safety relies on an `f+1` assumption for peer set `0`. Every remote
-//! response is validated before it can influence target selection:
+//! response is validated before it can influence floor selection:
 //! - the finalization certificate must verify against the configured threshold scheme
-//! - the certificate payload must match the provided block digest
 //! - only one response per peer counts in a round
-//! - the pending fetch resolves only when `f+1` peers report the same tip
+//! - the pending fetch resolves only when `f+1` peers report the same proposal
 //!
-//! Peers only answer when they have a locally verified finalized tip. Nodes
-//! without a safe tip stay silent for that round.
+//! Peers only answer when they have a locally verified finalization. Nodes
+//! without a safe floor stay silent for that round.
 
-use super::{
-    EngineBlock, EngineFinalization, EngineMarshalMailbox, EngineVariant, InitialTarget, Mailbox,
-    mailbox::Message,
-};
+use super::{EngineFinalization, EngineMarshalMailbox, InitialTarget, Mailbox, mailbox::Message};
 use crate::ThresholdScheme;
 use commonware_codec::{Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
-use commonware_consensus::{
-    Heightable,
-    marshal::{Identifier, core::Variant as MarshalVariant},
-    simplex::types::Finalization,
-    types::coding::Commitment,
-};
+use commonware_consensus::{simplex::types::Finalization, types::coding::Commitment};
 use commonware_cryptography::{
-    Digestible, Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::Scheme,
+    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::Scheme,
 };
 use commonware_macros::select_loop;
 use commonware_p2p::{Blocker, Provider, Receiver, Recipients, Sender};
@@ -41,7 +32,6 @@ use commonware_utils::{
     Faults, N3f1,
     channel::{fallible::OneshotExt, mpsc, oneshot},
 };
-use constantinople_primitives::BlockCfg;
 use futures::future::{self, Either};
 use rand_core::CryptoRngCore;
 use std::time::{Duration, SystemTime};
@@ -74,67 +64,11 @@ where
     /// This throttles subscriber-driven fetches so the actor does not spam
     /// peers while waiting for a majority.
     pub retry_interval: Duration,
-    /// Codec used to decode finalized blocks on the wire.
-    pub block_codec: BlockCfg,
 }
 
 #[derive(Clone)]
-struct LatestTip<H, P, V>
+enum WireMessage<P, V>
 where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    block: EngineBlock<H, P>,
-    finalization: EngineFinalization<P, V>,
-}
-
-impl<H, P, V> Write for LatestTip<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.block.write(buf);
-        self.finalization.write(buf);
-    }
-}
-
-impl<H, P, V> EncodeSize for LatestTip<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    fn encode_size(&self) -> usize {
-        self.block.encode_size() + self.finalization.encode_size()
-    }
-}
-
-impl<H, P, V> Read for LatestTip<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    type Cfg = WireConfig<P, V>;
-
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self {
-            block: EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?,
-            finalization: Finalization::<ThresholdScheme<P, V>, Commitment>::read_cfg(
-                buf,
-                &cfg.certificate,
-            )?,
-        })
-    }
-}
-
-#[derive(Clone)]
-enum WireMessage<H, P, V>
-where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
@@ -143,13 +77,12 @@ where
     },
     Response {
         id: u64,
-        tip: Box<LatestTip<H, P, V>>,
+        finalization: EngineFinalization<P, V>,
     },
 }
 
-impl<H, P, V> Write for WireMessage<H, P, V>
+impl<P, V> Write for WireMessage<P, V>
 where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
@@ -159,32 +92,30 @@ where
                 0u8.write(buf);
                 id.write(buf);
             }
-            Self::Response { id, tip } => {
+            Self::Response { id, finalization } => {
                 1u8.write(buf);
                 id.write(buf);
-                tip.write(buf);
+                finalization.write(buf);
             }
         }
     }
 }
 
-impl<H, P, V> EncodeSize for WireMessage<H, P, V>
+impl<P, V> EncodeSize for WireMessage<P, V>
 where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Request { id } => id.encode_size(),
-            Self::Response { id, tip } => id.encode_size() + tip.encode_size(),
+            Self::Response { id, finalization } => id.encode_size() + finalization.encode_size(),
         }
     }
 }
 
-impl<H, P, V> Read for WireMessage<H, P, V>
+impl<P, V> Read for WireMessage<P, V>
 where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
@@ -197,7 +128,10 @@ where
             }),
             1 => Ok(Self::Response {
                 id: u64::read(buf)?,
-                tip: Box::new(LatestTip::<H, P, V>::read_cfg(buf, cfg)?),
+                finalization: Finalization::<ThresholdScheme<P, V>, Commitment>::read_cfg(
+                    buf,
+                    &cfg.certificate,
+                )?,
             }),
             other => Err(CodecError::InvalidEnum(other)),
         }
@@ -210,24 +144,21 @@ where
     P: PublicKey,
     V: Variant,
 {
-    block: BlockCfg,
     certificate: <<ThresholdScheme<P, V> as Scheme>::Certificate as Read>::Cfg,
 }
 
-struct Fetch<H, P, V>
+struct Fetch<P, V>
 where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
     id: u64,
     deadline: SystemTime,
-    responses: Vec<(P, LatestTip<H, P, V>)>,
+    responses: Vec<(P, EngineFinalization<P, V>)>,
 }
 
-impl<H, P, V> Fetch<H, P, V>
+impl<P, V> Fetch<P, V>
 where
-    H: Hasher,
     P: PublicKey,
     V: Variant,
 {
@@ -239,37 +170,31 @@ where
         }
     }
 
-    fn record_response(&mut self, peer: P, response: LatestTip<H, P, V>) {
+    fn record_response(&mut self, peer: P, response: EngineFinalization<P, V>) {
         if self.responses.iter().any(|(existing, _)| *existing == peer) {
             return;
         }
         self.responses.push((peer, response));
     }
 
-    #[allow(clippy::type_complexity)]
-    fn majority_tip(&self, required: usize) -> Option<LatestTip<H, P, V>> {
-        let mut counts: Vec<(
-            <EngineBlock<H, P> as Digestible>::Digest,
-            usize,
-            LatestTip<H, P, V>,
-        )> = Vec::new();
+    fn majority_finalization(&self, required: usize) -> Option<EngineFinalization<P, V>> {
+        let mut counts = Vec::new();
 
-        for (_, response) in &self.responses {
-            let digest = response.block.digest();
+        for (_, finalization) in &self.responses {
             if let Some((_, count, _)) = counts
                 .iter_mut()
-                .find(|(candidate, _, _)| *candidate == digest)
+                .find(|(proposal, _, _)| *proposal == finalization.proposal)
             {
                 *count += 1;
                 continue;
             }
 
-            counts.push((digest, 1, response.clone()));
+            counts.push((finalization.proposal.clone(), 1, finalization.clone()));
         }
 
         counts
             .into_iter()
-            .find_map(|(_, count, tip)| (count >= required).then_some(tip))
+            .find_map(|(_, count, finalization)| (count >= required).then_some(finalization))
     }
 }
 
@@ -290,8 +215,8 @@ where
     blocker: B,
     scheme: ThresholdScheme<P, V>,
     marshal: Option<EngineMarshalMailbox<H, P, V>>,
-    pending: Option<oneshot::Sender<InitialTarget<H, P, V>>>,
-    fetch: Option<Fetch<H, P, V>>,
+    pending: Option<oneshot::Sender<InitialTarget<P, V>>>,
+    fetch: Option<Fetch<P, V>>,
     retry_deadline: Option<SystemTime>,
     next_request_id: u64,
     quorum: usize,
@@ -333,7 +258,6 @@ where
                 round_timeout: config.round_timeout,
                 retry_interval: config.retry_interval,
                 wire_config: WireConfig {
-                    block: config.block_codec,
                     certificate: ThresholdScheme::<P, V>::certificate_codec_config_unbounded(),
                 },
             },
@@ -419,7 +343,7 @@ where
     where
         S: Sender<PublicKey = P>,
     {
-        let message = match WireMessage::<H, P, V>::decode_cfg(payload, &self.wire_config) {
+        let message = match WireMessage::<P, V>::decode_cfg(payload, &self.wire_config) {
             Ok(message) => message,
             Err(error) => {
                 warn!(?error, "bootstrapper received malformed message");
@@ -434,27 +358,24 @@ where
 
         match message {
             WireMessage::Request { id } => {
-                let Some(tip) = self.load_latest_tip().await else {
+                let Some(finalization) = self.load_latest_finalization().await else {
                     return;
                 };
-                let wire = WireMessage::Response {
-                    id,
-                    tip: Box::new(tip),
-                };
+                let wire = WireMessage::Response { id, finalization };
                 let sent = sender.send(Recipients::One(peer), wire.encode(), false);
                 if sent.is_empty() {
                     warn!("bootstrapper failed to send response");
                 }
             }
-            WireMessage::Response { id, tip } => {
-                self.handle_response(peer, id, *tip).await;
+            WireMessage::Response { id, finalization } => {
+                self.handle_response(peer, id, finalization).await;
             }
         }
     }
 
     /// Process a peer's response to a fetch round.
-    async fn handle_response(&mut self, peer: P, id: u64, response: LatestTip<H, P, V>) {
-        let Some(tip) = self.validate_response(&peer, response).await else {
+    async fn handle_response(&mut self, peer: P, id: u64, response: EngineFinalization<P, V>) {
+        let Some(finalization) = self.validate_response(&peer, response).await else {
             return;
         };
 
@@ -466,25 +387,20 @@ where
             return;
         }
 
-        fetch.record_response(peer, tip);
+        fetch.record_response(peer, finalization);
 
-        let Some(tip) = fetch.majority_tip(self.quorum) else {
+        let Some(finalization) = fetch.majority_finalization(self.quorum) else {
             return;
         };
-        self.resolve_pending(tip);
+        self.resolve_pending(finalization);
     }
 
-    /// Verify a peer's finalization certificate and block digest.
+    /// Verify a peer's finalization certificate.
     async fn validate_response(
         &mut self,
         peer: &P,
-        response: LatestTip<H, P, V>,
-    ) -> Option<LatestTip<H, P, V>> {
-        let LatestTip {
-            block,
-            finalization,
-        } = response;
-
+        finalization: EngineFinalization<P, V>,
+    ) -> Option<EngineFinalization<P, V>> {
         if !finalization.verify(self.context.as_present_mut(), &self.scheme, &Sequential) {
             commonware_p2p::block!(
                 self.blocker,
@@ -494,25 +410,10 @@ where
             return None;
         }
 
-        if <EngineVariant<H, P> as MarshalVariant>::commitment_to_inner(
-            finalization.proposal.payload,
-        ) != block.digest()
-        {
-            commonware_p2p::block!(
-                self.blocker,
-                peer.clone(),
-                "bootstrapper received block/finalization mismatch"
-            );
-            return None;
-        }
-
-        Some(LatestTip {
-            block,
-            finalization,
-        })
+        Some(finalization)
     }
 
-    /// Fan out a latest-tip request to all peers and begin a new fetch round.
+    /// Fan out a latest-finalization request to all peers and begin a new fetch round.
     async fn start_latest_round<S>(&mut self, sender: &mut S)
     where
         S: Sender<PublicKey = P>,
@@ -530,7 +431,7 @@ where
 
         let id = self.next_id();
         let Some(sent) = Self::send_request(sender, id, peers).await else {
-            warn!("bootstrapper failed to send latest request");
+            warn!("bootstrapper failed to send latest-finalization request");
             self.schedule_retry();
             return;
         };
@@ -553,35 +454,21 @@ where
             return;
         };
 
-        let Some(target) = fetch.majority_tip(self.quorum) else {
+        let Some(target) = fetch.majority_finalization(self.quorum) else {
             self.schedule_retry();
             return;
         };
         self.resolve_pending(target);
     }
 
-    /// Load the local finalized tip from the marshal.
+    /// Load the latest local finalization from the marshal.
     ///
     /// The marshal only stores validated data, so we trust it without
     /// re-verifying the finalization certificate.
-    async fn load_latest_tip(&mut self) -> Option<LatestTip<H, P, V>> {
+    async fn load_latest_finalization(&mut self) -> Option<EngineFinalization<P, V>> {
         let marshal = self.marshal.clone()?;
-        let block = marshal.get_block(Identifier::Latest).await?;
-        let height = block.height();
-        let finalization = marshal.get_finalization(height).await?;
-        let block = <EngineVariant<H, P> as MarshalVariant>::into_inner(block);
-        debug_assert_eq!(
-            <EngineVariant<H, P> as MarshalVariant>::commitment_to_inner(
-                finalization.proposal.payload,
-            ),
-            block.digest(),
-            "marshal returned mismatched block/finalization at height {}",
-            height.get(),
-        );
-        Some(LatestTip {
-            block,
-            finalization,
-        })
+        let height = marshal.get_processed_height().await?;
+        marshal.get_finalization(height).await
     }
 
     /// Return all peers in peer set 0, excluding ourselves.
@@ -596,12 +483,12 @@ where
             .collect()
     }
 
-    /// Broadcast a latest-tip request to the given peers.
+    /// Broadcast a latest-finalization request to the given peers.
     async fn send_request<S>(sender: &mut S, id: u64, peers: Vec<P>) -> Option<Vec<P>>
     where
         S: Sender<PublicKey = P>,
     {
-        let message = WireMessage::<H, P, V>::Request { id };
+        let message = WireMessage::<P, V>::Request { id };
         let sent = sender.send(Recipients::Some(peers), message.encode(), false);
         if sent.is_empty() {
             return None;
@@ -625,12 +512,12 @@ where
         id
     }
 
-    /// Deliver the selected tip to the pending caller.
-    fn resolve_pending(&mut self, tip: LatestTip<H, P, V>) {
+    /// Deliver the selected finalization to the pending caller.
+    fn resolve_pending(&mut self, finalization: EngineFinalization<P, V>) {
         self.fetch = None;
         self.retry_deadline = None;
         if let Some(sender) = self.pending.take() {
-            sender.send_lossy((tip.block, tip.finalization));
+            sender.send_lossy(finalization);
         }
     }
 

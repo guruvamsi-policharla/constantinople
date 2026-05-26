@@ -1,7 +1,7 @@
 //! Mailbox for bootstrapper actor control messages.
 //!
 //! The bootstrapper keeps a fetch request open until it discovers a usable
-//! initial state-sync target.
+//! initial state-sync floor.
 
 use super::{EngineMarshalMailbox, InitialTarget};
 use commonware_cryptography::{Hasher, PublicKey, bls12381::primitives::variant::Variant};
@@ -17,7 +17,7 @@ where
         marshal: EngineMarshalMailbox<H, P, V>,
     },
     FetchInitialTarget {
-        response: oneshot::Sender<InitialTarget<H, P, V>>,
+        response: oneshot::Sender<InitialTarget<P, V>>,
     },
 }
 
@@ -59,8 +59,8 @@ where
         self.sender.send_lossy(Message::Attach { marshal }).await;
     }
 
-    /// Wait until the actor discovers an initial state-sync target.
-    pub async fn fetch_initial_target(&self) -> Option<InitialTarget<H, P, V>> {
+    /// Wait until the actor discovers an initial state-sync floor.
+    pub async fn fetch_initial_target(&self) -> Option<InitialTarget<P, V>> {
         self.sender
             .request(|response| Message::FetchInitialTarget { response })
             .await

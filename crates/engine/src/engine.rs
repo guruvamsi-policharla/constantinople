@@ -143,9 +143,9 @@ where
 /// `O` is the type of an optional simplex activity observer (e.g. the
 /// indexer's certificate publisher). Pass `None::<NoopActivityReporter<P, V>>`
 /// when no external observer is wired in.
-pub enum StartupMode<B, F> {
+pub enum StartupMode<F> {
     MarshalSync,
-    StateSync { block: B, finalization: F },
+    StateSync { finalization: F },
 }
 
 pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
@@ -170,7 +170,7 @@ where
     pub partition_prefix: String,
     pub signature_strategy: SigT,
     pub hash_strategy: HashT,
-    pub startup: StartupMode<EngineBlock<H, C::PublicKey>, EngineFinalization<C::PublicKey, V>>,
+    pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
     pub sync_config: SyncEngineConfig,
     pub prune_cadence_blocks: NonZero<u64>,
     pub genesis_leader: C::PublicKey,
@@ -396,121 +396,60 @@ where
                     SimplexFloor::Finalized(finalization),
                 )
             } else {
-                match &config.startup {
-                    StartupMode::MarshalSync => {
-                        let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
-                            context.child("genesis_state"),
-                            state_db_config(
-                                &config.partition_prefix,
-                                &storage_page_cache,
-                                config.hash_strategy.clone(),
-                            ),
-                        )
-                        .await
-                        .expect("state db must initialize for genesis target");
-                        let genesis_state_target =
-                            <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(
-                                &genesis_state_db,
-                            )
-                            .await;
-                        let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
-                            context.child("genesis_transactions"),
-                            transaction_db_config.clone(),
-                        )
-                        .await
-                        .expect("transaction history db must initialize for genesis target");
-                        let genesis_transactions_target =
-                            <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
-                                &genesis_transaction_db,
-                            )
-                            .await;
-                        let genesis_block =
-                            constantinople_application::consensus::genesis_block_with_parent(
-                                &mut H::default(),
-                                config.genesis_leader.clone(),
-                                (commonware_consensus::types::View::zero(), genesis_parent),
-                                0,
-                                genesis_state_target.clone(),
-                                genesis_transactions_target.clone(),
-                            );
-                        let coded_block = EngineCodedBlock::new(
-                            genesis_block,
-                            coding_config,
-                            &config.hash_strategy,
-                        );
-                        let commitment = coded_block.commitment();
-                        (
-                            genesis_state_target,
-                            genesis_transactions_target,
-                            startup_plan.marshal_start(coded_block),
-                            SimplexFloor::Genesis(commitment),
-                        )
+                let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
+                    context.child("genesis_state"),
+                    state_db_config(
+                        &config.partition_prefix,
+                        &storage_page_cache,
+                        config.hash_strategy.clone(),
+                    ),
+                )
+                .await
+                .expect("state db must initialize for genesis target");
+                let genesis_state_target =
+                    <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(
+                        &genesis_state_db,
+                    )
+                    .await;
+                let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
+                    context.child("genesis_transactions"),
+                    transaction_db_config.clone(),
+                )
+                .await
+                .expect("transaction history db must initialize for genesis target");
+                let genesis_transactions_target =
+                    <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
+                        &genesis_transaction_db,
+                    )
+                    .await;
+                let genesis_block =
+                    constantinople_application::consensus::genesis_block_with_parent(
+                        &mut H::default(),
+                        config.genesis_leader.clone(),
+                        (commonware_consensus::types::View::zero(), genesis_parent),
+                        0,
+                        genesis_state_target.clone(),
+                        genesis_transactions_target.clone(),
+                    );
+                let coded_block =
+                    EngineCodedBlock::new(genesis_block, coding_config, &config.hash_strategy);
+                let commitment = coded_block.commitment();
+                let simplex_floor = match &config.startup {
+                    StartupMode::StateSync { finalization } if startup_plan.may_state_sync() => {
+                        startup_plan = startup_plan.with_floor(finalization.clone());
+                        SimplexFloor::Finalized(finalization.clone())
                     }
-                    StartupMode::StateSync {
-                        block,
-                        finalization,
-                    } => {
-                        let should_state_sync = startup_plan.may_state_sync();
-                        let (state_target, transaction_target) = if should_state_sync {
-                            startup_plan = startup_plan.with_floor(finalization.clone());
-                            block_targets(block)
-                        } else {
-                            let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
-                                context.child("genesis_state"),
-                                state_db_config(
-                                    &config.partition_prefix,
-                                    &storage_page_cache,
-                                    config.hash_strategy.clone(),
-                                ),
-                            )
-                            .await
-                            .expect("state db must initialize for genesis target");
-                            let state_target =
-                                <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(
-                                    &genesis_state_db,
-                                )
-                                .await;
-                            let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
-                                context.child("genesis_transactions"),
-                                transaction_db_config.clone(),
-                            )
-                            .await
-                            .expect("transaction history db must initialize for genesis target");
-                            let transaction_target =
-                                <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
-                                    &genesis_transaction_db,
-                                )
-                                .await;
-                            (state_target, transaction_target)
-                        };
-                        let genesis_block =
-                            constantinople_application::consensus::genesis_block_with_parent(
-                                &mut H::default(),
-                                config.genesis_leader.clone(),
-                                (commonware_consensus::types::View::zero(), genesis_parent),
-                                0,
-                                state_target.clone(),
-                                transaction_target.clone(),
-                            );
-                        let coded_block = EngineCodedBlock::new(
-                            genesis_block,
-                            coding_config,
-                            &config.hash_strategy,
-                        );
-                        let commitment = coded_block.commitment();
-                        let simplex_floor = if should_state_sync {
-                            SimplexFloor::Finalized(finalization.clone())
-                        } else {
-                            SimplexFloor::Genesis(commitment)
-                        };
-                        (
-                            state_target,
-                            transaction_target,
-                            startup_plan.marshal_start(coded_block),
-                            simplex_floor,
-                        )
+                    StartupMode::MarshalSync | StartupMode::StateSync { .. } => {
+                        SimplexFloor::Genesis(commitment)
                     }
-                }
+                };
+
+                (
+                    genesis_state_target,
+                    genesis_transactions_target,
+                    startup_plan.marshal_start(coded_block),
+                    simplex_floor,
+                )
             };
 
         let (marshal, marshal_mailbox, _) = MarshalActor::init(

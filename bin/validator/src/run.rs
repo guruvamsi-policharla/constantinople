@@ -306,7 +306,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 mailbox_size: 32,
                 round_timeout: Duration::from_secs(1),
                 retry_interval: Duration::from_secs(1),
-                block_codec: Default::default(),
             },
         );
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
@@ -471,24 +470,21 @@ const fn production_sync_config() -> SyncEngineConfig {
     }
 }
 
-async fn resolve_startup_mode<T, Fin, F, Fut>(
+async fn resolve_startup_mode<Fin, F, Fut>(
     requested: StartupModeConfig,
     fetch_initial_target: F,
-) -> StartupMode<T, Fin>
+) -> StartupMode<Fin>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<(T, Fin)>>,
+    Fut: Future<Output = Option<Fin>>,
 {
     match requested {
         StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
         StartupModeConfig::StateSync => {
-            let (block, finalization) = fetch_initial_target()
+            let finalization = fetch_initial_target()
                 .await
-                .expect("bootstrapper actor exited before selecting a state-sync target");
-            StartupMode::StateSync {
-                block,
-                finalization,
-            }
+                .expect("bootstrapper actor exited before selecting a state-sync floor");
+            StartupMode::StateSync { finalization }
         }
     }
 }

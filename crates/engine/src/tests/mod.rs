@@ -12,7 +12,7 @@ use common::{
     HeightMonitorReporter, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
     TestPrivateKey, TestPublicKey, TestScheme, ValidatorState, state_sync_done, validator_fixture,
 };
-use commonware_consensus::{Heightable, simplex::elector::RoundRobin, types::coding::Commitment};
+use commonware_consensus::{simplex::elector::RoundRobin, types::coding::Commitment};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -217,7 +217,6 @@ impl EngineDefinition for TestEngineDefinition {
                     mailbox_size: 32,
                     round_timeout: Duration::from_secs(1),
                     retry_interval: Duration::from_millis(100),
-                    block_codec: Default::default(),
                 },
             );
             let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
@@ -228,18 +227,12 @@ impl EngineDefinition for TestEngineDefinition {
                 bootstrapper_mailbox
                     .fetch_initial_target()
                     .await
-                    .map(|(block, finalization)| {
-                        let height = block.height().get();
+                    .map(|finalization| {
+                        let height = finalization.proposal.round.view().get();
                         sync_heights.lock().insert(public_key.clone(), height);
-                        (
-                            StartupMode::StateSync {
-                                block,
-                                finalization,
-                            },
-                            Some(height),
-                        )
+                        (StartupMode::StateSync { finalization }, Some(height))
                     })
-                    .expect("bootstrapper actor exited before selecting a state-sync target")
+                    .expect("bootstrapper actor exited before selecting a state-sync floor")
             } else {
                 let prior = sync_heights.lock().get(&public_key).copied();
                 (StartupMode::MarshalSync, prior)
