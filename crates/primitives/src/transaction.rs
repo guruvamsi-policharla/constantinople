@@ -1,16 +1,106 @@
 //! Constantinople transaction type and transaction wrappers.
 
-use crate::{AccountKey, Sealable, Sealed, Signed, TransactionPublicKey, TransactionSignature};
+use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature};
 use bytes::{Buf, BufMut};
-use commonware_codec::{Encode, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
+use commonware_codec::{
+    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
+};
 use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
 
 /// A signed transaction accepted by the canonical block format.
-pub type SignedTransaction<H> = Signed<Transaction<<H as Hasher>::Digest>, H, TransactionSignature>;
+#[derive(Debug, Clone)]
+pub struct SignedTransaction<H>
+where
+    H: Hasher,
+{
+    inner: Sealed<Transaction<H::Digest>, H>,
+    signature: TransactionSignature,
+}
+
+impl<H> PartialEq for SignedTransaction<H>
+where
+    H: Hasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner && self.signature == other.signature
+    }
+}
+
+impl<H> Eq for SignedTransaction<H> where H: Hasher {}
 
 /// A signed transaction whose signature has been accepted by the caller.
 pub type VerifiedTransaction<H> = SignedTransaction<H>;
+
+impl<H> SignedTransaction<H>
+where
+    H: Hasher,
+{
+    /// Creates a signed transaction without checking the signature.
+    pub const fn new_unchecked(
+        inner: Sealed<Transaction<H::Digest>, H>,
+        signature: TransactionSignature,
+    ) -> Self {
+        Self { inner, signature }
+    }
+
+    /// Returns the inner sealed transaction.
+    pub fn into_inner(self) -> Sealed<Transaction<H::Digest>, H> {
+        self.inner
+    }
+
+    /// Returns a reference to the inner sealed transaction.
+    pub const fn inner(&self) -> &Sealed<Transaction<H::Digest>, H> {
+        &self.inner
+    }
+
+    /// Returns a reference to the transaction.
+    pub fn value(&self) -> &Transaction<H::Digest> {
+        self.inner()
+    }
+
+    /// Returns the transaction digest that was signed.
+    pub const fn message_digest(&self) -> &H::Digest {
+        self.inner.seal()
+    }
+
+    /// Returns the decoded transaction signature.
+    pub const fn signature(&self) -> &TransactionSignature {
+        &self.signature
+    }
+}
+
+impl<H> Write for SignedTransaction<H>
+where
+    H: Hasher,
+{
+    fn write(&self, buf: &mut impl BufMut) {
+        self.inner.write(buf);
+        self.signature.write(buf);
+    }
+}
+
+impl<H> EncodeSize for SignedTransaction<H>
+where
+    H: Hasher,
+{
+    fn encode_size(&self) -> usize {
+        self.inner.encode_size() + self.signature.encode_size()
+    }
+}
+
+impl<H> Read for SignedTransaction<H>
+where
+    H: Hasher,
+{
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
+        let inner = Sealed::<Transaction<H::Digest>, H>::read(buf)?;
+        let signature = TransactionSignature::read(buf)?;
+        Ok(Self { inner, signature })
+    }
+}
 
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,7 +168,7 @@ impl<D: Digest> Transaction<D> {
     {
         let sealed = self.seal(hasher);
         let signature = TransactionSignature::from(signer.sign(namespace, sealed.seal().as_ref()));
-        Signed::new_unchecked(sealed, signature)
+        SignedTransaction::new_unchecked(sealed, signature)
     }
 }
 
@@ -266,7 +356,7 @@ mod test {
 
         let mut buf = Vec::new();
         invalid_sender.write(&mut buf);
-        test_sender().write(&mut buf);
+        AccountKey::from_public_key(&test_sender()).write(&mut buf);
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 

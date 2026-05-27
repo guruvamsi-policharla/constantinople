@@ -4,19 +4,18 @@ use super::{
     INVALID_SIGNATURE, MALFORMED_TRANSACTION, MATERIALIZE_TASK_CLOSED, Result,
     SIGNATURE_TASK_CLOSED,
 };
-use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner};
 use constantinople_primitives::{
-    SignedTransaction, materialize_transaction_chunks, preload_transaction_chunks,
-    verify_transaction_batch,
+    LazySignedTransaction, SignedTransaction, materialize_transaction_chunks,
+    preload_transaction_chunks, verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
 use tracing::{Instrument, info_span};
 
-pub(super) type PreparedBody<H> = Arc<Vec<Lazy<SignedTransaction<H>>>>;
+pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
 
 pub(super) async fn verify_signatures<E, H, SigSt, HashSt>(
     runtime: E,
@@ -61,7 +60,7 @@ where
 pub(super) async fn materialize_body<E, H, HashSt>(
     runtime: E,
     hash_strategy: HashSt,
-    transactions: Vec<Lazy<SignedTransaction<H>>>,
+    transactions: Vec<LazySignedTransaction<H>>,
 ) -> Result<Vec<SignedTransaction<H>>>
 where
     E: Spawner,

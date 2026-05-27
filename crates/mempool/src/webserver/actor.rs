@@ -694,7 +694,7 @@ mod tests {
     };
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
-    use constantinople_primitives::{Signable as _, TRANSACTION_NAMESPACE, Transaction};
+    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
     use std::collections::{HashMap, HashSet};
@@ -738,8 +738,8 @@ mod tests {
         let signer = ed25519::PrivateKey::from_seed(1);
         let recipient = ed25519::PrivateKey::from_seed(2).public_key();
         let transaction = Transaction::new(
-            signer.public_key(),
-            recipient,
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
             NonZeroU64::new(1).expect("non-zero"),
             0,
         )

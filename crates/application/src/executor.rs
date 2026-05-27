@@ -3,7 +3,7 @@
 use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, SignedTransaction, TransactionPublicKey};
 use hashbrown::HashMap;
 
 /// Fully loaded account state for one execution batch.
@@ -194,11 +194,11 @@ where
 }
 
 fn account_key_from_sender(
-    sender: &commonware_codec::types::lazy::Lazy<constantinople_primitives::TransactionPublicKey>,
+    sender: &commonware_codec::types::lazy::Lazy<TransactionPublicKey>,
 ) -> Option<AccountKey> {
-    let mut bytes = BytesMut::with_capacity(AccountKey::SIZE);
+    let mut bytes = BytesMut::with_capacity(TransactionPublicKey::SIZE);
     sender.write(&mut bytes);
-    AccountKey::from_bytes(bytes.freeze())
+    AccountKey::from_public_key_bytes(&bytes)
 }
 
 #[derive(Debug)]

@@ -1,13 +1,15 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
-use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
+use constantinople_primitives::{
+    Account, AccountKey, Transaction, TransactionPublicKey, VerifiedTransaction,
+};
 use core::num::NonZeroU64;
 
 const NAMESPACE: &[u8] = b"executor-test";
 
 type TestHasher = sha256::Sha256;
-type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
-type TestProposal = ProposalOutput<ed25519::PublicKey, TestHasher>;
+type TestTransaction = VerifiedTransaction<TestHasher>;
+type TestProposal = ProposalOutput<TestHasher>;
 
 #[derive(Debug, Clone)]
 struct TestSigner {
@@ -24,8 +26,8 @@ impl TestSigner {
 
     fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
         Transaction::new(
-            self.key.public_key(),
-            to,
+            TransactionPublicKey::ed25519(self.key.public_key()),
+            TransactionPublicKey::ed25519(to),
             NonZeroU64::new(value).expect("test values must be non-zero"),
             nonce,
         )
@@ -37,12 +39,12 @@ fn account(balance: u64, nonce: u64) -> Account {
     Account { balance, nonce }
 }
 
-fn account_key(public_key: &ed25519::PublicKey) -> AccountKey<ed25519::PublicKey> {
-    AccountKey::from_public_key(public_key)
+fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
+    AccountKey::from_public_key(&TransactionPublicKey::ed25519(public_key.clone()))
 }
 
 fn changeset_account(
-    changeset: &[(AccountKey<ed25519::PublicKey>, Account)],
+    changeset: &[(AccountKey, Account)],
     public_key: ed25519::PublicKey,
 ) -> Option<Account> {
     let account_key = account_key(&public_key);
@@ -202,9 +204,9 @@ fn recipient_overflow_rejects_without_charging_sender() {
 }
 
 fn execute_prepared(
-    accounts: &State<ed25519::PublicKey>,
+    accounts: &State,
     transactions: &[TestTransaction],
-) -> Option<super::Changeset<ed25519::PublicKey>> {
+) -> Option<super::Changeset> {
     let transfers = transactions
         .iter()
         .map(prepare_transfer)

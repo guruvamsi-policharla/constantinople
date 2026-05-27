@@ -126,7 +126,7 @@ where
         let sql_writer = build_meta_schema(commit_client.clone())
             .map_err(PublishError::SqlSchema)?
             .batch_writer();
-        let state = recover_state_writer_state::<H, P>(state_client.clone()).await?;
+        let state = recover_state_writer_state::<H>(state_client.clone()).await?;
         let transactions =
             recover_transaction_writer_state::<H>(transaction_client.clone()).await?;
         let state_writer = Arc::new(StateWriter::new(state_client, state));
@@ -498,13 +498,12 @@ pub fn transactions_qmdb_client(client: &StoreClient) -> Result<StoreClient, Pub
     Ok(client.with_key_prefix(transactions_qmdb_prefix()?))
 }
 
-async fn recover_state_writer_state<H, P>(
+async fn recover_state_writer_state<H>(
     client: StoreClient,
 ) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
 {
     let reader =
         UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_client(
@@ -618,7 +617,7 @@ where
             block_start: end,
         });
     }
-    let delta = load_state_ops::<E, H, P, S>(&state, writer_next, end).await?;
+    let delta = load_state_ops::<E, H, S>(&state, writer_next, end).await?;
     let account_rows = account_rows(&delta, writer_next);
     Ok(PendingStateUpload {
         delta,
@@ -652,7 +651,7 @@ fn encode_account_row(account: &AccountValue, location: u64) -> bytes::Bytes {
     bytes::Bytes::from(row)
 }
 
-async fn load_state_ops<E, H, P, S>(
+async fn load_state_ops<E, H, S>(
     state: &commonware_storage::qmdb::any::unordered::fixed::Db<
         QmdbFamily,
         E,
@@ -668,7 +667,6 @@ async fn load_state_ops<E, H, P, S>(
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
     let count = end

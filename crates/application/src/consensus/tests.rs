@@ -5,7 +5,7 @@ use super::{
 use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
 use commonware_storage::merkle::mmr;
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Block, Sealable, Signable, Transaction};
+use constantinople_primitives::{Block, Sealable, Transaction, TransactionPublicKey};
 use std::num::NonZeroU64;
 
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
@@ -40,8 +40,8 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
         (0..3)
             .map(|nonce| {
                 Transaction::new(
-                    leader.public_key(),
-                    to.clone(),
+                    TransactionPublicKey::ed25519(leader.public_key()),
+                    TransactionPublicKey::ed25519(to.clone()),
                     NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
                     nonce,
                 )

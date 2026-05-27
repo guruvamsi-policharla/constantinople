@@ -31,7 +31,8 @@ use constantinople_indexer::{
     },
 };
 use constantinople_primitives::{
-    Block, Header, Sealable, Signable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+    Block, Header, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+    TransactionPublicKey,
 };
 use core::num::NonZeroU64;
 use datafusion::{
@@ -69,17 +70,14 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
     };
 
-    let txs: Vec<SignedTransaction<PublicKey, Sha256>> = (0..tx_count)
+    let txs: Vec<SignedTransaction<Sha256>> = (0..tx_count)
         .map(|i| {
             let signer = ed25519::PrivateKey::random(&mut rng);
-            let to = ed25519::PrivateKey::random(&mut rng).public_key();
+            let sender = TransactionPublicKey::ed25519(signer.public_key());
+            let to =
+                TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
             let value = NonZeroU64::new(100 + i as u64).expect("non-zero");
-            let tx = Transaction::<sha256::Digest, PublicKey>::new(
-                signer.public_key(),
-                to,
-                value,
-                i as u64,
-            );
+            let tx = Transaction::<sha256::Digest>::new(sender, to, value, i as u64);
             tx.seal_and_sign(&signer, TEST_NAMESPACE, &mut Sha256::default())
         })
         .collect();

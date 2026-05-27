@@ -15,6 +15,7 @@ import {
     GetOperationRangeRequestSchema,
     OperationLogService,
 } from '../vendor/exoware-qmdb/src/generated/proto/qmdb/v1/operation_log_pb';
+import { HistoricalOperationRangeProof } from '../vendor/exoware-qmdb/src/generated/proto/qmdb/v1/proof_pb';
 
 const TX_BY_HEIGHT_RESERVED_BITS = 4;
 const TX_BY_HEIGHT_PREFIX = 0x6;
@@ -44,6 +45,8 @@ export interface VerifiedFinalizationTarget {
 interface TransactionProofMetadata {
     readonly location: bigint;
     readonly height: bigint;
+    readonly blockIndex: number;
+    readonly blockTransactionCount: number;
 }
 
 interface FinalizedTransactionTarget {
@@ -119,16 +122,21 @@ export async function fetchAndVerifyTransactionProof({
 
     const tip = transactionProofTip(target.transactionsTip);
     const proof = await fetchOperationProof(`${trimTrailingSlash(qmdbUrl)}/transactions`, metadata.location, tip, signal);
-    const verification = verifyTransactionProof(
-        target.transactionsRoot,
-        proof.proof,
-        proof.opsRoot,
-        proof.opsRootWitness,
-        proof.startLocation,
-        proof.encodedOperations,
-        metadata.location,
-        fromHex(digest),
-    ) as WasmTransactionProof;
+    let verification: WasmTransactionProof;
+    try {
+        verification = verifyTransactionProof(
+            target.transactionsRoot,
+            proof.proof,
+            proof.opsRoot,
+            proof.opsRootWitness,
+            proof.startLocation,
+            proof.encodedOperations,
+            metadata.location,
+            fromHex(digest),
+        ) as WasmTransactionProof;
+    } catch (error) {
+        throw new Error(transactionProofErrorDetail(error, target, metadata, proof));
+    }
 
     return {
         location: metadata.location,
@@ -288,13 +296,35 @@ async function fetchTransactionProofMetadata(
     }
 
     const txCount = BigInt(rows.results.length);
+    const blockIndex = txIndexFromKey(match.key);
     const appendStart = target.transactionsTip - (txCount + 1n);
-    const location = appendStart + BigInt(txIndexFromKey(match.key));
+    const location = appendStart + BigInt(blockIndex);
 
     return {
         location,
         height: target.height,
+        blockIndex,
+        blockTransactionCount: rows.results.length,
     };
+}
+
+function transactionProofErrorDetail(
+    error: unknown,
+    target: FinalizedTransactionTarget,
+    metadata: TransactionProofMetadata,
+    proof: HistoricalOperationRangeProof,
+): string {
+    const reason = error instanceof Error ? error.message : String(error);
+    return [
+        reason,
+        `height ${target.height.toString()}`,
+        `location ${metadata.location.toString()}`,
+        `tip ${transactionProofTip(target.transactionsTip).toString()}`,
+        `proof start ${proof.startLocation.toString()}`,
+        `ops ${proof.encodedOperations.length}`,
+        `block index ${metadata.blockIndex}`,
+        `block txs ${metadata.blockTransactionCount}`,
+    ].join(' · ');
 }
 
 async function fetchOperationProof(
@@ -318,31 +348,18 @@ async function fetchOperationProof(
     return response.proof;
 }
 
-const finalizedTargetCache = new Map<string, Promise<FinalizedTransactionTarget>>();
-
 function finalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
     signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
-    const key = `${trimTrailingSlash(storeUrl)}:${simplexVerificationMaterial}:${height}`;
-    const cached = finalizedTargetCache.get(key);
-    if (cached) {
-        return cached;
-    }
-
-    const target = fetchFinalizedTransactionTarget(
+    return fetchFinalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
         height,
         signal,
-    ).catch((error: unknown) => {
-        finalizedTargetCache.delete(key);
-        throw error;
-    });
-    finalizedTargetCache.set(key, target);
-    return target;
+    );
 }
 
 function latestProofTarget(
@@ -432,12 +449,12 @@ function decodeTxBySenderRow(key: Uint8Array, value: Uint8Array): AccountTransac
     return {
         key,
         digest: toHex(value.slice(0, 32)),
-        to: toHex(value.slice(32, 64)),
-        value: readU64Be(value, 64),
-        nonce: readU64Be(value, 72),
-        qmdLocation: readU64Be(value, 80),
-        height: readU64Be(value, 88),
-        blockIndex: readU32Be(value, 96),
+        to: toHex(value.slice(32, 32 + ACCOUNT_KEY_BYTES)),
+        value: readU64Be(value, 32 + ACCOUNT_KEY_BYTES),
+        nonce: readU64Be(value, 40 + ACCOUNT_KEY_BYTES),
+        qmdLocation: readU64Be(value, 48 + ACCOUNT_KEY_BYTES),
+        height: readU64Be(value, 56 + ACCOUNT_KEY_BYTES),
+        blockIndex: readU32Be(value, 64 + ACCOUNT_KEY_BYTES),
     };
 }
 
@@ -455,7 +472,7 @@ function decodeAccountRow(value: Uint8Array): AccountProofRow {
 function parseAccountBytes(account: string): Uint8Array {
     const normalized = account.trim().replace(/^0x/i, '').toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(normalized)) {
-        throw new Error('expected a 32-byte hex account public key');
+        throw new Error('expected a 32-byte hex account key');
     }
     return fromHex(normalized);
 }

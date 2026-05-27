@@ -29,6 +29,7 @@ use commonware_codec::Encode;
 use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
+use constantinople_primitives::AccountKey;
 use exoware_sdk::keys::Key;
 use std::{
     marker::PhantomData,
@@ -208,8 +209,9 @@ where
             Bytes::copy_from_slice(tx_digest.as_ref()),
         ));
         if let Some(sender) = tx.value().sender() {
+            let sender_account = AccountKey::from_public_key(sender);
             raw.push((
-                keys::tx_by_sender(sender.as_ref(), height, idx_u32)
+                keys::tx_by_sender(sender_account.as_ref(), height, idx_u32)
                     .expect("sender tx index fits family payload"),
                 encode_tx_by_sender_row(
                     tx_digest.as_ref(),
@@ -261,4 +263,92 @@ fn encode_tx_by_sender_row(
     row.extend_from_slice(&height.to_be_bytes());
     row.extend_from_slice(&block_index.to_be_bytes());
     Bytes::from(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_codec::FixedSize;
+    use commonware_consensus::{
+        simplex::types::Context,
+        types::{Epoch, Round, View, coding::Commitment},
+    };
+    use commonware_cryptography::{
+        Digest, Signer,
+        ed25519::{self, PublicKey},
+        secp256r1::standard as secp256r1,
+        sha256::{self, Sha256},
+    };
+    use commonware_math::algebra::Random;
+    use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
+    use constantinople_primitives::{
+        Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+    };
+    use core::num::NonZeroU64;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn r1_sender_history_uses_account_key() {
+        let mut rng = StdRng::from_seed([3; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender =
+            TransactionPublicKey::secp256r1(secp256r1::PrivateKey::random(&mut rng).public_key());
+        let recipient =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+        let sender_account = AccountKey::from_public_key(&sender);
+        let transaction = Transaction::<sha256::Digest>::new(
+            sender,
+            recipient,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let block = Block::<Commitment, PublicKey, Sha256>::new(
+            test_header(consensus_key.public_key()),
+            vec![transaction],
+        )
+        .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        let tx_by_sender = rows
+            .raw
+            .iter()
+            .find(|(key, _)| keys::TX_BY_SENDER.matches(key))
+            .expect("sender history row should be indexed");
+        let payload = keys::TX_BY_SENDER
+            .decode(&tx_by_sender.0, AccountKey::SIZE + 12)
+            .expect("sender history key should decode");
+
+        assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
+    }
+
+    fn test_header(leader: PublicKey) -> Header<Commitment, sha256::Digest, PublicKey> {
+        Header {
+            context: Context {
+                round: Round::new(Epoch::zero(), View::zero()),
+                leader,
+                parent: (View::zero(), valid_commitment()),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: 7,
+            timestamp: 1_000,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(0u64, 2u64) as NonEmptyRange<u64>,
+        }
+    }
+
+    fn valid_commitment() -> Commitment {
+        Commitment::from((
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            commonware_coding::Config {
+                minimum_shards: NZU16!(1),
+                extra_shards: NZU16!(1),
+            },
+        ))
+    }
 }

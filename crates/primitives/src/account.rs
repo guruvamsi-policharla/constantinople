@@ -1,8 +1,12 @@
 //! Account model for the Constantinople chain.
 
-use crate::TransactionPublicKey;
+use crate::{
+    TransactionPublicKey,
+    auth::{ED25519_SCHEME, SECP256R1_SCHEME},
+};
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
 use core::ops::Deref;
@@ -11,12 +15,12 @@ use derive_more::{Debug, Display};
 /// Default starting balance for accounts that have not been written yet.
 pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 
-/// Raw public-key bytes used as an account key.
+/// Fixed-width account identifier derived from a transaction public key.
 ///
-/// Unlike [`PublicKey`] implementations, decoding an [`AccountKey`] does not
-/// validate or decompress the curve point. This keeps state-database replay,
-/// indexing, and lookup on cheap byte comparisons while preserving the public
-/// key's canonical wire representation as the account identifier.
+/// Unlike [`commonware_cryptography::PublicKey`] implementations, decoding an
+/// [`AccountKey`] does not validate or decompress the curve point. This keeps
+/// state-database replay, indexing, and lookup on cheap byte comparisons while
+/// preserving the legacy Ed25519 account format.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountKey {
     bytes: Bytes,
@@ -25,14 +29,30 @@ pub struct AccountKey {
 impl AccountKey {
     /// Creates an account key from a decoded public key.
     pub fn from_public_key(public_key: &TransactionPublicKey) -> Self {
-        Self {
-            bytes: Bytes::copy_from_slice(public_key.as_ref()),
+        Self::from_public_key_bytes(public_key.as_ref())
+            .expect("decoded transaction public key bytes must derive an account key")
+    }
+
+    /// Creates an account key from encoded transaction public-key bytes.
+    pub fn from_public_key_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != TransactionPublicKey::SIZE {
+            return None;
+        }
+
+        match bytes[0] {
+            ED25519_SCHEME => Some(Self {
+                bytes: Bytes::copy_from_slice(&bytes[1..1 + Self::SIZE]),
+            }),
+            SECP256R1_SCHEME => Some(Self {
+                bytes: Bytes::copy_from_slice(sha256::Sha256::hash(bytes).as_ref()),
+            }),
+            _ => None,
         }
     }
 
-    /// Creates an account key from canonical public-key bytes.
+    /// Creates an account key from canonical account-key bytes.
     pub fn from_bytes(bytes: Bytes) -> Option<Self> {
-        if bytes.len() != TransactionPublicKey::SIZE {
+        if bytes.len() != Self::SIZE {
             return None;
         }
 
@@ -41,7 +61,7 @@ impl AccountKey {
 }
 
 impl FixedSize for AccountKey {
-    const SIZE: usize = TransactionPublicKey::SIZE;
+    const SIZE: usize = ed25519::PublicKey::SIZE;
 }
 
 impl Write for AccountKey {
@@ -142,26 +162,41 @@ impl Read for Account {
 mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, FixedSize};
-    use commonware_cryptography::{Signer, ed25519};
+    use commonware_cryptography::{
+        Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
+    };
 
     #[test]
     fn account_key_roundtrip_does_not_validate_public_key() {
-        let mut raw = vec![0u8; TransactionPublicKey::SIZE];
+        let mut raw = vec![0u8; AccountKey::SIZE];
         raw[0] = 1;
 
-        let key = AccountKey::decode(&mut &raw[..]).expect("account keys are raw public-key bytes");
+        let key = AccountKey::decode(&mut &raw[..]).expect("account keys are raw bytes");
 
         assert_eq!(key.as_ref(), raw.as_slice());
     }
 
     #[test]
-    fn account_key_from_public_key_uses_public_key_bytes() {
+    fn account_key_from_ed25519_public_key_uses_legacy_key_bytes() {
         let private_key = ed25519::PrivateKey::from_seed(1);
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
 
         let key = AccountKey::from_public_key(&public_key);
 
-        assert_eq!(key.as_ref(), public_key.as_ref());
+        assert_eq!(key.as_ref(), &public_key.as_ref()[1..1 + AccountKey::SIZE]);
+    }
+
+    #[test]
+    fn account_key_from_secp256r1_public_key_uses_hash() {
+        let private_key = secp256r1::PrivateKey::from_seed(1);
+        let public_key = TransactionPublicKey::secp256r1(private_key.public_key());
+
+        let key = AccountKey::from_public_key(&public_key);
+
+        assert_eq!(
+            key.as_ref(),
+            sha256::Sha256::hash(public_key.as_ref()).as_ref()
+        );
     }
 
     #[test]

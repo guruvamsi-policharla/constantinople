@@ -7,10 +7,12 @@ import {
     type CSSProperties,
 } from 'react';
 import {
+    accountKeyFromPublicKey,
     encodeSignedTransaction,
     encodeTransactionBatch,
     parsePublicKeyHex,
     parseU64,
+    toHex,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
@@ -574,10 +576,10 @@ export default function App() {
         }
     };
 
-    const submitAccountLookup = () => {
-        const normalized = normalizeAccountInput(accountInput);
+    const submitAccountLookup = async () => {
+        const normalized = await normalizeAccountInput(accountInput);
         if (!normalized) {
-            setSearchMessage('expected a 32-byte hex account public key');
+            setSearchMessage('expected a 32-byte account key or 34-byte transaction public key');
             return;
         }
         setSearchMessage('');
@@ -1373,9 +1375,12 @@ function ProofCell({
     }
     if (proof.status === 'error') {
         return (
-            <span className="tx-proof-error" aria-label={proof.detail} title={proof.detail}>
-                !
-            </span>
+            <>
+                <span className="tx-proof-error" aria-label={proof.detail} title={proof.detail}>
+                    !
+                </span>
+                <span className="tx-proof-error-detail">{proof.detail}</span>
+            </>
         );
     }
     return (
@@ -1607,19 +1612,26 @@ function bytesToHex(bytes: Uint8Array): string {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function normalizeAccountInput(value: string): string | null {
+async function normalizeAccountInput(value: string): Promise<string | null> {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    return /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
+    if (/^[0-9a-f]{64}$/.test(normalized)) {
+        return normalized;
+    }
+    if (!/^[0-9a-f]{68}$/.test(normalized)) {
+        return null;
+    }
+
+    return toHex(await accountKeyFromPublicKey(parsePublicKeyHex(normalized)));
 }
 
 function accountFromLocation(): string {
     const url = new URL(window.location.href);
     const queryAccount = url.searchParams.get('account');
-    const fromQuery = queryAccount ? normalizeAccountInput(queryAccount) : null;
-    if (fromQuery) return fromQuery;
+    const fromQuery = queryAccount?.trim().replace(/^0x/i, '').toLowerCase();
+    if (fromQuery && /^[0-9a-f]{64}$/.test(fromQuery)) return fromQuery;
 
     const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
-    return pathMatch ? normalizeAccountInput(pathMatch[1]) ?? '' : '';
+    return pathMatch ? pathMatch[1].toLowerCase() : '';
 }
 
 function readHistory(key: string): SubmittedTransaction[] {
@@ -1748,11 +1760,11 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
             proofSizeBytes: typeof proof.proofSizeBytes === 'number' ? proof.proofSizeBytes : 0,
         };
     }
-    if (
-        (proof.status === 'waiting' || proof.status === 'error') &&
-        typeof proof.detail === 'string'
-    ) {
-        return { status: proof.status, detail: proof.detail };
+    if (proof.status === 'waiting' && typeof proof.detail === 'string') {
+        return { status: 'waiting', detail: proof.detail };
+    }
+    if (proof.status === 'error') {
+        return { status: 'waiting', detail: 'retrying QMDB proof' };
     }
     return { status: 'waiting', detail: 'waiting for finalization' };
 }

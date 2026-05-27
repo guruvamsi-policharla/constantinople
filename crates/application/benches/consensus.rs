@@ -33,8 +33,8 @@ use commonware_utils::{
 use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, Signable,
-    TRANSACTION_NAMESPACE, Transaction, VerifiedTransaction,
+    Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, TRANSACTION_NAMESPACE,
+    Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{
@@ -47,7 +47,7 @@ use std::{
 type TestHasher = sha256::Sha256;
 type TestCommitment = sha256::Digest;
 type TestPublicKey = ed25519::PublicKey;
-type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
+type TestTransaction = VerifiedTransaction<TestHasher>;
 type TestTransactionSource = StaticTransactionSource<TestCommitment, TestPublicKey, TestHasher>;
 type TestApplication = Application<
     RuntimeContext,
@@ -60,15 +60,8 @@ type TestApplication = Application<
     Rayon,
     Rayon,
 >;
-type TestStateDb = fixed::Db<
-    mmr::Family,
-    RuntimeContext,
-    AccountKey<TestPublicKey>,
-    Account,
-    TestHasher,
-    EightCap,
-    Rayon,
->;
+type TestStateDb =
+    fixed::Db<mmr::Family, RuntimeContext, AccountKey, Account, TestHasher, EightCap, Rayon>;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
 type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
 type TestTransactionDatabase = Arc<AsyncRwLock<TestTransactionDb>>;
@@ -458,7 +451,7 @@ fn decode_block(block: TestBlock) -> TestBlock {
 }
 
 struct GeneratedTransactions {
-    accounts: Vec<(AccountKey<TestPublicKey>, Account)>,
+    accounts: Vec<(AccountKey, Account)>,
     transactions: Vec<TestTransaction>,
     leader: TestPublicKey,
 }
@@ -472,14 +465,19 @@ impl GeneratedTransactions {
         for index in 0..transaction_count {
             let sender = TestSigner::new(index as u64);
             let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
+            let sender_public_key = TransactionPublicKey::ed25519(sender.public_key.clone());
+            let recipient_public_key = TransactionPublicKey::ed25519(recipient.clone());
             accounts.push((
-                AccountKey::from_public_key(&sender.public_key),
+                AccountKey::from_public_key(&sender_public_key),
                 Account {
                     balance: 1,
                     nonce: 0,
                 },
             ));
-            accounts.push((AccountKey::from_public_key(&recipient), Account::default()));
+            accounts.push((
+                AccountKey::from_public_key(&recipient_public_key),
+                Account::default(),
+            ));
             transactions.push(sender.sign(recipient, 1, 0));
         }
 
@@ -505,8 +503,8 @@ impl TestSigner {
 
     fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
         Transaction::new(
-            self.key.public_key(),
-            to,
+            TransactionPublicKey::ed25519(self.key.public_key()),
+            TransactionPublicKey::ed25519(to),
             NonZeroU64::new(value).expect("bench value must be non-zero"),
             nonce,
         )
@@ -517,7 +515,7 @@ impl TestSigner {
 async fn init_databases(
     runtime: &RuntimeContext,
     prefix: &str,
-    accounts: &[(AccountKey<TestPublicKey>, Account)],
+    accounts: &[(AccountKey, Account)],
     strategy: Rayon,
 ) -> TestDatabases {
     let databases = TestDatabases::init(

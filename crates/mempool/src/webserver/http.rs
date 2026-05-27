@@ -11,13 +11,13 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
+use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, SignedTransaction, TransactionPublicKey, TransactionSignature, VerifiedTransaction,
-    verify_transaction_chunks,
+    Account, LazySignedTransaction, SignedTransaction, TransactionPublicKey, TransactionSignature,
+    VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -105,7 +105,7 @@ const fn min_signed_transaction_bytes() -> usize {
         + TransactionPublicKey::SIZE
         + MIN_U64_VARINT_BYTES
         + MIN_U64_VARINT_BYTES
-        + TransactionSignature::SIZE
+        + TransactionSignature::MIN_SIZE
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {
@@ -117,9 +117,8 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 /// Accepts a batch of signed transactions as a commonware-codec length-prefixed
 /// vector.
 ///
-/// Signatures are verified in parallel using the configured [`Strategy`] and
-/// [`BatchVerifier`]. Blocks until the batch is fully finalized, partially
-/// finalized, or dropped.
+/// Signatures are verified in parallel using the configured [`Strategy`].
+/// Blocks until the batch is fully finalized, partially finalized, or dropped.
 ///
 /// Returns:
 /// - `200 OK` with JSON status on finalization or drop.
@@ -248,7 +247,10 @@ where
     let signature_strategy = state.signature_strategy.clone();
     let hash_strategy = state.hash_strategy.clone();
     let namespace = state.namespace;
-    let signed_lazy = signed.into_iter().map(Lazy::new).collect::<Vec<_>>();
+    let signed_lazy = signed
+        .into_iter()
+        .map(LazySignedTransaction::new)
+        .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
         verify_transaction_chunks::<H, _, _>(
             &signature_strategy,
@@ -418,14 +420,7 @@ mod tests {
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
-        router::<
-            sha256::Digest,
-            ed25519::PublicKey,
-            sha256::Sha256,
-            ed25519::Batch,
-            Sequential,
-            Sequential,
-        >(state)
+        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential, Sequential>(state)
     }
 
     #[test]

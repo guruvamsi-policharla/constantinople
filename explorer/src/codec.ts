@@ -1,6 +1,6 @@
-const TX_NAMESPACE = new TextEncoder().encode('constantinople-tx');
-const PUBLIC_KEY_BYTES = 32;
-const SIGNATURE_BYTES = 64;
+const PUBLIC_KEY_BYTES = 34;
+const ACCOUNT_KEY_BYTES = 32;
+const ED25519_SCHEME = 0;
 const U64_BYTES = 8;
 const MAX_U64 = (1n << 64n) - 1n;
 
@@ -18,8 +18,8 @@ export interface EncodedTransaction {
 
 export function parsePublicKeyHex(value: string): Uint8Array {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(normalized)) {
-        throw new Error('expected a 32-byte hex public key');
+    if (!/^[0-9a-f]{68}$/.test(normalized)) {
+        throw new Error('expected a 34-byte hex public key');
     }
     return fromHex(normalized);
 }
@@ -38,18 +38,15 @@ export function parseU64(value: string, field: string): bigint {
 
 export async function encodeSignedTransaction(
     draft: TransactionDraft,
-    sign: (namespace: Uint8Array, message: Uint8Array) => Promise<Uint8Array>,
+    sign: (message: Uint8Array) => Promise<Uint8Array>,
 ): Promise<EncodedTransaction> {
     if (draft.value === 0n) {
         throw new Error('value must be greater than zero');
     }
 
-    const body = encodeTransactionBody(draft);
+    const body = await encodeTransactionBody(draft);
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body)));
-    const signature = await sign(TX_NAMESPACE, digest);
-    if (signature.length !== SIGNATURE_BYTES) {
-        throw new Error(`expected ${SIGNATURE_BYTES}-byte Ed25519 signature`);
-    }
+    const signature = await sign(digest);
 
     return {
         digestHex: toHex(digest),
@@ -79,16 +76,25 @@ export function fromHex(value: string): Uint8Array {
     return bytes;
 }
 
-function encodeTransactionBody(draft: TransactionDraft): Uint8Array {
+async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Array> {
     assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
     assertByteLength(draft.toPublicKey, PUBLIC_KEY_BYTES, 'recipient public key');
+    const accountKey = await accountKeyFromPublicKey(draft.toPublicKey);
 
     return bytesConcat(
         draft.senderPublicKey,
-        draft.toPublicKey,
+        accountKey,
         encodeU64(draft.value),
         encodeU64(draft.nonce),
     );
+}
+
+export async function accountKeyFromPublicKey(publicKey: Uint8Array): Promise<Uint8Array> {
+    assertByteLength(publicKey, PUBLIC_KEY_BYTES, 'public key');
+    if (publicKey[0] === ED25519_SCHEME) {
+        return publicKey.slice(1, 1 + ACCOUNT_KEY_BYTES);
+    }
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(publicKey)));
 }
 
 function encodeU64(value: bigint): Uint8Array {

@@ -132,7 +132,7 @@ mod tests {
         let mut rng = commonware_utils::test_rng();
         let lazy_decoded: Vec<_> = decoded
             .into_iter()
-            .map(commonware_codec::types::lazy::Lazy::new)
+            .map(constantinople_primitives::LazySignedTransaction::new)
             .collect();
         assert!(
             verify_transaction_batch::<Sha256, _>(

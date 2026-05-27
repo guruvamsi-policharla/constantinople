@@ -5,10 +5,8 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{Sealable, Sealed, SignedTransaction};
-use commonware_codec::{
-    Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write, types::lazy::Lazy,
-};
+use crate::{LazySignedTransaction, Sealable, Sealed, SignedTransaction};
+use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
@@ -160,11 +158,11 @@ where
     pub header: Header<C, H::Digest, P>,
     /// Ordered transactions included in this execution payload.
     ///
-    /// Each transaction is held in a [`Lazy`] so block decoding does not pay
-    /// the per-transaction decode + seal-hash cost on the caller's thread.
-    /// Materialization is typically driven in parallel at verify time via a
-    /// [`commonware_parallel::Strategy`].
-    pub body: Vec<Lazy<SignedTransaction<H>>>,
+    /// Each transaction is held in a [`LazySignedTransaction`] so block
+    /// decoding does not pay the per-transaction decode + seal-hash cost on the
+    /// caller's thread. Materialization is typically driven in parallel at
+    /// verify time via a [`commonware_parallel::Strategy`].
+    pub body: Vec<LazySignedTransaction<H>>,
 }
 
 /// A sealed canonical block.
@@ -183,7 +181,7 @@ where
         let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
-            body: body.into_iter().map(Lazy::new).collect(),
+            body: body.into_iter().map(LazySignedTransaction::new).collect(),
         })
     }
 }
@@ -218,7 +216,7 @@ where
     pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
-            body: body.into_iter().map(Lazy::new).collect(),
+            body: body.into_iter().map(LazySignedTransaction::new).collect(),
         }
     }
 }
@@ -324,7 +322,7 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer, ed25519, sha256};
+    use commonware_cryptography::{Signer, ed25519, secp256r1::standard as secp256r1, sha256};
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use rand::{SeedableRng, rngs::StdRng};
@@ -402,5 +400,41 @@ mod tests {
         let mut buf = Vec::new();
         block.write(&mut buf);
         assert_eq!(buf.len(), expected);
+    }
+
+    #[test]
+    fn block_decode_consumes_webauthn_transaction_bytes() {
+        let mut rng = StdRng::from_seed([9u8; 32]);
+        let signer = secp256r1::PrivateKey::random(&mut rng);
+        let public_key = crate::TransactionPublicKey::secp256r1(signer.public_key());
+        let transaction = crate::Transaction::<sha256::Digest>::new(
+            public_key.clone(),
+            public_key,
+            core::num::NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        );
+        let sealed = transaction.seal(&mut sha256::Sha256::default());
+        let signature = crate::TransactionSignature::secp256r1(
+            signer.sign(crate::TRANSACTION_NAMESPACE, sealed.seal().as_ref()),
+            vec![0; 37],
+            br#"{"type":"webauthn.get","challenge":"test"}"#.to_vec(),
+        )
+        .expect("test WebAuthn signature should encode");
+        let signed = crate::SignedTransaction::new_unchecked(sealed, signature);
+        let block = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(
+            test_header(),
+            vec![signed],
+        );
+
+        let encoded = block.encode();
+        let mut reader = encoded.as_ref();
+        let _decoded =
+            <Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
+                &mut reader,
+                &BlockCfg::default(),
+            )
+            .expect("block should decode");
+
+        assert!(reader.is_empty(), "block decoder left trailing bytes");
     }
 }

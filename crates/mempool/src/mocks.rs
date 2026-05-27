@@ -19,8 +19,8 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: VecDeque<Vec<VerifiedTransaction<P, H>>>,
-    _marker: PhantomData<C>,
+    proposals: VecDeque<Vec<VerifiedTransaction<H>>>,
+    _marker: PhantomData<(C, P)>,
 }
 
 impl<C, P, H> StaticTransactionSource<C, P, H>
@@ -30,7 +30,7 @@ where
     H: Hasher,
 {
     /// Creates a new static source from queued proposal batches.
-    pub fn new(proposals: Vec<Vec<VerifiedTransaction<P, H>>>) -> Self {
+    pub fn new(proposals: Vec<Vec<VerifiedTransaction<H>>>) -> Self {
         Self {
             proposals: proposals.into(),
             _marker: PhantomData,
@@ -38,7 +38,7 @@ where
     }
 
     /// Appends another proposal batch to the queue.
-    pub fn push(&mut self, transactions: Vec<VerifiedTransaction<P, H>>) {
+    pub fn push(&mut self, transactions: Vec<VerifiedTransaction<H>>) {
         self.proposals.push_back(transactions);
     }
 }
@@ -54,7 +54,7 @@ where
         &mut self,
         _parent: &Header<C, H::Digest, P>,
         _context: &Context<C, P>,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<P, H>>> + Send {
+    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
         ready(self.proposals.pop_front().unwrap_or_default())
     }
 }
@@ -85,19 +85,19 @@ mod tests {
     };
     use commonware_cryptography::{Digest, Signer, ed25519, sha256};
     use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Header, Signable, Transaction, VerifiedTransaction};
+    use constantinople_primitives::{
+        Header, Transaction, TransactionPublicKey, VerifiedTransaction,
+    };
     use core::num::NonZeroU64;
 
     const NAMESPACE: &[u8] = b"mempool-test";
 
-    fn sign_tx(
-        key: &ed25519::PrivateKey,
-        nonce: u64,
-    ) -> VerifiedTransaction<ed25519::PublicKey, sha256::Sha256> {
+    fn sign_tx(key: &ed25519::PrivateKey, nonce: u64) -> VerifiedTransaction<sha256::Sha256> {
         let hasher = &mut sha256::Sha256::default();
+        let public_key = TransactionPublicKey::ed25519(key.public_key());
         Transaction::new(
-            key.public_key(),
-            key.public_key(),
+            public_key.clone(),
+            public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
         )

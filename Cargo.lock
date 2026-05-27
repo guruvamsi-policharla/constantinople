@@ -1843,8 +1843,10 @@ dependencies = [
  "commonware-parallel",
  "commonware-utils",
  "derive_more",
+ "p256",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,14 +1,16 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use constantinople_application::executor::{self, State};
-use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
+use constantinople_primitives::{
+    Account, AccountKey, Transaction, TransactionPublicKey, VerifiedTransaction,
+};
 use core::num::NonZeroU64;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{SeedableRng, rngs::StdRng};
 use std::hint::black_box;
 
 type TestHasher = sha256::Sha256;
-type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
+type TestTransaction = VerifiedTransaction<TestHasher>;
 
 const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
@@ -42,21 +44,26 @@ fn executor(c: &mut Criterion) {
     group.finish();
 }
 
-fn build_fixture(transaction_count: usize) -> (State<ed25519::PublicKey>, Vec<TestTransaction>) {
+fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
     let mut accounts = State::new();
     let mut transactions = Vec::with_capacity(transaction_count);
 
     for index in 0..transaction_count {
         let signer = TestSigner::new(index as u64);
         let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
+        let sender_public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
+        let recipient_public_key = TransactionPublicKey::ed25519(recipient.clone());
         accounts.insert(
-            AccountKey::from_public_key(&signer.public_key),
+            AccountKey::from_public_key(&sender_public_key),
             Account {
                 balance: 1,
                 nonce: 0,
             },
         );
-        accounts.insert(AccountKey::from_public_key(&recipient), Account::default());
+        accounts.insert(
+            AccountKey::from_public_key(&recipient_public_key),
+            Account::default(),
+        );
         transactions.push(signer.sign(recipient, 1, 0));
     }
 
@@ -78,8 +85,8 @@ impl TestSigner {
 
     fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
         Transaction::new(
-            self.key.public_key(),
-            to,
+            TransactionPublicKey::ed25519(self.key.public_key()),
+            TransactionPublicKey::ed25519(to),
             NonZeroU64::new(value).expect("bench value must be non-zero"),
             nonce,
         )
