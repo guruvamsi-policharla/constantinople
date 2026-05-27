@@ -26,7 +26,8 @@ use constantinople_engine::types::EngineBlock;
 use constantinople_indexer::{
     BlockReporter, IndexerClient, UploaderHandles, keys as indexer_keys, spawn_uploaders,
     sql_schema::{
-        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_ROOT,
+        BLOCK_META_DIGEST, BLOCK_META_ED25519_TX_COUNT, BLOCK_META_HEIGHT,
+        BLOCK_META_SECP256R1_TX_COUNT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_ROOT,
         BLOCK_META_TRANSACTIONS_TIP, BLOCK_META_TX_COUNT, TX_META_TABLE, build_meta_schema,
     },
 };
@@ -335,7 +336,7 @@ async fn block_reporter_writes_block_meta_only() {
 
     // block_meta: exactly one row matching the encoded block.
     let block_meta_query = format!(
-        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_DIGEST}, {BLOCK_META_TX_COUNT}, {BLOCK_META_TRANSACTIONS_ROOT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE}",
+        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_DIGEST}, {BLOCK_META_TX_COUNT}, {BLOCK_META_SECP256R1_TX_COUNT}, {BLOCK_META_ED25519_TX_COUNT}, {BLOCK_META_TRANSACTIONS_ROOT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE}",
     );
     let batches = ctx
         .sql(&block_meta_query)
@@ -368,15 +369,29 @@ async fn block_reporter_writes_block_meta_only() {
         .expect("tx_count col")
         .value(0);
     assert_eq!(tx_count, expected_tx_count);
-    let transactions_root = batch
+    let secp256r1_tx_count = batch
         .column(3)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("secp256r1_tx_count col")
+        .value(0);
+    assert_eq!(secp256r1_tx_count, 0);
+    let ed25519_tx_count = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("ed25519_tx_count col")
+        .value(0);
+    assert_eq!(ed25519_tx_count, expected_tx_count);
+    let transactions_root = batch
+        .column(5)
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
         .expect("transactions_root col")
         .value(0);
     assert_eq!(transactions_root, block.header.transactions_root.as_ref());
     let transactions_tip = batch
-        .column(4)
+        .column(6)
         .as_any()
         .downcast_ref::<UInt64Array>()
         .expect("transactions_tip col")

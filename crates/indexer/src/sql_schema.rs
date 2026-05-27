@@ -36,6 +36,10 @@ pub const BLOCK_META_HEIGHT: &str = "height";
 pub const BLOCK_META_DIGEST: &str = "digest";
 /// `block_meta`: number of transactions contained in the block.
 pub const BLOCK_META_TX_COUNT: &str = "tx_count";
+/// `block_meta`: number of transactions with secp256r1 senders.
+pub const BLOCK_META_SECP256R1_TX_COUNT: &str = "secp256r1_tx_count";
+/// `block_meta`: number of transactions with Ed25519 senders.
+pub const BLOCK_META_ED25519_TX_COUNT: &str = "ed25519_tx_count";
 /// `block_meta`: root of the transaction-hash QMDB operation log at this block.
 pub const BLOCK_META_TRANSACTIONS_ROOT: &str = "transactions_root";
 /// `block_meta`: latest transaction-hash QMDB operation location at this block.
@@ -81,6 +85,8 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(BLOCK_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(BLOCK_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(BLOCK_META_TX_COUNT, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_SECP256R1_TX_COUNT, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_ED25519_TX_COUNT, DataType::UInt64, false),
                 TableColumnConfig::new(
                     BLOCK_META_TRANSACTIONS_ROOT,
                     DataType::FixedSizeBinary(32),
@@ -153,6 +159,8 @@ mod tests {
         assert_eq!(BLOCK_META_HEIGHT, "height");
         assert_eq!(BLOCK_META_DIGEST, "digest");
         assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
+        assert_eq!(BLOCK_META_SECP256R1_TX_COUNT, "secp256r1_tx_count");
+        assert_eq!(BLOCK_META_ED25519_TX_COUNT, "ed25519_tx_count");
         assert_eq!(BLOCK_META_TRANSACTIONS_ROOT, "transactions_root");
         assert_eq!(BLOCK_META_TRANSACTIONS_TIP, "transactions_tip");
         assert_eq!(BLOCK_META_VIEW, "view");

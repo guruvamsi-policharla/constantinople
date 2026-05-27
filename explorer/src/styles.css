@@ -887,8 +887,8 @@ body {
     overflow: auto;
     width: min(1180px, 100%);
     --block-log-columns:
-        minmax(7ch, 0.55fr) minmax(18ch, 1.5fr) minmax(8ch, 0.65fr)
-        minmax(18ch, 1fr);
+        minmax(7ch, 0.45fr) minmax(18ch, 1.35fr) minmax(7ch, 0.45fr)
+        minmax(14ch, 0.8fr) minmax(12ch, 0.7fr) minmax(18ch, 0.9fr);
 }
 
 .block-log__header {
@@ -908,11 +908,17 @@ body {
 }
 
 .block-log__header span:nth-child(3),
-.block-log__header span:nth-child(4) {
+.block-log__header span:nth-child(4),
+.block-log__header span:nth-child(5),
+.block-log__header span:nth-child(6) {
     text-align: right;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.block-log__header span:nth-child(4) {
+.block-log__header span:nth-child(6) {
     padding-right: 8px;
 }
 
@@ -1167,8 +1173,8 @@ body {
     /* Block row slightly smaller on mobile */
     .block-log {
         --block-log-columns:
-            minmax(5ch, 0.5fr) minmax(12ch, 1.2fr) minmax(6ch, 0.7fr)
-            minmax(10ch, 1fr);
+            minmax(5ch, 0.4fr) minmax(10ch, 1fr) minmax(5ch, 0.45fr)
+            minmax(8ch, 0.65fr) minmax(8ch, 0.6fr) minmax(9ch, 0.8fr);
     }
 
     .block-row {

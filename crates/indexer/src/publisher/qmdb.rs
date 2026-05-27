@@ -846,6 +846,8 @@ mod tests {
                     CellValue::UInt64(1),
                     CellValue::FixedBinary(vec![1u8; 32]),
                     CellValue::UInt64(1),
+                    CellValue::UInt64(0),
+                    CellValue::UInt64(1),
                     CellValue::FixedBinary(vec![2u8; 32]),
                     CellValue::UInt64(2),
                     CellValue::UInt64(0),

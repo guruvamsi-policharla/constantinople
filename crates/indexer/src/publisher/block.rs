@@ -29,7 +29,7 @@ use commonware_codec::Encode;
 use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::AccountKey;
+use constantinople_primitives::{AccountKey, TransactionPublicKey};
 use exoware_sdk::keys::Key;
 use std::{
     marker::PhantomData,
@@ -176,6 +176,11 @@ where
         })
         .collect::<Vec<_>>();
     let tx_count = u64::try_from(materialized_txs.len()).expect("transaction count fits u64");
+    let (secp256r1_tx_count, ed25519_tx_count) = transaction_scheme_counts(
+        materialized_txs
+            .iter()
+            .filter_map(|(_, _, tx)| tx.value().sender()),
+    );
     let append_start = block
         .header
         .transactions_range
@@ -236,6 +241,8 @@ where
         height,
         digest: block_digest_arr,
         tx_count,
+        secp256r1_tx_count,
+        ed25519_tx_count,
         transactions_root,
         transactions_tip: block.header.transactions_range.end() - 1,
         view: 0,
@@ -243,6 +250,22 @@ where
     });
 
     IndexedBlockRows { raw, sql }
+}
+
+fn transaction_scheme_counts<'a>(
+    senders: impl Iterator<Item = &'a TransactionPublicKey>,
+) -> (u64, u64) {
+    let mut secp256r1 = 0u64;
+    let mut ed25519 = 0u64;
+
+    for sender in senders {
+        match sender {
+            TransactionPublicKey::Secp256r1 { .. } => secp256r1 += 1,
+            TransactionPublicKey::Ed25519 { .. } => ed25519 += 1,
+        }
+    }
+
+    (secp256r1, ed25519)
 }
 
 fn encode_tx_by_sender_row(
@@ -305,7 +328,7 @@ mod tests {
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
         let block = Block::<Commitment, PublicKey, Sha256>::new(
-            test_header(consensus_key.public_key()),
+            test_header(consensus_key.public_key(), 1),
             vec![transaction],
         )
         .seal(&mut Sha256::default());
@@ -323,7 +346,63 @@ mod tests {
         assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
     }
 
-    fn test_header(leader: PublicKey) -> Header<Commitment, sha256::Digest, PublicKey> {
+    #[test]
+    fn block_meta_counts_transaction_sender_schemes() {
+        let mut rng = StdRng::from_seed([4; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let recipient =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+        let r1_sender =
+            TransactionPublicKey::secp256r1(secp256r1::PrivateKey::random(&mut rng).public_key());
+        let ed_sender = TransactionPublicKey::ed25519(signer.public_key());
+        let transactions = vec![
+            test_transaction(r1_sender, recipient.clone(), &signer, 0),
+            test_transaction(ed_sender, recipient, &signer, 1),
+        ];
+        let block = Block::<Commitment, PublicKey, Sha256>::new(
+            test_header(consensus_key.public_key(), transactions.len()),
+            transactions,
+        )
+        .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        let [sql] = rows.sql.as_slice() else {
+            panic!("expected one block_meta row");
+        };
+
+        assert_eq!(uint64_cell(&sql.values[2]), 2);
+        assert_eq!(uint64_cell(&sql.values[3]), 1);
+        assert_eq!(uint64_cell(&sql.values[4]), 1);
+    }
+
+    fn uint64_cell(value: &exoware_sql::CellValue) -> u64 {
+        let exoware_sql::CellValue::UInt64(value) = value else {
+            panic!("expected UInt64 cell");
+        };
+        *value
+    }
+
+    fn test_transaction(
+        sender: TransactionPublicKey,
+        recipient: TransactionPublicKey,
+        signer: &ed25519::PrivateKey,
+        nonce: u64,
+    ) -> constantinople_primitives::SignedTransaction<Sha256> {
+        Transaction::<sha256::Digest>::new(
+            sender,
+            recipient,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            nonce,
+        )
+        .seal_and_sign(signer, TRANSACTION_NAMESPACE, &mut Sha256::default())
+    }
+
+    fn test_header(
+        leader: PublicKey,
+        tx_count: usize,
+    ) -> Header<Commitment, sha256::Digest, PublicKey> {
+        let transactions_end = u64::try_from(tx_count).expect("tx count fits u64") + 1;
         Header {
             context: Context {
                 round: Round::new(Epoch::zero(), View::zero()),
@@ -336,7 +415,7 @@ mod tests {
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
             transactions_root: sha256::Digest::EMPTY,
-            transactions_range: non_empty_range!(0u64, 2u64) as NonEmptyRange<u64>,
+            transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
         }
     }
 

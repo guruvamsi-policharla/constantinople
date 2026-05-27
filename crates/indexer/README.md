@@ -18,7 +18,7 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Full storage** (KV) | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H` | Tools that need full `SignedTransaction` bodies through [`IndexerClient`](src/client.rs). |
-| **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, view, finalized_ts, transactions_root, transactions_tip)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
+| **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, secp256r1_tx_count, ed25519_tx_count, transactions_root, transactions_tip, view, finalized_ts)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex artifacts** | `exoware-simplex` header and finalization indexes in the shared Store | The explorer and proof clients that need a browser-verifiable finalization certificate for a block. |
 

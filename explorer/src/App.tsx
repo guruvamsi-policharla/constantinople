@@ -1984,6 +1984,8 @@ const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] })
                 <span>height</span>
                 <span>block hash</span>
                 <span># txs</span>
+                <span># secp256r1 txs</span>
+                <span># ed25519 txs</span>
                 <span>timestamp</span>
             </div>
             <div className="block-log__list">
@@ -2010,6 +2012,8 @@ const BlockLogRow = memo(function BlockLogRow({
                 {shortHex(hash)}
             </span>
             <span className="block-row__txcount">{block.txCount.toLocaleString()}</span>
+            <span className="block-row__txcount">{block.secp256r1TxCount.toLocaleString()}</span>
+            <span className="block-row__txcount">{block.ed25519TxCount.toLocaleString()}</span>
             <span className="block-row__time">{formatter.format(block.arrivedAt)}</span>
         </div>
     );
