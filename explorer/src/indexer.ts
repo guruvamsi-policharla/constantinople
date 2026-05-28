@@ -20,8 +20,6 @@ import { collectLiveBlocks, createBlockSequenceCursor } from './blockSequence';
 const COL_HEIGHT = 'height';
 const COL_DIGEST = 'digest';
 const COL_TX_COUNT = 'tx_count';
-const COL_SECP256R1_TX_COUNT = 'secp256r1_tx_count';
-const COL_ED25519_TX_COUNT = 'ed25519_tx_count';
 
 /** The SQL table the explorer subscribes to. */
 const BLOCK_META_TABLE = 'block_meta';
@@ -35,10 +33,6 @@ export interface ObservedBlock {
     readonly digest: Uint8Array;
     /** Number of transactions contained in the block. */
     readonly txCount: number;
-    /** Number of transactions with secp256r1 senders. */
-    readonly secp256r1TxCount: number;
-    /** Number of transactions with Ed25519 senders. */
-    readonly ed25519TxCount: number;
     /** Wall-clock arrival time on this client, in epoch milliseconds. */
     readonly arrivedAt: number;
     /** Underlying store batch sequence number. Multiple rows may share it. */
@@ -135,8 +129,6 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
     const heightIdx = frame.columns.indexOf(COL_HEIGHT);
     const digestIdx = frame.columns.indexOf(COL_DIGEST);
     const txCountIdx = frame.columns.indexOf(COL_TX_COUNT);
-    const secp256r1TxCountIdx = frame.columns.indexOf(COL_SECP256R1_TX_COUNT);
-    const ed25519TxCountIdx = frame.columns.indexOf(COL_ED25519_TX_COUNT);
     if (heightIdx < 0 || digestIdx < 0 || txCountIdx < 0) {
         // Server schema diverged from the explorer's compile-time
         // expectations — surface as zero rows so the UI keeps streaming
@@ -149,16 +141,10 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
         const heightCell = row.cells[heightIdx];
         const digestCell = row.cells[digestIdx];
         const txCountCell = row.cells[txCountIdx];
-        const secp256r1TxCountCell =
-            secp256r1TxCountIdx >= 0 ? row.cells[secp256r1TxCountIdx] : 0n;
-        const ed25519TxCountCell =
-            ed25519TxCountIdx >= 0 ? row.cells[ed25519TxCountIdx] : txCountCell;
         if (
             typeof heightCell !== 'bigint' ||
             !(digestCell instanceof Uint8Array) ||
-            typeof txCountCell !== 'bigint' ||
-            typeof secp256r1TxCountCell !== 'bigint' ||
-            typeof ed25519TxCountCell !== 'bigint'
+            typeof txCountCell !== 'bigint'
         ) {
             continue;
         }
@@ -168,8 +154,6 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
             height: heightCell,
             digest: digestCell,
             txCount: Number(txCountCell),
-            secp256r1TxCount: Number(secp256r1TxCountCell),
-            ed25519TxCount: Number(ed25519TxCountCell),
             arrivedAt,
             sequence: frame.sequenceNumber,
         });

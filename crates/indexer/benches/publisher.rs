@@ -219,8 +219,6 @@ fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
             CellValue::UInt64(height),
             CellValue::FixedBinary(digest(height).to_vec()),
             CellValue::UInt64(tx_count as u64),
-            CellValue::UInt64(0),
-            CellValue::UInt64(tx_count as u64),
             CellValue::FixedBinary(digest(height ^ 0xA5A5).to_vec()),
             CellValue::UInt64(height.saturating_mul(tx_count as u64 + 1)),
             CellValue::UInt64(0),

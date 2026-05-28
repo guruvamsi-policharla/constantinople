@@ -23,6 +23,7 @@
 //! exclusively in the SQL `block_meta` table (see [`crate::sql_schema`]);
 //! the KV path no longer carries a redundant `META` family.
 
+use bytes::Bytes;
 use exoware_sdk::keys::{Key, KeyCodec, KeyCodecError};
 
 /// Number of high bits reserved for the family prefix.
@@ -47,27 +48,27 @@ pub const ACCOUNT: KeyCodec = KeyCodec::new(RESERVED_BITS, 0xa);
 
 /// Encode a `BLOCK` key for the given block digest.
 pub fn block(digest: &[u8]) -> Result<Key, KeyCodecError> {
-    BLOCK.encode(digest)
+    encode_indexer_key(BLOCK.prefix(), digest)
 }
 
 /// Encode a `BLOCK_BY_H` key for the given block height.
 pub fn block_by_height(height: u64) -> Result<Key, KeyCodecError> {
-    BLOCK_BY_H.encode(&height.to_be_bytes())
+    encode_indexer_key(BLOCK_BY_H.prefix(), &height.to_be_bytes())
 }
 
 /// Encode a `FINALIZED` key for the given consensus view.
 pub fn finalized(view: u64) -> Result<Key, KeyCodecError> {
-    FINALIZED.encode(&view.to_be_bytes())
+    encode_indexer_key(FINALIZED.prefix(), &view.to_be_bytes())
 }
 
 /// Encode a `NOTARIZED` key for the given consensus view.
 pub fn notarized(view: u64) -> Result<Key, KeyCodecError> {
-    NOTARIZED.encode(&view.to_be_bytes())
+    encode_indexer_key(NOTARIZED.prefix(), &view.to_be_bytes())
 }
 
 /// Encode a `TX` key for the given transaction digest.
 pub fn tx(digest: &[u8]) -> Result<Key, KeyCodecError> {
-    TX.encode(digest)
+    encode_indexer_key(TX.prefix(), digest)
 }
 
 /// Encode a `TX_BY_H` key for the (height, index) pair within a block.
@@ -75,7 +76,7 @@ pub fn tx_by_height(height: u64, index: u32) -> Result<Key, KeyCodecError> {
     let mut payload = [0u8; 12];
     payload[..8].copy_from_slice(&height.to_be_bytes());
     payload[8..].copy_from_slice(&index.to_be_bytes());
-    TX_BY_H.encode(&payload)
+    encode_indexer_key(TX_BY_H.prefix(), &payload)
 }
 
 /// Encode a `TX_BY_SENDER` key sorted by newest transaction first.
@@ -84,12 +85,38 @@ pub fn tx_by_sender(sender: &[u8], height: u64, index: u32) -> Result<Key, KeyCo
     payload.extend_from_slice(sender);
     payload.extend_from_slice(&(u64::MAX - height).to_be_bytes());
     payload.extend_from_slice(&(u32::MAX - index).to_be_bytes());
-    TX_BY_SENDER.encode(&payload)
+    encode_indexer_key(TX_BY_SENDER.prefix(), &payload)
 }
 
 /// Encode an `ACCOUNT` key for the given account public key bytes.
 pub fn account(account: &[u8]) -> Result<Key, KeyCodecError> {
-    ACCOUNT.encode(account)
+    encode_indexer_key(ACCOUNT.prefix(), account)
+}
+
+fn encode_indexer_key(prefix: u16, payload: &[u8]) -> Result<Key, KeyCodecError> {
+    let max_payload_len = BLOCK.max_payload_capacity_bytes();
+    if payload.len() > max_payload_len {
+        return Err(KeyCodecError::PayloadTooLarge {
+            payload_len: payload.len(),
+            max_payload_len,
+        });
+    }
+
+    debug_assert_eq!(RESERVED_BITS, 4);
+    debug_assert!(prefix <= 0x0f);
+
+    let prefix = u8::try_from(prefix).expect("indexer key prefix fits u8") << 4;
+    if payload.is_empty() {
+        return Ok(Bytes::copy_from_slice(&[prefix]));
+    }
+
+    let mut key = Vec::with_capacity(payload.len() + 1);
+    key.push(prefix | (payload[0] >> 4));
+    for bytes in payload.windows(2) {
+        key.push((bytes[0] << 4) | (bytes[1] >> 4));
+    }
+    key.push(payload[payload.len() - 1] << 4);
+    Ok(Bytes::from(key))
 }
 
 /// Inclusive `(start, end)` bounds spanning every key under the `BLOCK` family.

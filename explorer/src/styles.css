@@ -888,7 +888,7 @@ body {
     width: min(1180px, 100%);
     --block-log-columns:
         minmax(7ch, 0.45fr) minmax(18ch, 1.35fr) minmax(7ch, 0.45fr)
-        minmax(14ch, 0.8fr) minmax(12ch, 0.7fr) minmax(18ch, 0.9fr);
+        minmax(18ch, 0.9fr);
 }
 
 .block-log__header {
@@ -908,9 +908,7 @@ body {
 }
 
 .block-log__header span:nth-child(3),
-.block-log__header span:nth-child(4),
-.block-log__header span:nth-child(5),
-.block-log__header span:nth-child(6) {
+.block-log__header span:nth-child(4) {
     text-align: right;
     min-width: 0;
     overflow: hidden;
@@ -918,7 +916,7 @@ body {
     white-space: nowrap;
 }
 
-.block-log__header span:nth-child(6) {
+.block-log__header span:nth-child(4) {
     padding-right: 8px;
 }
 
@@ -1174,7 +1172,7 @@ body {
     .block-log {
         --block-log-columns:
             minmax(5ch, 0.4fr) minmax(10ch, 1fr) minmax(5ch, 0.45fr)
-            minmax(8ch, 0.65fr) minmax(8ch, 0.6fr) minmax(9ch, 0.8fr);
+            minmax(9ch, 0.8fr);
     }
 
     .block-row {
