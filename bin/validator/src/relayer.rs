@@ -32,6 +32,7 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
+const PINNED_SUBMIT_RETRIES: usize = 3;
 
 type Activity = EngineActivity<ed25519::PublicKey, MinSig>;
 
@@ -196,45 +197,33 @@ async fn submit_transactions(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, String) {
+    if let Some(target) = requested_target_leader(&headers) {
+        if body.len() > max_request_bytes(state.max_batch_bytes) {
+            return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
+        }
+        if requested_leader_fanout(&headers).is_some_and(|fanout| fanout != 1) {
+            return (StatusCode::BAD_REQUEST, String::new());
+        }
+        return submit_to_pinned_leader(&state, body, &target).await;
+    }
+
     let batch = match decode_batch(&body, state.max_batch_bytes) {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
-
-    if let Some(target) = requested_target_leader(&headers) {
-        if requested_leader_fanout(&headers).is_some_and(|fanout| fanout != 1) {
-            return (StatusCode::BAD_REQUEST, String::new());
-        }
-        return submit_to_pinned_leader(&state, &body, &batch, &target).await;
-    }
 
     submit_with_retries(&state, batch).await
 }
 
 async fn submit_to_pinned_leader(
     state: &AppState,
-    body: &Bytes,
-    batch: &DecodedBatch,
+    body: Bytes,
     target: &str,
 ) -> (StatusCode, String) {
     let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    match forward_to_leader(&state.http, leader.clone(), body.clone()).await {
-        ForwardResult::Accepted { .. } => {}
-        ForwardResult::Deterministic(status) => return (status, String::new()),
-        ForwardResult::Transient { .. } => return (StatusCode::SERVICE_UNAVAILABLE, String::new()),
-    }
-
-    let batch_id = batch_id(body);
-    loop {
-        if let Some(status) = fetch_status_from_leader(&state.http, &leader, &batch_id).await
-            && let Some(status) = tx_status_from_batch(&status, &batch.digests)
-        {
-            return json_response(status);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    submit_blocking_to_leader(&state.http, &leader, body).await
 }
 
 async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCode, String) {
@@ -389,32 +378,6 @@ fn best_effort_status(digests: &[String], included: &HashSet<String>, height: u6
     }
 }
 
-fn tx_status_from_batch(status: &BatchStatus, digests: &[String]) -> Option<TxStatus> {
-    match status {
-        BatchStatus::Accepted { .. } => None,
-        BatchStatus::Finalized { height, .. } => Some(TxStatus::Finalized { height: *height }),
-        BatchStatus::PartiallyFinalized {
-            height,
-            included,
-            filtered,
-        } => Some(TxStatus::PartiallyFinalized {
-            height: *height,
-            included: included.clone(),
-            filtered: filtered.clone(),
-        }),
-        BatchStatus::Dropped { filtered } => {
-            if filtered
-                .iter()
-                .all(|digest| digests.iter().any(|known| known == digest))
-            {
-                Some(TxStatus::Dropped)
-            } else {
-                None
-            }
-        }
-    }
-}
-
 fn json_response(status: TxStatus) -> (StatusCode, String) {
     (
         StatusCode::OK,
@@ -509,6 +472,45 @@ async fn forward_to_leader(http: &reqwest::Client, leader: Leader, body: Bytes) 
         }
         Ok(_) | Err(_) => ForwardResult::Transient { leader },
     }
+}
+
+async fn submit_blocking_to_leader(
+    http: &reqwest::Client,
+    leader: &Leader,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let mut backoff = std::time::Duration::from_millis(50);
+    for attempt in 0..PINNED_SUBMIT_RETRIES {
+        match http
+            .post(format!("{}/transactions", leader.url))
+            .header("content-type", "application/octet-stream")
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                if should_retry_pinned_submit(status) && attempt + 1 < PINNED_SUBMIT_RETRIES {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                return (status, body);
+            }
+            Err(_) if attempt + 1 < PINNED_SUBMIT_RETRIES => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, String::new())
+}
+
+fn should_retry_pinned_submit(status: StatusCode) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE || status.is_server_error()
 }
 
 async fn fetch_status_from_leader(
@@ -649,6 +651,8 @@ fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leade
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn leader(key: &str) -> Leader {
         Leader {
@@ -656,6 +660,42 @@ mod tests {
             sort_key: from_hex(key).expect("hex key"),
             url: format!("http://{key}"),
         }
+    }
+
+    async fn spawn_mock_leader(mock: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock leader");
+        let leader_url = format!("http://{}", listener.local_addr().expect("mock addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, mock)
+                .await
+                .expect("mock leader serve");
+        });
+        leader_url
+    }
+
+    fn pinned_state(leader_url: String) -> AppState {
+        let (_, view_clock) = Observer::new();
+        AppState {
+            leaders: Arc::new(vec![Leader {
+                public_key: "00".to_string(),
+                sort_key: vec![0],
+                url: leader_url,
+            }]),
+            max_retry_views: 1,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            account_reader: Arc::new(OnceLock::new()),
+            view_clock,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn pinned_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(TARGET_LEADER_HEADER, HeaderValue::from_static("00"));
+        headers.insert(LEADER_FANOUT_HEADER, HeaderValue::from_static("1"));
+        headers
     }
 
     #[test]
@@ -697,5 +737,86 @@ mod tests {
                 filtered: vec!["bb".to_string()]
             }
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_target_proxies_blocking_submit_without_decoding() {
+        let submit_count = Arc::new(AtomicUsize::new(0));
+        let ingest_count = Arc::new(AtomicUsize::new(0));
+        let submit_count_for_handler = submit_count.clone();
+        let ingest_count_for_handler = ingest_count.clone();
+        let mock = Router::new()
+            .route(
+                "/transactions",
+                post(move |body: Bytes| {
+                    let submit_count = submit_count_for_handler.clone();
+                    async move {
+                        submit_count.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(body, Bytes::from_static(b"not a codec batch"));
+                        json_response(TxStatus::Dropped)
+                    }
+                }),
+            )
+            .route(
+                "/transactions/ingest",
+                post(move || {
+                    let ingest_count = ingest_count_for_handler.clone();
+                    async move {
+                        ingest_count.fetch_add(1, Ordering::Relaxed);
+                        (StatusCode::ACCEPTED, String::new())
+                    }
+                }),
+            );
+        let state = pinned_state(spawn_mock_leader(mock).await);
+
+        let (status, body) = submit_transactions(
+            State(state),
+            pinned_headers(),
+            Bytes::from_static(b"not a codec batch"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&body).expect("status json"),
+            TxStatus::Dropped,
+        );
+        assert_eq!(submit_count.load(Ordering::Relaxed), 1);
+        assert_eq!(ingest_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_target_retries_transient_blocking_submit() {
+        let submit_count = Arc::new(AtomicUsize::new(0));
+        let submit_count_for_handler = submit_count.clone();
+        let mock = Router::new().route(
+            "/transactions",
+            post(move |body: Bytes| {
+                let submit_count = submit_count_for_handler.clone();
+                async move {
+                    assert_eq!(body, Bytes::from_static(b"not a codec batch"));
+                    let attempt = submit_count.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+                    }
+                    json_response(TxStatus::Dropped)
+                }
+            }),
+        );
+        let state = pinned_state(spawn_mock_leader(mock).await);
+
+        let (status, body) = submit_transactions(
+            State(state),
+            pinned_headers(),
+            Bytes::from_static(b"not a codec batch"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&body).expect("status json"),
+            TxStatus::Dropped,
+        );
+        assert_eq!(submit_count.load(Ordering::Relaxed), 2);
     }
 }
