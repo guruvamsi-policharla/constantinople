@@ -12,12 +12,11 @@ use commonware_storage::{
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
-            sync::Target as AnyTarget,
             unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
         },
         keyless::fixed as keyless_fixed,
-        sync::compact::Target as CompactTarget,
+        sync::{Target as AnyTarget, compact::Target as CompactTarget},
     },
     translator::EightCap,
 };

@@ -367,11 +367,12 @@ where
             transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
-        let mut startup_plan = SyncPlan::<EngineFinalization<C::PublicKey, V>>::init(
-            &stateful_startup_context,
-            stateful_partition_prefix.clone(),
-        )
-        .await;
+        let mut startup_plan =
+            SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C::PublicKey>>::init(
+                &stateful_startup_context,
+                stateful_partition_prefix.clone(),
+            )
+            .await;
         let (genesis_state_target, genesis_transactions_target, marshal_start, simplex_floor) =
             if let Some(finalization) = recovered_floor {
                 let block_digest =
