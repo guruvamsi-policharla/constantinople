@@ -7,11 +7,18 @@ use constantinople_indexer::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use exoware_sdk::{RetryConfig, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, CellValue};
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
+use tokio::{sync::Semaphore, task::JoinSet};
 
 const TX_COUNTS: [usize; 2] = [512, 4096];
 const COALESCED_BLOCKS: usize = 8;
+const MOVING_FINALIZED_BLOCKS: usize = 128;
+const FINALIZED_UPLOAD_BACKLOG: usize = 64;
+const SIMULATED_UPLOAD_TIME: Duration = Duration::from_millis(2);
 
 fn bench_raw_sql_upload(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -100,6 +107,70 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
 
     group.finish();
     drop(store);
+}
+
+fn bench_finalized_upload_admission(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("indexer/finalized_upload_admission");
+    group.throughput(Throughput::Elements(MOVING_FINALIZED_BLOCKS as u64));
+
+    group.bench_function("blocking_upload", |bencher| {
+        bencher.iter_custom(|iterations| {
+            runtime.block_on(async {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    blocking_finalized_uploads(MOVING_FINALIZED_BLOCKS).await;
+                }
+                start.elapsed()
+            })
+        });
+    });
+
+    group.bench_function("background_backlog_64", |bencher| {
+        bencher.iter_custom(|iterations| {
+            runtime.block_on(async {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    pipelined_finalized_uploads(MOVING_FINALIZED_BLOCKS, FINALIZED_UPLOAD_BACKLOG)
+                        .await;
+                }
+                start.elapsed()
+            })
+        });
+    });
+
+    group.finish();
+}
+
+async fn blocking_finalized_uploads(blocks: usize) {
+    for _ in 0..blocks {
+        simulated_upload().await;
+    }
+}
+
+async fn pipelined_finalized_uploads(blocks: usize, backlog: usize) {
+    let backlog = Arc::new(Semaphore::new(backlog));
+    let mut uploads = JoinSet::new();
+
+    for _ in 0..blocks {
+        let permit = backlog
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("benchmark semaphore is open");
+        uploads.spawn(async move {
+            let _permit = permit;
+            simulated_upload().await;
+        });
+    }
+
+    while let Some(result) = uploads.join_next().await {
+        result.expect("simulated upload task should finish");
+    }
+}
+
+async fn simulated_upload() {
+    tokio::time::sleep(SIMULATED_UPLOAD_TIME).await;
 }
 
 struct BenchStore {
@@ -240,6 +311,6 @@ criterion_group! {
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(3));
-    targets = bench_raw_sql_upload
+    targets = bench_raw_sql_upload, bench_finalized_upload_admission
 }
 criterion_main!(benches);
