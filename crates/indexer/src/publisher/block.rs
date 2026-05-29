@@ -25,13 +25,16 @@ use crate::{
 };
 use bytes::Bytes;
 use commonware_actor::Feedback;
-use commonware_codec::Encode;
+use commonware_codec::{Encode, FixedSize};
 use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::AccountKey;
+use constantinople_primitives::{
+    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
+};
 use exoware_sdk::keys::Key;
 use std::{
+    array::TryFromSliceError,
     marker::PhantomData,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -138,6 +141,16 @@ pub(crate) struct IndexedBlockRows<D: Digest> {
     pub transaction_digests: Vec<D>,
 }
 
+struct IndexedTransaction<D: Digest> {
+    block_index: usize,
+    digest: D,
+    bytes: Bytes,
+    sender: Option<AccountKey>,
+    to: [u8; AccountKey::SIZE],
+    value: u64,
+    nonce: u64,
+}
+
 /// Build every row for a finalized block, partitioned by destination store.
 pub(crate) fn encode_indexed_block_rows<H, P>(
     block: &EngineBlock<H, P>,
@@ -164,23 +177,13 @@ where
     block_digest_arr.copy_from_slice(block_digest.as_ref());
     let mut transactions_root = [0u8; 32];
     transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
-    let materialized_txs = block
+    let indexed_txs = block
         .body
         .iter()
         .enumerate()
-        .filter_map(|(idx, lazy)| {
-            let Some(tx) = lazy.get() else {
-                warn!(
-                    height,
-                    idx, "indexer: skipping transaction that failed to materialize"
-                );
-                return None;
-            };
-            let tx_digest = *tx.message_digest();
-            Some((idx, lazy, tx, tx_digest))
-        })
+        .filter_map(|(idx, lazy)| index_transaction::<H>(height, idx, lazy))
         .collect::<Vec<_>>();
-    let tx_count = u64::try_from(materialized_txs.len()).expect("transaction count fits u64");
+    let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
     let append_start = block
         .header
         .transactions_range
@@ -199,31 +202,29 @@ where
     ));
 
     // Per-transaction rows: TX, TX_BY_H, and TX_BY_SENDER for account lookup.
-    let mut transaction_digests = Vec::with_capacity(materialized_txs.len());
-    for (materialized_idx, (idx, lazy, tx, tx_digest)) in materialized_txs.iter().enumerate() {
-        transaction_digests.push(*tx_digest);
-        let tx_bytes = lazy.encode();
-        let idx_u32 = u32::try_from(*idx).expect("transaction index fits u32");
+    let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
+    for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
+        transaction_digests.push(tx.digest);
+        let idx_u32 = u32::try_from(tx.block_index).expect("transaction index fits u32");
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
 
         raw.push((
-            keys::tx(tx_digest.as_ref()).expect("tx digest fits family payload"),
-            tx_bytes,
+            keys::tx(tx.digest.as_ref()).expect("tx digest fits family payload"),
+            tx.bytes,
         ));
         raw.push((
             keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
-            Bytes::copy_from_slice(tx_digest.as_ref()),
+            Bytes::copy_from_slice(tx.digest.as_ref()),
         ));
-        if let Some(sender) = tx.value().sender() {
-            let sender_account = AccountKey::from_public_key(sender);
+        if let Some(sender_account) = tx.sender {
             raw.push((
                 keys::tx_by_sender(sender_account.as_ref(), height, idx_u32)
                     .expect("sender tx index fits family payload"),
                 encode_tx_by_sender_row(
-                    tx_digest.as_ref(),
-                    tx.value().to.as_ref(),
-                    tx.value().value.get(),
-                    tx.value().nonce,
+                    tx.digest.as_ref(),
+                    &tx.to,
+                    tx.value,
+                    tx.nonce,
                     qmdb_location,
                     height,
                     idx_u32,
@@ -255,6 +256,75 @@ where
     }
 }
 
+fn index_transaction<H>(
+    height: u64,
+    block_index: usize,
+    transaction: &LazySignedTransaction<H>,
+) -> Option<IndexedTransaction<H::Digest>>
+where
+    H: Hasher,
+{
+    let signed_bytes = transaction.encoded_signed_transaction();
+    let transaction_size = Transaction::<H::Digest>::SIZE;
+    if signed_bytes.len() < transaction_size {
+        warn!(
+            height,
+            block_index,
+            signed_len = signed_bytes.len(),
+            transaction_size,
+            "indexer: skipping transaction with truncated signed payload"
+        );
+        return None;
+    }
+
+    let transaction_bytes = &signed_bytes[..transaction_size];
+    let sender =
+        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE]);
+    if sender.is_none() {
+        warn!(
+            height,
+            block_index, "indexer: sender public key bytes cannot derive an account key"
+        );
+    }
+
+    let to_start = TransactionPublicKey::SIZE;
+    let to_end = to_start + AccountKey::SIZE;
+    let value_start = to_end;
+    let value_end = value_start + u64::SIZE;
+    let nonce_start = value_end;
+    let nonce_end = nonce_start + u64::SIZE;
+    let value = read_u64(&transaction_bytes[value_start..value_end])
+        .expect("transaction value slice has fixed width");
+    if value == 0 {
+        warn!(
+            height,
+            block_index, "indexer: skipping transaction with zero value"
+        );
+        return None;
+    }
+
+    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
+        .expect("transaction nonce slice has fixed width");
+    let mut to = [0u8; AccountKey::SIZE];
+    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
+
+    let mut hasher = H::new();
+    hasher.update(transaction_bytes);
+    Some(IndexedTransaction {
+        block_index,
+        digest: hasher.finalize(),
+        bytes: transaction.encode(),
+        sender,
+        to,
+        value,
+        nonce,
+    })
+}
+
+fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
+    Ok(u64::from_be_bytes(bytes.try_into()?))
+}
+
 fn encode_tx_by_sender_row(
     digest: &[u8],
     to: &[u8],
@@ -278,7 +348,7 @@ fn encode_tx_by_sender_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::FixedSize;
+    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View, coding::Commitment},
@@ -292,7 +362,8 @@ mod tests {
     use commonware_math::algebra::Random;
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_primitives::{
-        Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+        Block, Header, LazySignedTransaction, Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction,
+        TransactionPublicKey,
     };
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
@@ -333,6 +404,56 @@ mod tests {
         assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
     }
 
+    #[test]
+    fn row_encoding_uses_lazy_transaction_bytes_without_materializing() {
+        let mut rng = StdRng::from_seed([9; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let recipient =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+        let signed = Transaction::<sha256::Digest>::new(
+            sender,
+            recipient,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+
+        let mut transaction = Vec::with_capacity(signed.encode_size());
+        signed.write(&mut transaction);
+        let invalid_sender = invalid_public_key_bytes();
+        let sender_account = AccountKey::from_public_key_bytes(&invalid_sender)
+            .expect("invalid ed25519 curve bytes still define an account key");
+        transaction[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_sender);
+        let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
+        transaction.len().write(&mut encoded);
+        encoded.extend_from_slice(&transaction);
+        let lazy = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+            .expect("outer lazy transaction should decode");
+
+        let block = Sealed::new_unchecked(
+            Block {
+                header: test_header(consensus_key.public_key(), 1),
+                body: vec![lazy],
+            },
+            sha256::Digest::EMPTY,
+        );
+
+        let rows = encode_indexed_block_rows(&block);
+        let tx_by_sender = rows
+            .raw
+            .iter()
+            .find(|(key, _)| keys::TX_BY_SENDER.matches(key))
+            .expect("sender history row should be indexed from encoded bytes");
+        let payload = keys::TX_BY_SENDER
+            .decode(&tx_by_sender.0, AccountKey::SIZE + 12)
+            .expect("sender history key should decode");
+
+        assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
+        assert_eq!(rows.transaction_digests.len(), 1);
+    }
+
     fn test_header(
         leader: PublicKey,
         tx_count: usize,
@@ -364,5 +485,21 @@ mod tests {
                 extra_shards: NZU16!(1),
             },
         ))
+    }
+
+    fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {
+        (0u8..=u8::MAX)
+            .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
+            .find_map(|(first, last)| {
+                let mut candidate = [0; TransactionPublicKey::SIZE];
+                candidate[0] = 0;
+                candidate[1] = first;
+                candidate[TransactionPublicKey::SIZE - 1] = last;
+
+                TransactionPublicKey::decode(&mut &candidate[..])
+                    .is_err()
+                    .then_some(candidate)
+            })
+            .expect("test should find invalid public key bytes")
     }
 }

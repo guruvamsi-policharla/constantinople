@@ -13,7 +13,8 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{
-    DecodeExt, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write, types::lazy::Lazy,
+    DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
+    types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
@@ -228,6 +229,20 @@ where
                 SignedTransaction::decode(bytes.clone()).ok()
             })
             .as_ref()
+    }
+
+    /// Returns the encoded signed transaction bytes without the lazy length prefix.
+    ///
+    /// If this value came from block decoding, this clones the deferred bytes and
+    /// does not materialize the transaction.
+    pub fn encoded_signed_transaction(&self) -> Bytes {
+        if let Some(bytes) = &self.pending {
+            return bytes.clone();
+        }
+
+        self.get()
+            .expect("lazy signed transaction must have a value")
+            .encode()
     }
 
     fn deferred(bytes: Bytes) -> Self {
@@ -602,6 +617,41 @@ mod test {
         assert!(
             super::preload_transaction_chunks(&Sequential, vec![lazy]).is_none(),
             "preload must force the nested sender public key"
+        );
+    }
+
+    #[test]
+    fn lazy_signed_transaction_exposes_pending_bytes_without_materializing() {
+        let hasher = &mut sha256::Sha256::default();
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
+        let signed = Transaction::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&private_key, NAMESPACE, hasher);
+
+        let mut transaction = Vec::with_capacity(signed.encode_size());
+        signed.write(&mut transaction);
+        transaction[0] = u8::MAX;
+
+        let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
+        transaction.len().write(&mut encoded);
+        encoded.extend_from_slice(&transaction);
+
+        let lazy = LazySignedTransaction::<sha256::Sha256>::read(&mut &encoded[..])
+            .expect("outer transaction should decode");
+
+        assert_eq!(lazy.encoded_signed_transaction().as_ref(), transaction);
+        assert!(
+            lazy.get()
+                .expect("signed transaction should decode while sender stays lazy")
+                .value()
+                .sender()
+                .is_none(),
+            "nested sender decode should still fail after reading pending bytes"
         );
     }
 

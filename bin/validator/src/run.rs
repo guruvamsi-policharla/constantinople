@@ -23,7 +23,10 @@ use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discove
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     Quota, Runner as _, Supervisor as _, ThreadPooler as _,
-    tokio::telemetry::{self, Logging},
+    tokio::{
+        Context as RuntimeContext,
+        telemetry::{self, Logging},
+    },
 };
 use commonware_storage::translator::EightCap;
 use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
@@ -34,7 +37,10 @@ use constantinople_engine::{
     StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper,
     types::{EngineActivity, EngineBlock},
 };
-use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
+use constantinople_indexer::{
+    BlockReporter, CertificateReporter, QmdbPublisher, publisher::qmdb::QmdbUploadPlan,
+    spawn_uploaders,
+};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -45,8 +51,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
-    task::JoinHandle,
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
 };
 use tracing::{error, info, warn};
 
@@ -55,6 +61,7 @@ const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QMDB_FINALIZED_BACKLOG: usize = 64;
 
 /// Concrete type the engine sees in the `simplex_observer` slot.
 ///
@@ -110,6 +117,7 @@ struct IndexerHandle {
     block_reporter: Option<BlockReporter<Sha256, PublicKey>>,
     cert_reporter: Option<EngineCertReporter>,
     qmd_finalized_tx: Option<mpsc::Sender<FinalizedIndexUpload>>,
+    qmd_backlog: Option<Arc<Semaphore>>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
     _uploaders: Vec<JoinHandle<()>>,
 }
@@ -117,18 +125,21 @@ struct IndexerHandle {
 struct FinalizedIndexUpload {
     block: EngineBlock<Sha256, PublicKey>,
     databases: EngineDatabases,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Connects the QMDB publisher only when finalized data is ready to upload.
 struct LazyQmdbPublisher {
+    context: RuntimeContext,
     store_url: String,
     buffer: usize,
     publisher: Mutex<Option<Arc<EngineQmdbPublisher>>>,
 }
 
 impl LazyQmdbPublisher {
-    fn new(store_url: String, buffer: usize) -> Self {
+    fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
         Self {
+            context,
             store_url,
             buffer,
             publisher: Mutex::new(None),
@@ -141,7 +152,13 @@ impl LazyQmdbPublisher {
                 return publisher;
             }
 
-            match EngineQmdbPublisher::connect(&self.store_url, self.buffer).await {
+            match EngineQmdbPublisher::connect(
+                self.context.child("publisher"),
+                &self.store_url,
+                self.buffer,
+            )
+            .await
+            {
                 Ok(publisher) => {
                     let publisher = Arc::new(publisher);
                     *self.publisher.lock().await = Some(publisher.clone());
@@ -164,29 +181,67 @@ async fn run_qmdb_finalized_uploader(
     publisher: Arc<LazyQmdbPublisher>,
     cert_reporter: Option<EngineCertReporter>,
     mut rx: mpsc::Receiver<FinalizedIndexUpload>,
-    _max_in_flight: usize,
 ) {
-    while let Some(upload) = rx.recv().await {
-        upload_finalized_index(publisher.clone(), cert_reporter.clone(), upload).await;
+    let mut uploads = JoinSet::new();
+    let mut rx_closed = false;
+    loop {
+        tokio::select! {
+            maybe_upload = rx.recv(), if !rx_closed => {
+                match maybe_upload {
+                    Some(upload) => {
+                        let qmd_publisher = publisher.publisher().await;
+                        match qmd_publisher.plan_finalized(&upload.block).await {
+                            Ok(plan) => {
+                                uploads.spawn(upload_finalized_index(
+                                    qmd_publisher,
+                                    cert_reporter.clone(),
+                                    upload,
+                                    plan,
+                                ));
+                            }
+                            Err(error) => {
+                                warn!(
+                                    height = upload.block.header.height,
+                                    error = %error,
+                                    "finalized index upload failed",
+                                );
+                                if let Some(cert_reporter) = cert_reporter.clone() {
+                                    cert_reporter.publish_block(&upload.block).await;
+                                }
+                            }
+                        }
+                    }
+                    None => rx_closed = true,
+                }
+            }
+            maybe_done = uploads.join_next(), if !uploads.is_empty() => {
+                if let Some(Err(error)) = maybe_done {
+                    warn!(%error, "finalized index upload task panicked");
+                }
+            }
+            else => break,
+        }
     }
 }
 
 async fn upload_finalized_index(
-    publisher: Arc<LazyQmdbPublisher>,
+    publisher: Arc<EngineQmdbPublisher>,
     cert_reporter: Option<EngineCertReporter>,
     upload: FinalizedIndexUpload,
+    plan: QmdbUploadPlan,
 ) {
-    if let Err(error) = publisher
-        .publisher()
-        .await
-        .upload_finalized(&upload.block, &upload.databases)
+    match publisher
+        .enqueue_planned_finalized(plan, &upload.block, &upload.databases)
         .await
     {
-        warn!(
-            height = upload.block.header.height,
-            error = %error,
-            "finalized index upload failed",
-        );
+        Ok(completion) => completion.wait().await,
+        Err(error) => {
+            warn!(
+                height = upload.block.header.height,
+                error = %error,
+                "finalized index upload failed",
+            );
+        }
     }
 
     if let Some(cert_reporter) = cert_reporter {
@@ -196,6 +251,7 @@ async fn upload_finalized_index(
 
 /// Build the indexer wiring iff the secondary validator opted in.
 async fn maybe_build_indexer(
+    context: RuntimeContext,
     is_primary: bool,
     indexer: Option<IndexerConfig>,
 ) -> Option<IndexerHandle> {
@@ -217,20 +273,23 @@ async fn maybe_build_indexer(
             let cert_reporter = Some(cert_reporter);
             if cfg.qmdb_upload {
                 let qmd_publisher = Arc::new(LazyQmdbPublisher::new(
+                    context.child("qmd_publisher"),
                     cfg.chain_indexer_url,
                     cfg.upload_buffer,
                 ));
-                let (qmd_finalized_tx, qmd_finalized_rx) = mpsc::channel(cfg.upload_buffer);
+                let qmd_backlog = Arc::new(Semaphore::new(MAX_QMDB_FINALIZED_BACKLOG));
+                let (qmd_finalized_tx, qmd_finalized_rx) =
+                    mpsc::channel(MAX_QMDB_FINALIZED_BACKLOG);
                 let qmd_join = tokio::spawn(run_qmdb_finalized_uploader(
                     qmd_publisher,
                     cert_reporter.clone(),
                     qmd_finalized_rx,
-                    cfg.upload_buffer,
                 ));
                 Some(IndexerHandle {
                     block_reporter: None,
                     cert_reporter,
                     qmd_finalized_tx: Some(qmd_finalized_tx),
+                    qmd_backlog: Some(qmd_backlog),
                     _uploaders: vec![cert_join, qmd_join],
                 })
             } else {
@@ -247,6 +306,7 @@ async fn maybe_build_indexer(
                     block_reporter: Some(block_reporter),
                     cert_reporter,
                     qmd_finalized_tx: None,
+                    qmd_backlog: None,
                     _uploaders: joins,
                 })
             }
@@ -259,6 +319,7 @@ async fn maybe_build_indexer(
                 block_reporter: Some(BlockReporter::<Sha256, PublicKey>::metadata_only(sql)),
                 cert_reporter: None,
                 qmd_finalized_tx: None,
+                qmd_backlog: None,
                 _uploaders: vec![sql_join],
             })
         }
@@ -271,18 +332,29 @@ fn indexer_finalized_hook(
 {
     let indexer = indexer?;
     let qmd_finalized_tx = indexer.qmd_finalized_tx.clone();
+    let qmd_backlog = indexer.qmd_backlog.clone();
     let cert_reporter = indexer.cert_reporter.clone();
     if qmd_finalized_tx.is_none() && cert_reporter.is_none() {
         return None;
     }
     Some(Arc::new(move |block, databases| {
         let qmd_finalized_tx = qmd_finalized_tx.clone();
+        let qmd_backlog = qmd_backlog.clone();
         let cert_reporter = cert_reporter.clone();
         let block = block.clone();
         let databases = databases.clone();
         Box::pin(async move {
             if let Some(qmd_finalized_tx) = qmd_finalized_tx {
-                let upload = FinalizedIndexUpload { block, databases };
+                let permit = qmd_backlog
+                    .expect("qmd finalized sender has a backlog semaphore")
+                    .acquire_owned()
+                    .await
+                    .expect("qmd finalized backlog semaphore is never closed");
+                let upload = FinalizedIndexUpload {
+                    block,
+                    databases,
+                    _permit: permit,
+                };
                 if let Err(upload) = enqueue_finalized_upload(&qmd_finalized_tx, upload).await {
                     error!(
                         height = upload.block.header.height,
@@ -506,7 +578,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // loaded config and returns `None` for primaries, validators that did
         // not declare an `indexer` block, or those that declared one with
         // `enabled: false`.
-        let indexer_handle = maybe_build_indexer(is_primary, indexer).await;
+        let indexer_handle =
+            maybe_build_indexer(context.child("indexer"), is_primary, indexer).await;
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
 
         info!("initializing engine");
@@ -629,6 +702,7 @@ const fn production_sync_config() -> SyncEngineConfig {
 mod tests {
     use super::{enqueue_finalized_upload, maybe_build_indexer, wait_for_critical_task_exit};
     use crate::config::{IndexerConfig, IndexerMode};
+    use commonware_runtime::Runner as _;
     use std::{future::pending, time::Duration};
 
     #[tokio::test]
@@ -648,24 +722,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn qmdb_indexer_does_not_block_secondary_startup_on_connect_failure() {
-        let indexer = IndexerConfig {
-            mode: IndexerMode::Full,
-            chain_indexer_url: "http://127.0.0.1:1".to_string(),
-            upload_buffer: 1,
-            qmdb_upload: true,
-        };
+    #[test]
+    fn qmdb_indexer_does_not_block_secondary_startup_on_connect_failure() {
+        let runner =
+            commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
+        runner.start(|context| async move {
+            let indexer = IndexerConfig {
+                mode: IndexerMode::Full,
+                chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                upload_buffer: 1,
+                qmdb_upload: true,
+            };
 
-        let handle = tokio::time::timeout(
-            Duration::from_millis(50),
-            maybe_build_indexer(false, Some(indexer)),
-        )
-        .await
-        .expect("qmd publisher connection should not block startup")
-        .expect("secondary should keep indexer wiring");
+            let handle = tokio::time::timeout(
+                Duration::from_millis(50),
+                maybe_build_indexer(context, false, Some(indexer)),
+            )
+            .await
+            .expect("qmd publisher connection should not block startup")
+            .expect("secondary should keep indexer wiring");
 
-        assert!(handle.qmd_finalized_tx.is_some());
+            assert!(handle.qmd_finalized_tx.is_some());
+        });
     }
 
     #[tokio::test]

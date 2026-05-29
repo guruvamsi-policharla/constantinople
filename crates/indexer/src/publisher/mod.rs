@@ -34,7 +34,7 @@
 
 use bytes::Bytes;
 use commonware_utils::{Acknowledgement, acknowledgement::Exact};
-use exoware_sdk::{RetryConfig, StoreClient, keys::Key};
+use exoware_sdk::{ConnectRequestCompression, RetryConfig, StoreClient, keys::Key};
 use std::time::Duration;
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug, error, warn};
@@ -192,7 +192,12 @@ fn retry_backoff(attempt: u32) -> Duration {
 
 /// Convenience: build a [`StoreClient`] with the SDK's standard retry policy.
 pub fn standard_store_client(url: &str) -> StoreClient {
-    StoreClient::with_retry_config(url, RetryConfig::standard())
+    StoreClient::builder()
+        .url(url)
+        .retry_config(RetryConfig::standard())
+        .connect_request_compression(ConnectRequestCompression::Gzip)
+        .build()
+        .expect("url sets health, ingest, and query URLs")
 }
 
 /// Hand a batch off to the uploader in the background.
