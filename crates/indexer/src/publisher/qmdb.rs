@@ -469,10 +469,10 @@ async fn run_qmdb_preparer<Cx, H>(
                 let state_writer = state_writer.clone();
                 let transaction_writer = transaction_writer.clone();
                 let done_tx = done_tx.clone();
-                let _handle = context.child("prepare_upload").shared(true).spawn(move |_| async move {
+                let _handle = context.child("prepare_upload").shared(true).spawn(move |context| async move {
                     let _permit = permit;
                     let height = upload.height;
-                    let result = prepare_qmdb_upload(state_writer, transaction_writer, upload)
+                    let result = prepare_qmdb_upload(context, state_writer, transaction_writer, upload)
                         .await
                         .map_err(|error| (height, error));
                     let _ = done_tx.send(result).await;
@@ -518,35 +518,54 @@ async fn run_qmdb_preparer<Cx, H>(
     debug!("indexer qmd preparer task exiting: channel closed");
 }
 
-async fn prepare_qmdb_upload<H>(
+async fn prepare_qmdb_upload<Cx, H>(
+    context: Cx,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     upload: PendingQmdbUpload<H>,
 ) -> Result<PreparedQmdbUpload, PublishError>
 where
+    Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
-    let height = upload.height;
+    let PendingQmdbUpload {
+        order,
+        height,
+        block_rows,
+        state_delta,
+        account_rows,
+        transaction_ops,
+        completion,
+    } = upload;
     let IndexedBlockRows {
         raw,
         sql,
         transaction_digests: _,
-    } = upload.block_rows;
+    } = block_rows;
     let mut raw = raw;
-    raw.extend(upload.account_rows);
-    let (state, transactions) = tokio::try_join!(
-        state_writer.prepare_upload(&upload.state_delta),
-        transaction_writer.prepare_upload(&upload.transaction_ops),
-    )?;
+    raw.extend(account_rows);
+
+    let state_prepare = context
+        .child("state")
+        .shared(true)
+        .spawn(move |_| async move { state_writer.prepare_upload(&state_delta).await });
+    let transaction_prepare = context
+        .child("transactions")
+        .shared(true)
+        .spawn(move |_| async move { transaction_writer.prepare_upload(&transaction_ops).await });
+    let (state, transactions) = tokio::join!(state_prepare, transaction_prepare);
+    let state = state.expect("QMDB state prepare task exited")?;
+    let transactions = transactions.expect("QMDB transaction prepare task exited")?;
+
     Ok(PreparedQmdbUpload {
-        order: upload.order,
+        order,
         height,
         raw_rows: raw,
         sql_rows: sql,
         state,
         transactions,
-        completion: upload.completion,
+        completion,
     })
 }
 

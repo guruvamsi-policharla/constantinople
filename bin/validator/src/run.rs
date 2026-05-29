@@ -249,6 +249,13 @@ async fn upload_finalized_index(
     }
 }
 
+async fn acquire_finalized_upload_slot(backlog: Arc<Semaphore>) -> OwnedSemaphorePermit {
+    backlog
+        .acquire_owned()
+        .await
+        .expect("qmd finalized backlog semaphore is never closed")
+}
+
 /// Build the indexer wiring iff the secondary validator opted in.
 async fn maybe_build_indexer(
     context: RuntimeContext,
@@ -345,11 +352,10 @@ fn indexer_finalized_hook(
         let databases = databases.clone();
         Box::pin(async move {
             if let Some(qmd_finalized_tx) = qmd_finalized_tx {
-                let permit = qmd_backlog
-                    .expect("qmd finalized sender has a backlog semaphore")
-                    .acquire_owned()
-                    .await
-                    .expect("qmd finalized backlog semaphore is never closed");
+                let permit = acquire_finalized_upload_slot(
+                    qmd_backlog.expect("qmd finalized sender has a backlog semaphore"),
+                )
+                .await;
                 let upload = FinalizedIndexUpload {
                     block,
                     databases,
@@ -700,10 +706,14 @@ const fn production_sync_config() -> SyncEngineConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{enqueue_finalized_upload, maybe_build_indexer, wait_for_critical_task_exit};
+    use super::{
+        MAX_QMDB_FINALIZED_BACKLOG, acquire_finalized_upload_slot, enqueue_finalized_upload,
+        maybe_build_indexer, wait_for_critical_task_exit,
+    };
     use crate::config::{IndexerConfig, IndexerMode};
     use commonware_runtime::Runner as _;
-    use std::{future::pending, time::Duration};
+    use std::{future::pending, sync::Arc, time::Duration};
+    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
@@ -756,5 +766,33 @@ mod tests {
             .expect_err("closed uploader should return the payload");
 
         assert_eq!(payload, 7);
+    }
+
+    #[tokio::test]
+    async fn qmd_finalized_backlog_waits_after_64_outstanding_uploads() {
+        let backlog = Arc::new(Semaphore::new(MAX_QMDB_FINALIZED_BACKLOG));
+        let mut permits = Vec::with_capacity(MAX_QMDB_FINALIZED_BACKLOG);
+
+        for _ in 0..MAX_QMDB_FINALIZED_BACKLOG {
+            permits.push(acquire_finalized_upload_slot(backlog.clone()).await);
+        }
+
+        let full = tokio::time::timeout(
+            Duration::from_millis(10),
+            acquire_finalized_upload_slot(backlog.clone()),
+        )
+        .await;
+        assert!(
+            full.is_err(),
+            "65th finalized upload must wait while 64 uploads are outstanding",
+        );
+
+        drop(permits.pop().expect("a held upload slot should exist"));
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_finalized_upload_slot(backlog.clone()),
+        )
+        .await
+        .expect("freed upload slot should admit the next finalized block");
     }
 }
