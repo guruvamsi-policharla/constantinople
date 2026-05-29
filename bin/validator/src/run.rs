@@ -178,6 +178,7 @@ impl LazyQmdbPublisher {
 }
 
 async fn run_qmdb_finalized_uploader(
+    context: RuntimeContext,
     publisher: Arc<LazyQmdbPublisher>,
     cert_reporter: Option<EngineCertReporter>,
     mut rx: mpsc::Receiver<FinalizedIndexUpload>,
@@ -193,6 +194,7 @@ async fn run_qmdb_finalized_uploader(
                         match qmd_publisher.plan_finalized(&upload.block).await {
                             Ok(plan) => {
                                 uploads.spawn(upload_finalized_index(
+                                    context.child("upload_finalized_index"),
                                     qmd_publisher,
                                     cert_reporter.clone(),
                                     upload,
@@ -225,6 +227,7 @@ async fn run_qmdb_finalized_uploader(
 }
 
 async fn upload_finalized_index(
+    context: RuntimeContext,
     publisher: Arc<EngineQmdbPublisher>,
     cert_reporter: Option<EngineCertReporter>,
     upload: FinalizedIndexUpload,
@@ -237,7 +240,7 @@ async fn upload_finalized_index(
     } = upload;
 
     match publisher
-        .enqueue_planned_finalized(plan, &block, &databases)
+        .enqueue_planned_finalized_with_context(context, plan, &block, &databases)
         .await
     {
         Ok(completion) => completion.wait().await,
@@ -295,6 +298,7 @@ async fn maybe_build_indexer(
                 let (qmd_finalized_tx, qmd_finalized_rx) =
                     mpsc::channel(MAX_QMDB_FINALIZED_BACKLOG);
                 let qmd_join = tokio::spawn(run_qmdb_finalized_uploader(
+                    context.child("qmd_finalized_uploader"),
                     qmd_publisher,
                     cert_reporter.clone(),
                     qmd_finalized_rx,

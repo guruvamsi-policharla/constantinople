@@ -195,7 +195,7 @@ pub fn standard_store_client(url: &str) -> StoreClient {
     StoreClient::builder()
         .url(url)
         .retry_config(RetryConfig::standard())
-        .connect_request_compression(ConnectRequestCompression::Gzip)
+        .connect_request_compression(ConnectRequestCompression::Zstd)
         .build()
         .expect("url sets health, ingest, and query URLs")
 }

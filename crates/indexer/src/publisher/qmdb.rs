@@ -337,15 +337,49 @@ where
         S: Strategy + Send + Sync + 'static,
     {
         let block_rows = encode_indexed_block_rows(block);
-        let (state, transactions) = tokio::try_join!(
-            build_state_upload::<E, H, P, S>(plan.state_writer_next, block, &databases.0),
-            async {
-                build_transaction_upload_from_digests(
-                    block,
-                    plan.transaction_writer_next,
-                    &block_rows.transaction_digests,
-                )
-            },
+        let state =
+            build_state_upload::<E, H, P, S>(plan.state_writer_next, block, &databases.0).await?;
+        self.enqueue_prepared_finalized(plan, block, block_rows, state)
+            .await
+    }
+
+    /// Build and enqueue a finalized-block upload with row encoding offloaded.
+    pub async fn enqueue_planned_finalized_with_context<Cx, E, S>(
+        &self,
+        context: Cx,
+        plan: QmdbUploadPlan,
+        block: &EngineBlock<H, P>,
+        databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
+    ) -> Result<QmdbUploadCompletion, PublishError>
+    where
+        Cx: Spawner,
+        E: Storage + Clock + Metrics,
+        S: Strategy + Send + Sync + 'static,
+    {
+        let rows_block = block.clone();
+        let rows = context
+            .child("encode_rows")
+            .shared(true)
+            .spawn(move |_| async move { encode_indexed_block_rows(&rows_block) });
+        let state =
+            build_state_upload::<E, H, P, S>(plan.state_writer_next, block, &databases.0).await;
+        let block_rows = rows.await.expect("QMDB row encoding task exited");
+        let state = state?;
+        self.enqueue_prepared_finalized(plan, block, block_rows, state)
+            .await
+    }
+
+    async fn enqueue_prepared_finalized(
+        &self,
+        plan: QmdbUploadPlan,
+        block: &EngineBlock<H, P>,
+        block_rows: IndexedBlockRows<H::Digest>,
+        state: PendingStateUpload,
+    ) -> Result<QmdbUploadCompletion, PublishError> {
+        let transactions = build_transaction_upload_from_digests(
+            block,
+            plan.transaction_writer_next,
+            &block_rows.transaction_digests,
         )?;
         let (completion, rx) = oneshot::channel();
         let prepare_tx = self
