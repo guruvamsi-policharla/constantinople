@@ -125,7 +125,7 @@ struct IndexerHandle {
 struct FinalizedIndexUpload {
     block: EngineBlock<Sha256, PublicKey>,
     databases: EngineDatabases,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 /// Connects the QMDB publisher only when finalized data is ready to upload.
@@ -230,22 +230,29 @@ async fn upload_finalized_index(
     upload: FinalizedIndexUpload,
     plan: QmdbUploadPlan,
 ) {
+    let FinalizedIndexUpload {
+        block,
+        databases,
+        permit,
+    } = upload;
+
     match publisher
-        .enqueue_planned_finalized(plan, &upload.block, &upload.databases)
+        .enqueue_planned_finalized(plan, &block, &databases)
         .await
     {
         Ok(completion) => completion.wait().await,
         Err(error) => {
             warn!(
-                height = upload.block.header.height,
+                height = block.header.height,
                 error = %error,
                 "finalized index upload failed",
             );
         }
     }
+    drop(permit);
 
     if let Some(cert_reporter) = cert_reporter {
-        cert_reporter.publish_block(&upload.block).await;
+        cert_reporter.publish_block(&block).await;
     }
 }
 
@@ -359,7 +366,7 @@ fn indexer_finalized_hook(
                 let upload = FinalizedIndexUpload {
                     block,
                     databases,
-                    _permit: permit,
+                    permit,
                 };
                 if let Err(upload) = enqueue_finalized_upload(&qmd_finalized_tx, upload).await {
                     error!(
