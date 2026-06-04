@@ -401,6 +401,7 @@ export default function App() {
                     page.rows.map((row) =>
                         retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
+                            sqlUrl: indexerUrl,
                             row,
                             target: accountTarget,
                             signal: controller.signal,
@@ -616,7 +617,7 @@ export default function App() {
     const submitAccountLookup = () => {
         const normalized = normalizeAccountInput(accountInput);
         if (!normalized) {
-            setSearchMessage('expected a 32-byte account key');
+            setSearchMessage('expected a 32-byte address');
             return;
         }
         setSearchMessage('');
@@ -928,7 +929,7 @@ function AccountPage({
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
-                            <span>loc {row.qmdbLocation.toString()}</span>
+                            <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>
@@ -1021,7 +1022,7 @@ function AccountSearchPanel({
                         autoFocus
                         value={accountInput}
                         onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="account key"
+                        placeholder="address"
                         spellCheck={false}
                     />
                 </label>

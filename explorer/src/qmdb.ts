@@ -25,27 +25,28 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
+const TRANSACTION_PUBLIC_KEY_BYTES = 34;
+const TRANSACTION_VALUE_BYTES = 8;
+const TRANSACTION_NONCE_BYTES = 8;
+const TRANSACTION_BODY_BYTES =
+    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 16;
 const ACCOUNT_CURSOR_BYTES = 24;
 
 const TX_META_TABLE = 'tx_meta';
-const TX_META_HEIGHT = 'height';
-const TX_META_INDEX = 'index';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
+const TX_META_BODY_HEX = 'body_hex';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
-const TX_ACTIVITY_SORT_HEIGHT = 'sort_height';
-const TX_ACTIVITY_SORT_INDEX = 'sort_index';
-const TX_ACTIVITY_ROLE = 'role';
 const TX_ACTIVITY_HEIGHT = 'height';
 const TX_ACTIVITY_INDEX = 'index';
+const TX_ACTIVITY_ROLE = 'role';
 const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
 const TX_ACTIVITY_VALUE = 'value';
 const TX_ACTIVITY_NONCE = 'nonce';
-const TX_ACTIVITY_QMDB_LOCATION = 'qmdb_location';
 const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 
@@ -70,9 +71,6 @@ export interface VerifiedFinalizationTarget {
 
 interface TransactionProofMetadata {
     readonly location: bigint;
-    readonly height: bigint;
-    readonly blockIndex: number;
-    readonly blockTransactionCount: number;
 }
 
 interface FinalizedTransactionTarget {
@@ -97,7 +95,6 @@ export interface AccountTransactionRow {
     readonly counterparty: string;
     readonly value: bigint;
     readonly nonce: bigint;
-    readonly qmdbLocation: bigint;
     readonly height: bigint;
     readonly blockIndex: number;
 }
@@ -142,9 +139,6 @@ export async function fetchAndVerifyTransactionProof({
     );
     onFinalizationVerified?.(target);
     const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
-    if (target.height !== metadata.height) {
-        throw new Error(`finalized certificate height ${target.height} does not match tx height ${metadata.height}`);
-    }
     if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
         throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
     }
@@ -253,34 +247,72 @@ export async function fetchAndVerifyAccountProof({
 
 export async function fetchAndVerifyTransactionRowProof({
     qmdbUrl,
+    sqlUrl,
     row,
     target,
     signal,
 }: {
     qmdbUrl: string;
+    sqlUrl: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
-    assertTransactionLocationBeforeTip(row.qmdbLocation, target.transactionsTip);
+    const digestBytes = fromHex(row.digest);
+    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
+    const metadata = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+    assertTransactionLocationBeforeTip(metadata.location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
         `${trimTrailingSlash(qmdbUrl)}/transactions`,
-        row.qmdbLocation,
+        metadata.location,
         tip,
         target.transactionsRoot,
-        fromHex(row.digest),
+        digestBytes,
         signal,
     );
 
     return {
-        location: row.qmdbLocation,
+        location: metadata.location,
         tip,
         height: target.height,
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
     };
+}
+
+async function fetchVerifiedSqlTransactionMetadata(
+    sqlUrl: string,
+    digest: Uint8Array,
+    signal?: AbortSignal,
+): Promise<TransactionProofMetadata> {
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY_HEX}
+            FROM ${TX_META_TABLE}
+            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) {
+        throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
+    }
+
+    const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
+    const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
+    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+        throw new Error('SQL transaction body is truncated');
+    }
+    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
+    if (!bytesEqual(actual, digest)) {
+        throw new Error('SQL transaction body does not match transaction digest');
+    }
+    return { location };
 }
 
 async function fetchTransactionProofMetadata(
@@ -294,7 +326,7 @@ async function fetchTransactionProofMetadata(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_HEIGHT}, ${TX_META_INDEX}, ${TX_META_QMDB_LOCATION}
+            SELECT ${TX_META_QMDB_LOCATION}
             FROM ${TX_META_TABLE}
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
             LIMIT 1
@@ -306,16 +338,10 @@ async function fetchTransactionProofMetadata(
         throw new Error(`tx digest ${shortHex(digest)} missing at height ${target.height}`);
     }
 
-    const height = expectBigint(row.values[TX_META_HEIGHT], TX_META_HEIGHT);
-    const blockIndex = expectSafeNumber(row.values[TX_META_INDEX], TX_META_INDEX);
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-    const blockTransactionCount = target.transactionsTip - target.transactionsStart - 1n;
 
     return {
         location,
-        height,
-        blockIndex,
-        blockTransactionCount: expectSafeNumber(blockTransactionCount, 'block transaction count'),
     };
 }
 
@@ -332,8 +358,6 @@ function transactionProofErrorDetail(
         `tip ${transactionProofTip(target.transactionsTip).toString()}`,
         `proof start ${metadata.location.toString()}`,
         'ops 1',
-        `block index ${metadata.blockIndex}`,
-        `block txs ${metadata.blockTransactionCount}`,
     ].join(' · ');
 }
 
@@ -600,21 +624,18 @@ async function fetchAccountActivityRows(
         sqlUrl,
         `
             SELECT
-                ${TX_ACTIVITY_SORT_HEIGHT},
-                ${TX_ACTIVITY_SORT_INDEX},
-                ${TX_ACTIVITY_ROLE},
                 ${TX_ACTIVITY_HEIGHT},
                 ${TX_ACTIVITY_INDEX},
+                ${TX_ACTIVITY_ROLE},
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE},
-                ${TX_ACTIVITY_QMDB_LOCATION}
+                ${TX_ACTIVITY_NONCE}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
-            ORDER BY ${TX_ACTIVITY_SORT_HEIGHT} ASC,
-                     ${TX_ACTIVITY_SORT_INDEX} ASC,
-                     ${TX_ACTIVITY_ROLE} ASC
+            ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
+                     ${TX_ACTIVITY_INDEX} DESC,
+                     ${TX_ACTIVITY_ROLE} DESC
             LIMIT ${ACCOUNT_PAGE_SIZE + 1}
         `,
     );
@@ -635,7 +656,6 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
         nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
-        qmdbLocation: expectBigint(row.values[TX_ACTIVITY_QMDB_LOCATION], TX_ACTIVITY_QMDB_LOCATION),
         height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
     };
@@ -691,30 +711,30 @@ function activityModeRole(mode: AccountActivityMode): bigint | null {
 }
 
 interface ActivityCursor {
-    readonly sortHeight: bigint;
-    readonly sortIndex: bigint;
+    readonly height: bigint;
+    readonly index: bigint;
     readonly role: bigint;
 }
 
 function activityCursorPredicate(cursor: ActivityCursor): string {
-    const sortHeight = cursor.sortHeight.toString();
-    const sortIndex = cursor.sortIndex.toString();
+    const height = cursor.height.toString();
+    const index = cursor.index.toString();
     const role = cursor.role.toString();
     return `(
-        ${TX_ACTIVITY_SORT_HEIGHT} > ${sortHeight}
-        OR (${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight} AND ${TX_ACTIVITY_SORT_INDEX} > ${sortIndex})
+        ${TX_ACTIVITY_HEIGHT} < ${height}
+        OR (${TX_ACTIVITY_HEIGHT} = ${height} AND ${TX_ACTIVITY_INDEX} < ${index})
         OR (
-            ${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight}
-            AND ${TX_ACTIVITY_SORT_INDEX} = ${sortIndex}
-            AND ${TX_ACTIVITY_ROLE} > ${role}
+            ${TX_ACTIVITY_HEIGHT} = ${height}
+            AND ${TX_ACTIVITY_INDEX} = ${index}
+            AND ${TX_ACTIVITY_ROLE} < ${role}
         )
     )`;
 }
 
 function encodeActivityCursor(row: DecodedRow): Uint8Array {
     const cursor = new Uint8Array(ACCOUNT_CURSOR_BYTES);
-    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_SORT_HEIGHT], TX_ACTIVITY_SORT_HEIGHT));
-    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_SORT_INDEX], TX_ACTIVITY_SORT_INDEX));
+    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT));
+    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX));
     writeU64Be(cursor, 16, expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE));
     return cursor;
 }
@@ -724,8 +744,8 @@ function decodeActivityCursor(cursor: Uint8Array): ActivityCursor {
         throw new Error('malformed account activity cursor');
     }
     return {
-        sortHeight: readU64Be(cursor, 0),
-        sortIndex: readU64Be(cursor, 8),
+        height: readU64Be(cursor, 0),
+        index: readU64Be(cursor, 8),
         role: readU64Be(cursor, 16),
     };
 }
@@ -751,6 +771,17 @@ function expectBytes(value: CellValue, column: string, length: number): Uint8Arr
     }
     assertByteLength(value, length, column);
     return value;
+}
+
+function expectHexBytes(value: CellValue, column: string): Uint8Array {
+    if (typeof value !== 'string') {
+        throw new Error(`SQL column ${column} must be Utf8 hex`);
+    }
+    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
+    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length % 2 !== 0) {
+        throw new Error(`SQL column ${column} must be even-length hex`);
+    }
+    return fromHex(normalized);
 }
 
 function assertByteLength(bytes: Uint8Array, length: number, field: string) {

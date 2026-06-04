@@ -26,13 +26,7 @@ pub(crate) struct BlockMetaRow {
 
 /// Transaction row fields stored in `tx_meta`.
 pub(crate) struct TxMetaRow {
-    pub height: u64,
-    pub index: u32,
     pub digest: [u8; 32],
-    pub sender: [u8; 32],
-    pub receiver: [u8; 32],
-    pub value: u64,
-    pub nonce: u64,
     pub qmdb_location: u64,
     pub body: Vec<u8>,
 }
@@ -63,7 +57,6 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
-    pub qmdb_location: u64,
 }
 
 /// Latest account row stored in `account_meta`.
@@ -104,13 +97,7 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
     SqlRow {
         table: TX_META_TABLE,
         values: vec![
-            CellValue::UInt64(tx.height),
-            CellValue::UInt64(u64::from(tx.index)),
             CellValue::FixedBinary(tx.digest.to_vec()),
-            CellValue::FixedBinary(tx.sender.to_vec()),
-            CellValue::FixedBinary(tx.receiver.to_vec()),
-            CellValue::UInt64(tx.value),
-            CellValue::UInt64(tx.nonce),
             CellValue::UInt64(tx.qmdb_location),
             CellValue::Utf8(hex_lower(&tx.body)),
         ],
@@ -123,16 +110,13 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
         table: TX_ACTIVITY_TABLE,
         values: vec![
             CellValue::FixedBinary(tx.account.to_vec()),
-            CellValue::UInt64(u64::MAX - tx.height),
-            CellValue::UInt64(u64::MAX - u64::from(tx.index)),
-            CellValue::UInt64(tx.role.as_u64()),
             CellValue::UInt64(tx.height),
             CellValue::UInt64(u64::from(tx.index)),
+            CellValue::UInt64(tx.role.as_u64()),
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
-            CellValue::UInt64(tx.qmdb_location),
         ],
     }
 }
