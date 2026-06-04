@@ -28,21 +28,23 @@ is auto-scaled to the peak in the visible window.
 When the signed-in account submits transactions, the explorer also looks up
 their `tx_meta.qmdb_location`, fetches a transaction operation-log proof from
 `qmdb-indexer` under `/transactions`, verifies it in the browser with the
-WASM verifier in `crates/explorer-crypto`, and shows a checkmark after
+Exoware QMDB and Simplex WASM verifiers, and shows a checkmark after
 verification succeeds.
 
-### Why SQL, not the raw KV stream?
+### Why SQL?
 
 The indexer publishes every finalized block to complementary surfaces
 (see [`crates/indexer/README.md`](../crates/indexer/README.md)):
 
-- **Full storage (KV)** — `BLOCK`, `TX`, `BLOCK_BY_H`, `TX_BY_H`,
-  `FINALIZED`, `NOTARIZED`. Tools that need the full
-  `SignedTransaction` body fetch by digest through the `StoreClient`. The
-  explorer does not consume this path.
-- **Metadata stream (SQL)** — `block_meta` / `tx_meta` tables on top
-  of the same store. Cheap to subscribe to from the browser and
-  already deduplicated to one row per block.
+- **Simplex block/certificate storage** — certified headers, full blocks by
+  digest, and finalization indexes. The explorer uses this for browser-side
+  certificate/header verification and only fetches full block bodies when a
+  workflow needs them.
+- **Metadata and lookup storage (SQL)** — `block_meta`, `tx_meta`,
+  `tx_activity`, and `account_meta` tables on top of the same store. Cheap to
+  subscribe to from the browser and directly queryable for transaction proof
+  metadata, transaction bodies, account activity, and latest account proof
+  locations.
 - **QMDB operation logs** — transaction-hash operation proofs. The explorer
   only fetches these for transactions submitted by the signed-in account.
 
@@ -52,7 +54,7 @@ The indexer publishes every finalized block to complementary surfaces
 | ------- | ------- | ----- |
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
 | `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
-| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for raw blocks and Simplex artifacts. |
+| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts. |
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction submission/status endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
 | `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |
@@ -72,14 +74,14 @@ point a secondary validator at the simulator and start the spammer:
 
 ```sh
 cargo run -p constantinople-deploy -- generate \
-    --validators 4 --secondaries 1 --output-dir local --spammer \
-    local --indexer
+    --validators 4 --indexer --relayer --output-dir local --spammer \
+    local
 mprocs ...   # the deploy job prints the full mprocs invocation
 ```
 
-`local --indexer` automatically appends the shared store (`chain-indexer` bin),
-the metadata service (`metadata-indexer` bin from `constantinople-indexer`), and this dev
-server to the printed mprocs command list (see
+`--indexer` automatically appends the shared store (`chain-indexer` bin), the
+metadata service (`metadata-indexer` bin from `constantinople-indexer`), the
+QMDB facade (`qmdb-indexer` bin), and this dev server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 
 ## Build

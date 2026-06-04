@@ -127,11 +127,7 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
 
 fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let base = StoreClient::new(store_url);
-    let state = Arc::new(StateClient::from_client(
-        state_qmdb_client(&base)?,
-        (),
-        ((), ()),
-    ));
+    let state = Arc::new(StateClient::from_client(state_qmdb_client(&base)?, ()));
     let transactions = Arc::new(TransactionClient::from_client(
         transactions_qmdb_client(&base)?,
         (),
@@ -154,7 +150,7 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = build_app(store_url)?;
     let addr = SocketAddr::from((host, port));
-    info!(%addr, store_url, "constantinople qmd server listening");
+    info!(%addr, store_url, "constantinople QMDB server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -304,10 +300,10 @@ mod tests {
                         .uri(path)
                         .header("content-type", "application/json")
                         .body(Body::from("{}"))
-                        .expect("qmd request"),
+                        .expect("QMDB request"),
                 )
                 .await
-                .expect("qmd response");
+                .expect("QMDB response");
             assert_ne!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
     }

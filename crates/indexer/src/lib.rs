@@ -3,12 +3,9 @@
 
 pub mod client;
 pub mod codec;
-pub mod keys;
 pub mod publisher;
+mod simplex_block;
 pub mod sql_schema;
 
 pub use client::{IndexerClient, ReadError};
-pub use publisher::{
-    BlockReporter, CertificateReporter, QmdbPublisher, UploadBatch, UploaderHandles,
-    spawn_raw_uploader, spawn_uploaders, standard_store_client,
-};
+pub use publisher::{CertificateReporter, Publisher};

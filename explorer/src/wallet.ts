@@ -1,4 +1,3 @@
-import initCrypto from './crypto-wasm/constantinople_explorer_crypto';
 import { fromHex, toArrayBuffer, toHex } from './codec';
 
 const META_STORAGE_KEY = 'constantinople.wallets.v1';
@@ -24,8 +23,6 @@ export interface ActiveWallet extends WalletProfile {
     readonly sign: (message: Uint8Array) => Promise<Uint8Array>;
 }
 
-let cryptoReady: Promise<unknown> | null = null;
-
 export function listWallets(): WalletProfile[] {
     return readProfiles().sort((a, b) => b.createdAt - a.createdAt);
 }
@@ -36,6 +33,19 @@ export function readSession(): string | null {
 
 export function clearSession() {
     window.localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+export function restoreWalletSession(): ActiveWallet | null {
+    const publicKeyHex = readSession();
+    if (publicKeyHex === null) return null;
+
+    const profile = readProfiles().find((candidate) => candidate.publicKeyHex === publicKeyHex);
+    if (!profile) {
+        clearSession();
+        return null;
+    }
+
+    return activeWallet(profile);
 }
 
 export async function createWallet(): Promise<ActiveWallet> {
@@ -87,11 +97,6 @@ function activeWallet(profile: WalletProfile): ActiveWallet {
         publicKey,
         sign: (message) => signWithPasskey(profile, message),
     };
-}
-
-export async function loadCrypto() {
-    cryptoReady ??= initCrypto();
-    await cryptoReady;
 }
 
 async function createPasskey(): Promise<PublicKeyCredential> {

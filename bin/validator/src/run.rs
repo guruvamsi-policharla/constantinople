@@ -2,16 +2,13 @@
 
 use crate::{
     config::{
-        IndexerConfig, IndexerMode, LoadedConfig, StartupModeConfig, load_deployer_config,
-        load_local_config,
+        IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
     },
     state_reader::StateDbReader,
 };
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
-use commonware_consensus::{
-    Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
-};
+use commonware_consensus::{Reporter, simplex::elector::RoundRobin, types::coding::Commitment};
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
     ed25519::{self, Batch, PublicKey},
@@ -23,13 +20,18 @@ use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discove
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
         telemetry::{self, Logging},
     },
 };
-use commonware_storage::translator::EightCap;
-use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
+use commonware_storage::{
+    metadata::{Config as MetadataConfig, Metadata},
+    queue,
+    translator::EightCap,
+};
+use commonware_utils::{NZU16, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union};
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
@@ -38,30 +40,34 @@ use constantinople_engine::{
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
-    BlockReporter, CertificateReporter, QmdbPublisher, publisher::qmdb::QmdbUploadPlan,
-    spawn_uploaders,
+    CertificateReporter, Publisher,
+    publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
-    num::NonZeroU64,
+    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::Mutex,
     task::{JoinHandle, JoinSet},
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
-const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
-const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_QMDB_FINALIZED_BACKLOG: usize = 64;
+const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
+const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
+const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
+const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
+const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
+const CURSOR_STATE_KEY: U64 = U64::new(0);
+const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 
 /// Concrete type the engine sees in the `simplex_observer` slot.
 ///
@@ -70,8 +76,12 @@ const MAX_QMDB_FINALIZED_BACKLOG: usize = 64;
 /// out simply pass `simplex_observer: None`.
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
-type EngineQmdbPublisher = QmdbPublisher<Sha256, PublicKey>;
+type EnginePublisher = Publisher<Sha256, PublicKey>;
 type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
+type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
+type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
+type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
+type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
 
 #[derive(Clone)]
 enum SimplexObserver {
@@ -90,53 +100,24 @@ impl Reporter for SimplexObserver {
     }
 }
 
-/// Concrete type the engine sees in `engine.start(_, reporter)`.
-///
-/// Primaries report finalized blocks to the local mempool; secondaries with an
-/// indexer enabled report them to the indexer. The two reporter implementations
-/// have unrelated types, so we tee them through this small dispatch enum.
-#[derive(Clone)]
-enum BlockUpdateReporter {
-    Mempool(Mailbox<Commitment, PublicKey, Sha256>),
-    Indexer(BlockReporter<Sha256, PublicKey>),
-}
-
-impl Reporter for BlockUpdateReporter {
-    type Activity = Update<EngineBlock<Sha256, PublicKey>>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match self {
-            Self::Mempool(m) => m.report(activity),
-            Self::Indexer(i) => i.report(activity),
-        }
-    }
-}
-
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
-    block_reporter: Option<BlockReporter<Sha256, PublicKey>>,
-    cert_reporter: Option<EngineCertReporter>,
-    qmd_finalized_tx: Option<mpsc::Sender<FinalizedIndexUpload>>,
-    qmd_backlog: Option<Arc<Semaphore>>,
+    cert_reporter: EngineCertReporter,
+    publisher: Arc<LazyPublisher>,
+    finalized_producer: FinalizedUploadProducer,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
     _uploaders: Vec<JoinHandle<()>>,
 }
 
-struct FinalizedIndexUpload {
-    block: EngineBlock<Sha256, PublicKey>,
-    databases: EngineDatabases,
-    permit: OwnedSemaphorePermit,
-}
-
-/// Connects the QMDB publisher only when finalized data is ready to upload.
-struct LazyQmdbPublisher {
+/// Connects the indexer publisher only when finalized data is ready to upload.
+struct LazyPublisher {
     context: RuntimeContext,
     store_url: String,
     buffer: usize,
-    publisher: Mutex<Option<Arc<EngineQmdbPublisher>>>,
+    publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
-impl LazyQmdbPublisher {
+impl LazyPublisher {
     fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
         Self {
             context,
@@ -146,13 +127,13 @@ impl LazyQmdbPublisher {
         }
     }
 
-    async fn publisher(&self) -> Arc<EngineQmdbPublisher> {
+    async fn publisher(&self) -> Arc<EnginePublisher> {
         loop {
             if let Some(publisher) = self.publisher.lock().await.as_ref().cloned() {
                 return publisher;
             }
 
-            match EngineQmdbPublisher::connect(
+            match EnginePublisher::connect(
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
@@ -168,7 +149,7 @@ impl LazyQmdbPublisher {
                     warn!(
                         error = %error,
                         chain_indexer_url = %self.store_url,
-                        "qmd publisher connection failed, retrying",
+                        "indexer publisher connection failed, retrying",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -177,93 +158,339 @@ impl LazyQmdbPublisher {
     }
 }
 
-async fn run_qmdb_finalized_uploader(
-    context: RuntimeContext,
-    publisher: Arc<LazyQmdbPublisher>,
-    cert_reporter: Option<EngineCertReporter>,
-    mut rx: mpsc::Receiver<FinalizedIndexUpload>,
-) {
-    let mut uploads = JoinSet::new();
-    let mut rx_closed = false;
-    loop {
-        tokio::select! {
-            maybe_upload = rx.recv(), if !rx_closed => {
-                match maybe_upload {
-                    Some(upload) => {
-                        let qmd_publisher = publisher.publisher().await;
-                        match qmd_publisher.plan_finalized(&upload.block).await {
-                            Ok(plan) => {
-                                uploads.spawn(upload_finalized_index(
-                                    context.child("upload_finalized_index"),
-                                    qmd_publisher,
-                                    cert_reporter.clone(),
-                                    upload,
-                                    plan,
-                                ));
-                            }
-                            Err(error) => {
-                                warn!(
-                                    height = upload.block.header.height,
-                                    error = %error,
-                                    "finalized index upload failed",
-                                );
-                                if let Some(cert_reporter) = cert_reporter.clone() {
-                                    cert_reporter.publish_block(&upload.block).await;
-                                }
-                            }
-                        }
+#[derive(Clone)]
+struct FinalizedUploadProducer {
+    writer: FinalizedQueueWriter,
+    metadata: Arc<Mutex<CursorMetadata>>,
+    cursor: Arc<Mutex<FinalizedUploadCursor>>,
+    publisher: Arc<LazyPublisher>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FinalizedUploadCursor {
+    state_next: u64,
+    transaction_next: u64,
+}
+
+impl FinalizedUploadCursor {
+    fn from_metadata(metadata: &CursorMetadata) -> Option<Self> {
+        let state_next = metadata.get(&CURSOR_STATE_KEY).cloned().map(u64::from);
+        let transaction_next = metadata
+            .get(&CURSOR_TRANSACTION_KEY)
+            .cloned()
+            .map(u64::from);
+        Self::from_parts(state_next, transaction_next)
+    }
+
+    const fn from_parts(state_next: Option<u64>, transaction_next: Option<u64>) -> Option<Self> {
+        match (state_next, transaction_next) {
+            (Some(state_next), Some(transaction_next)) => Some(Self {
+                state_next,
+                transaction_next,
+            }),
+            _ => None,
+        }
+    }
+
+    fn from_upload(upload: &EngineQueuedUpload) -> Self {
+        Self {
+            state_next: upload.state_end(),
+            transaction_next: upload.transaction_end(),
+        }
+    }
+
+    /// Return the later finalized-upload frontier as a whole cursor pair.
+    ///
+    /// Do not max fields independently: `state_next` and `transaction_next`
+    /// are captured from one finalized block, so mixing halves from different
+    /// sources can create a frontier that never existed.
+    const fn max(self, other: Self) -> Self {
+        if other.state_next > self.state_next
+            || (other.state_next == self.state_next
+                && other.transaction_next > self.transaction_next)
+        {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+fn recovered_finalized_upload_cursor(
+    metadata: Option<FinalizedUploadCursor>,
+    queue: Option<FinalizedUploadCursor>,
+) -> FinalizedUploadCursor {
+    metadata.unwrap_or_default().max(queue.unwrap_or_default())
+}
+
+impl FinalizedUploadProducer {
+    async fn enqueue(
+        &self,
+        context: RuntimeContext,
+        block: &EngineBlock<Sha256, PublicKey>,
+        databases: &EngineDatabases,
+    ) {
+        loop {
+            let mut cursor = self.cursor.lock().await;
+            let upload = match EnginePublisher::build_queued_finalized_upload_with_context(
+                context.child("build"),
+                cursor.state_next,
+                cursor.transaction_next,
+                block,
+                databases,
+            )
+            .await
+            {
+                Ok(upload) => upload,
+                Err(PublishError::StoreEmptyPastGenesis { .. }) if cursor.state_next == 0 => {
+                    let publisher = self.publisher.publisher().await;
+                    let (state_next, transaction_next) = publisher.next_locations().await;
+                    if state_next == 0 && transaction_next == 0 {
+                        warn!(
+                            height = block.header.height,
+                            "finalized index cursor is empty and remote Store has no cursor, retrying",
+                        );
+                        drop(cursor);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                    None => rx_closed = true,
+                    *cursor = FinalizedUploadCursor {
+                        state_next,
+                        transaction_next,
+                    };
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        height = block.header.height,
+                        error = %error,
+                        "failed to prepare finalized index queue entry, retrying",
+                    );
+                    drop(cursor);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let next = FinalizedUploadCursor::from_upload(&upload);
+            match self.writer.enqueue(upload).await {
+                Ok(position) => {
+                    persist_finalized_cursor(&self.metadata, next).await;
+                    *cursor = next;
+                    info!(
+                        height = block.header.height,
+                        position,
+                        state_next = next.state_next,
+                        transaction_next = next.transaction_next,
+                        "queued finalized index upload"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        height = block.header.height,
+                        error = %error,
+                        "failed to enqueue finalized index upload, retrying",
+                    );
                 }
             }
-            maybe_done = uploads.join_next(), if !uploads.is_empty() => {
-                if let Some(Err(error)) = maybe_done {
-                    warn!(%error, "finalized index upload task panicked");
-                }
-            }
-            else => break,
+            drop(cursor);
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
 
-async fn upload_finalized_index(
-    context: RuntimeContext,
-    publisher: Arc<EngineQmdbPublisher>,
-    cert_reporter: Option<EngineCertReporter>,
-    upload: FinalizedIndexUpload,
-    plan: QmdbUploadPlan,
+async fn persist_finalized_cursor(
+    metadata: &Arc<Mutex<CursorMetadata>>,
+    cursor: FinalizedUploadCursor,
 ) {
-    let FinalizedIndexUpload {
-        block,
-        databases,
-        permit,
-    } = upload;
-
-    match publisher
-        .enqueue_planned_finalized_with_context(context, plan, &block, &databases)
-        .await
-    {
-        Ok(completion) => completion.wait().await,
-        Err(error) => {
-            warn!(
-                height = block.header.height,
-                error = %error,
-                "finalized index upload failed",
-            );
+    loop {
+        let mut metadata = metadata.lock().await;
+        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+        match metadata.sync().await {
+            Ok(()) => return,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    state_next = cursor.state_next,
+                    transaction_next = cursor.transaction_next,
+                    "failed to persist finalized index cursor, retrying",
+                );
+            }
         }
-    }
-    drop(permit);
-
-    if let Some(cert_reporter) = cert_reporter {
-        cert_reporter.publish_block(&block).await;
+        drop(metadata);
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn acquire_finalized_upload_slot(backlog: Arc<Semaphore>) -> OwnedSemaphorePermit {
-    backlog
-        .acquire_owned()
-        .await
-        .expect("qmd finalized backlog semaphore is never closed")
+async fn scan_finalized_queue_cursor(
+    reader: &mut FinalizedQueueReader,
+) -> Option<FinalizedUploadCursor> {
+    let mut cursor = None;
+    loop {
+        match reader.try_recv().await {
+            Ok(Some((_position, upload))) => {
+                cursor = Some(FinalizedUploadCursor::from_upload(&upload));
+            }
+            Ok(None) => {
+                reader.reset().await;
+                return cursor;
+            }
+            Err(error) => {
+                panic!("failed to scan finalized index queue: {error}");
+            }
+        }
+    }
+}
+
+async fn run_finalized_upload_consumer(
+    publisher: Arc<LazyPublisher>,
+    cert_reporter: EngineCertReporter,
+    writer: FinalizedQueueWriter,
+    mut reader: FinalizedQueueReader,
+    max_active: usize,
+) {
+    let mut active = JoinSet::new();
+    let mut reader_closed = false;
+    let max_active = max_active.max(1);
+
+    loop {
+        while active.len() < max_active {
+            let item = match reader.try_recv().await {
+                Ok(item) => item,
+                Err(error) => {
+                    warn!(error = %error, "failed to read finalized index queue, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let Some((position, upload)) = item else {
+                break;
+            };
+            start_queued_upload(
+                &mut active,
+                publisher.clone(),
+                cert_reporter.clone(),
+                position,
+                upload,
+            )
+            .await;
+        }
+
+        if reader_closed && active.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            item = reader.recv(), if !reader_closed && active.len() < max_active => {
+                match item {
+                    Ok(Some((position, upload))) => {
+                        start_queued_upload(
+                            &mut active,
+                            publisher.clone(),
+                            cert_reporter.clone(),
+                            position,
+                            upload,
+                        )
+                        .await;
+                    }
+                    Ok(None) => reader_closed = true,
+                    Err(error) => {
+                        warn!(error = %error, "failed to read finalized index queue, retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            completed = active.join_next(), if !active.is_empty() => {
+                let (position, height) = completed
+                    .expect("active upload set is not empty")
+                    .expect("finalized index upload task panicked");
+                ack_finalized_queue_entry(&reader, &writer, position, height).await;
+            }
+        }
+
+        if reader_closed && active.is_empty() {
+            break;
+        }
+    }
+}
+
+async fn ack_finalized_queue_entry(
+    reader: &FinalizedQueueReader,
+    writer: &FinalizedQueueWriter,
+    position: u64,
+    height: u64,
+) {
+    loop {
+        match reader.ack(position).await {
+            Ok(()) => break,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    position,
+                    height,
+                    "failed to ack finalized index queue entry, retrying",
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    loop {
+        match writer.sync().await {
+            Ok(()) => break,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    position,
+                    height,
+                    "failed to sync finalized index queue ack, retrying",
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn start_queued_upload(
+    active: &mut JoinSet<(u64, u64)>,
+    publisher: Arc<LazyPublisher>,
+    cert_reporter: EngineCertReporter,
+    position: u64,
+    upload: EngineQueuedUpload,
+) {
+    let height = upload.height();
+    let completion = loop {
+        let engine_publisher = publisher.publisher().await;
+        match engine_publisher
+            .enqueue_queued_finalized(upload.clone())
+            .await
+        {
+            Ok(completion) => break completion,
+            Err(error) => {
+                warn!(
+                    height,
+                    position,
+                    error = %error,
+                    "failed to start finalized index upload, retrying",
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+
+    active.spawn(async move {
+        if completion.wait().await {
+            cert_reporter.publish_block(upload.block()).await;
+            return (position, height);
+        }
+        warn!(
+            height,
+            position, "finalized index uploader stopped after accepting upload",
+        );
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
@@ -271,6 +498,7 @@ async fn maybe_build_indexer(
     context: RuntimeContext,
     is_primary: bool,
     indexer: Option<IndexerConfig>,
+    partition_prefix: &str,
 ) -> Option<IndexerHandle> {
     let cfg = indexer?;
     if is_primary {
@@ -278,70 +506,75 @@ async fn maybe_build_indexer(
     }
 
     info!(
-        mode = ?cfg.mode,
         chain_indexer_url = %cfg.chain_indexer_url,
-        "starting indexer uploaders",
+        "starting full indexer uploaders",
     );
-    match cfg.mode {
-        IndexerMode::Full => {
-            let raw_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let (cert_reporter, cert_join) =
-                EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
-            let cert_reporter = Some(cert_reporter);
-            if cfg.qmdb_upload {
-                let qmd_publisher = Arc::new(LazyQmdbPublisher::new(
-                    context.child("qmd_publisher"),
-                    cfg.chain_indexer_url,
-                    cfg.upload_buffer,
-                ));
-                let qmd_backlog = Arc::new(Semaphore::new(MAX_QMDB_FINALIZED_BACKLOG));
-                let (qmd_finalized_tx, qmd_finalized_rx) =
-                    mpsc::channel(MAX_QMDB_FINALIZED_BACKLOG);
-                let qmd_join = tokio::spawn(run_qmdb_finalized_uploader(
-                    context.child("qmd_finalized_uploader"),
-                    qmd_publisher,
-                    cert_reporter.clone(),
-                    qmd_finalized_rx,
-                ));
-                Some(IndexerHandle {
-                    block_reporter: None,
-                    cert_reporter,
-                    qmd_finalized_tx: Some(qmd_finalized_tx),
-                    qmd_backlog: Some(qmd_backlog),
-                    _uploaders: vec![cert_join, qmd_join],
-                })
-            } else {
-                let sql_store =
-                    constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-                let uploaders = spawn_uploaders(raw_store, sql_store, cfg.upload_buffer);
-                let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
-                    uploaders.raw.clone(),
-                    uploaders.sql.clone(),
-                );
-                let mut joins = Vec::from(uploaders.joins);
-                joins.push(cert_join);
-                Some(IndexerHandle {
-                    block_reporter: Some(block_reporter),
-                    cert_reporter,
-                    qmd_finalized_tx: None,
-                    qmd_backlog: None,
-                    _uploaders: joins,
-                })
-            }
-        }
-        IndexerMode::MetadataOnly => {
-            let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let (sql, sql_join) =
-                constantinople_indexer::publisher::spawn_sql_uploader(sql_store, cfg.upload_buffer);
-            Some(IndexerHandle {
-                block_reporter: Some(BlockReporter::<Sha256, PublicKey>::metadata_only(sql)),
-                cert_reporter: None,
-                qmd_finalized_tx: None,
-                qmd_backlog: None,
-                _uploaders: vec![sql_join],
-            })
-        }
+    let (cert_reporter, cert_join) =
+        EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
+    let publisher = Arc::new(LazyPublisher::new(
+        context.child("publisher"),
+        cfg.chain_indexer_url,
+        cfg.upload_buffer,
+    ));
+    let page_cache = CacheRef::from_pooler(
+        &context,
+        FINALIZED_QUEUE_PAGE_SIZE,
+        FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+    );
+    let (queue_writer, mut queue_reader) = queue::shared::init(
+        context.child("finalized_queue"),
+        queue::Config {
+            partition: format!("{partition_prefix}-finalized-index-queue"),
+            items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+            compression: None,
+            codec_config: QueuedFinalizedUploadCfg::default(),
+            page_cache,
+            write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+        },
+    )
+    .await
+    .expect("failed to initialize finalized index queue");
+    let mut metadata = Metadata::init(
+        context.child("finalized_cursor"),
+        MetadataConfig {
+            partition: format!("{partition_prefix}-finalized-index-cursor"),
+            codec_config: (),
+        },
+    )
+    .await
+    .expect("failed to initialize finalized index cursor");
+    let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
+    let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader).await;
+    let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
+    if metadata_cursor != Some(cursor) {
+        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+        metadata
+            .sync()
+            .await
+            .expect("failed to persist finalized index cursor");
     }
+    let metadata = Arc::new(Mutex::new(metadata));
+    let finalized_producer = FinalizedUploadProducer {
+        writer: queue_writer.clone(),
+        metadata,
+        cursor: Arc::new(Mutex::new(cursor)),
+        publisher: publisher.clone(),
+    };
+    let max_active_uploads = cfg.upload_buffer.clamp(1, MAX_FINALIZED_QUEUE_UPLOADS);
+    let finalized_join = tokio::spawn(run_finalized_upload_consumer(
+        publisher.clone(),
+        cert_reporter.clone(),
+        queue_writer,
+        queue_reader,
+        max_active_uploads,
+    ));
+    Some(IndexerHandle {
+        cert_reporter,
+        publisher,
+        finalized_producer,
+        _uploaders: vec![cert_join, finalized_join],
+    })
 }
 
 fn indexer_finalized_hook(
@@ -349,52 +582,23 @@ fn indexer_finalized_hook(
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
     let indexer = indexer?;
-    let qmd_finalized_tx = indexer.qmd_finalized_tx.clone();
-    let qmd_backlog = indexer.qmd_backlog.clone();
-    let cert_reporter = indexer.cert_reporter.clone();
-    if qmd_finalized_tx.is_none() && cert_reporter.is_none() {
-        return None;
-    }
+    let publisher = indexer.publisher.clone();
+    let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        let qmd_finalized_tx = qmd_finalized_tx.clone();
-        let qmd_backlog = qmd_backlog.clone();
-        let cert_reporter = cert_reporter.clone();
+        let publisher = publisher.clone();
+        let finalized_producer = finalized_producer.clone();
         let block = block.clone();
         let databases = databases.clone();
         Box::pin(async move {
-            if let Some(qmd_finalized_tx) = qmd_finalized_tx {
-                let permit = acquire_finalized_upload_slot(
-                    qmd_backlog.expect("qmd finalized sender has a backlog semaphore"),
+            finalized_producer
+                .enqueue(
+                    publisher.context.child("finalized_queue"),
+                    &block,
+                    &databases,
                 )
                 .await;
-                let upload = FinalizedIndexUpload {
-                    block,
-                    databases,
-                    permit,
-                };
-                if let Err(upload) = enqueue_finalized_upload(&qmd_finalized_tx, upload).await {
-                    error!(
-                        height = upload.block.header.height,
-                        "finalized index uploader stopped; continuing consensus without qmd upload",
-                    );
-                    if let Some(cert_reporter) = cert_reporter {
-                        cert_reporter.publish_block(&upload.block).await;
-                    }
-                }
-                return;
-            }
-
-            if let Some(cert_reporter) = cert_reporter {
-                cert_reporter.publish_block(&block).await;
-            }
         })
     }))
-}
-
-async fn enqueue_finalized_upload<T>(tx: &mpsc::Sender<T>, upload: T) -> Result<(), T> {
-    tx.send(upload)
-        .await
-        .map_err(|mpsc::error::SendError(upload)| upload)
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -416,6 +620,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         rayon_threads,
         http_listen,
         metrics_listen,
+        max_propose_bytes,
+        max_pool_bytes,
         prune_cadence_blocks,
         json_logs,
         deployer_managed,
@@ -538,8 +744,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
             webserver::Config {
-                max_pool_bytes: MAX_POOL_BYTES,
-                max_propose_bytes: MAX_PROPOSE_BYTES,
+                max_pool_bytes,
+                max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: 3,
                 signature_strategy: signature_strategy.clone(),
@@ -592,11 +798,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!(startup_mode, "selected validator startup mode");
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
-        // loaded config and returns `None` for primaries, validators that did
-        // not declare an `indexer` block, or those that declared one with
-        // `enabled: false`.
-        let indexer_handle =
-            maybe_build_indexer(context.child("indexer"), is_primary, indexer).await;
+        // loaded config and returns `None` for primaries or validators that
+        // did not declare an `indexer` block.
+        let indexer_partition_prefix = decoded.partition_prefix.clone();
+        let indexer_handle = maybe_build_indexer(
+            context.child("indexer"),
+            is_primary,
+            indexer,
+            &indexer_partition_prefix,
+        )
+        .await;
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
 
         info!("initializing engine");
@@ -637,7 +848,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
                         .as_ref()
-                        .and_then(|h| h.cert_reporter.clone())
+                        .map(|h| h.cert_reporter.clone())
                         .map(SimplexObserver::Indexer)
                 }),
                 finalized_hook,
@@ -659,17 +870,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
 
         info!("starting engine");
-        // Primaries report to the local mempool; secondaries with an indexer
-        // configured report to the indexer; secondaries without report to no
-        // one. The three cases share a single dispatch enum so the engine
-        // type is fixed regardless of role.
-        let reporter: Option<BlockUpdateReporter> = if is_primary {
-            Some(BlockUpdateReporter::Mempool(mempool_mailbox.clone()))
+        // Primaries report to the local mempool. Secondaries upload index data
+        // from the finalized hook and do not need marshal updates here.
+        let reporter: Option<Mailbox<Commitment, PublicKey, Sha256>> = if is_primary {
+            Some(mempool_mailbox.clone())
         } else {
-            indexer_handle
-                .as_ref()
-                .and_then(|h| h.block_reporter.clone())
-                .map(BlockUpdateReporter::Indexer)
+            None
         };
         let engine_handle = engine.start(channels, reporter);
 
@@ -718,13 +924,39 @@ const fn production_sync_config() -> SyncEngineConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_QMDB_FINALIZED_BACKLOG, acquire_finalized_upload_slot, enqueue_finalized_upload,
-        maybe_build_indexer, wait_for_critical_task_exit,
+        EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
+        FinalizedQueueWriter, FinalizedUploadCursor, maybe_build_indexer,
+        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        wait_for_critical_task_exit,
     };
-    use crate::config::{IndexerConfig, IndexerMode};
-    use commonware_runtime::Runner as _;
-    use std::{future::pending, sync::Arc, time::Duration};
-    use tokio::sync::Semaphore;
+    use crate::config::IndexerConfig;
+    use commonware_codec::{FixedSize as _, Read as _, Write as _};
+    use commonware_consensus::{
+        marshal::coding::types::coding_config_for_participants,
+        simplex::types::Context as SimplexContext,
+        types::{Round, View, coding::Commitment},
+    };
+    use commonware_cryptography::{
+        Digest as _, Signer as _,
+        ed25519::PrivateKey,
+        sha256::{Digest as Sha256Digest, Sha256},
+    };
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_storage::{
+        merkle::mmr,
+        qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
+        queue,
+    };
+    use commonware_utils::{non_empty_range, sequence::FixedBytes};
+    use constantinople_primitives::{
+        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
+    };
+    use std::{future::pending, time::Duration};
+
+    type TestAccountValue = FixedBytes<{ Account::SIZE }>;
+    type TestStateOperation =
+        UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
@@ -744,66 +976,182 @@ mod tests {
     }
 
     #[test]
-    fn qmdb_indexer_does_not_block_secondary_startup_on_connect_failure() {
+    fn publisher_does_not_block_secondary_startup_on_connect_failure() {
         let runner =
             commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
         runner.start(|context| async move {
             let indexer = IndexerConfig {
-                mode: IndexerMode::Full,
                 chain_indexer_url: "http://127.0.0.1:1".to_string(),
                 upload_buffer: 1,
-                qmdb_upload: true,
             };
 
             let handle = tokio::time::timeout(
-                Duration::from_millis(50),
-                maybe_build_indexer(context, false, Some(indexer)),
+                Duration::from_secs(2),
+                maybe_build_indexer(context, false, Some(indexer), "test"),
             )
             .await
-            .expect("qmd publisher connection should not block startup")
+            .expect("publisher connection should not block startup")
             .expect("secondary should keep indexer wiring");
 
-            assert!(handle.qmd_finalized_tx.is_some());
+            assert_eq!(handle._uploaders.len(), 2);
         });
     }
 
-    #[tokio::test]
-    async fn finalized_upload_enqueue_returns_payload_when_uploader_stopped() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
+    #[test]
+    fn finalized_upload_cursor_keeps_furthest_recovery_position() {
+        let older = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 20,
+        };
+        let newer_state = FinalizedUploadCursor {
+            state_next: 11,
+            transaction_next: 1,
+        };
+        let newer_transaction = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 21,
+        };
 
-        let payload = enqueue_finalized_upload(&tx, 7)
-            .await
-            .expect_err("closed uploader should return the payload");
-
-        assert_eq!(payload, 7);
+        assert_eq!(older.max(newer_state), newer_state);
+        assert_eq!(older.max(newer_transaction), newer_transaction);
+        assert_eq!(newer_state.max(older), newer_state);
+        assert_eq!(newer_transaction.max(older), newer_transaction);
     }
 
-    #[tokio::test]
-    async fn qmd_finalized_backlog_waits_after_64_outstanding_uploads() {
-        let backlog = Arc::new(Semaphore::new(MAX_QMDB_FINALIZED_BACKLOG));
-        let mut permits = Vec::with_capacity(MAX_QMDB_FINALIZED_BACKLOG);
+    #[test]
+    fn recovered_finalized_upload_cursor_uses_furthest_whole_frontier() {
+        let metadata = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 20,
+        };
+        let queue = FinalizedUploadCursor {
+            state_next: 11,
+            transaction_next: 1,
+        };
 
-        for _ in 0..MAX_QMDB_FINALIZED_BACKLOG {
-            permits.push(acquire_finalized_upload_slot(backlog.clone()).await);
-        }
-
-        let full = tokio::time::timeout(
-            Duration::from_millis(10),
-            acquire_finalized_upload_slot(backlog.clone()),
-        )
-        .await;
-        assert!(
-            full.is_err(),
-            "65th finalized upload must wait while 64 uploads are outstanding",
+        assert_eq!(
+            recovered_finalized_upload_cursor(None, None),
+            Default::default()
         );
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(metadata), None),
+            metadata
+        );
+        assert_eq!(recovered_finalized_upload_cursor(None, Some(queue)), queue);
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(metadata), Some(queue)),
+            queue
+        );
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(queue), Some(metadata)),
+            queue
+        );
+    }
 
-        drop(permits.pop().expect("a held upload slot should exist"));
-        let _permit = tokio::time::timeout(
-            Duration::from_secs(1),
-            acquire_finalized_upload_slot(backlog.clone()),
-        )
-        .await
-        .expect("freed upload slot should admit the next finalized block");
+    #[test]
+    fn finalized_upload_cursor_ignores_partial_metadata_pairs() {
+        assert_eq!(FinalizedUploadCursor::from_parts(None, None), None);
+        assert_eq!(FinalizedUploadCursor::from_parts(Some(10), None), None);
+        assert_eq!(FinalizedUploadCursor::from_parts(None, Some(20)), None);
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(Some(10), Some(20)),
+            Some(FinalizedUploadCursor {
+                state_next: 10,
+                transaction_next: 20,
+            }),
+        );
+    }
+
+    #[test]
+    fn finalized_queue_scan_recovers_last_cursor_and_resets_reader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
+                &context,
+                FINALIZED_QUEUE_PAGE_SIZE,
+                FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+            );
+            let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
+                queue::shared::init(
+                    context.child("finalized_queue"),
+                    queue::Config {
+                        partition: "finalized-queue-scan-recovers-last-cursor".to_string(),
+                        items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+                        compression: None,
+                        codec_config: super::QueuedFinalizedUploadCfg::default(),
+                        page_cache,
+                        write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+                    },
+                )
+                .await
+                .expect("queue initializes");
+            let first = queued_upload(1, 0, 2, 0, 2);
+            let second = queued_upload(2, 2, 5, 2, 3);
+            writer.enqueue(first.clone()).await.expect("enqueue first");
+            writer
+                .enqueue(second.clone())
+                .await
+                .expect("enqueue second");
+
+            assert_eq!(
+                scan_finalized_queue_cursor(&mut reader).await,
+                Some(FinalizedUploadCursor::from_upload(&second))
+            );
+
+            let (_position, upload) = reader
+                .try_recv()
+                .await
+                .expect("read after scan")
+                .expect("scan reset leaves first item readable");
+            assert_eq!(
+                FinalizedUploadCursor::from_upload(&upload),
+                FinalizedUploadCursor::from_upload(&first)
+            );
+        });
+    }
+
+    fn queued_upload(
+        height: u64,
+        state_start: u64,
+        state_end: u64,
+        transaction_start: u64,
+        transaction_end: u64,
+    ) -> EngineQueuedUpload {
+        let leader = PrivateKey::from_seed(height).public_key();
+        let parent_commitment = Commitment::from((
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            coding_config_for_participants(4),
+        ));
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), parent_commitment),
+            },
+            parent: Sha256Digest::EMPTY,
+            height,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(state_start, state_end),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(transaction_start, transaction_end),
+        };
+        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+            .seal(&mut Sha256::default());
+        let state_delta: Vec<TestStateOperation> = vec![TestStateOperation::CommitFloor(
+            None,
+            mmr::Location::new(state_start),
+        )];
+        let mut encoded = bytes::BytesMut::new();
+        block.write(&mut encoded);
+        0i64.write(&mut encoded);
+        state_start.write(&mut encoded);
+        transaction_start.write(&mut encoded);
+        state_delta.write(&mut encoded);
+
+        let mut encoded = encoded.freeze();
+        EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
+            .expect("queued upload decodes")
     }
 }

@@ -1,24 +1,46 @@
 //! Shared backing-store binary for the indexer stack.
 //!
-//! `chain-indexer` wraps the exoware simulator store. It supports both
+//! `chain-indexer` serves the exoware simulator store. It supports both
 //! direct local invocations (`--port`, `--data-dir`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
 use axum::{Router, routing::get};
-use bytes::Bytes;
 use clap::{ArgGroup, Parser};
-use exoware_server::QueryExtra;
-use exoware_simulator::{AppState, Ingest, Log, Prune, Query, RocksStore, Sequence, connect_stack};
+use exoware_simulator::{
+    AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack,
+    rocksdb::{BlockBasedOptions, Cache, DBCompressionType, Options, UniversalCompactOptions},
+};
 use serde::Deserialize;
 use std::{
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
+
+const ROCKS_BACKGROUND_JOBS: i32 = 16;
+const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
+const ROCKS_WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const ROCKS_DB_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024 * 1024;
+const ROCKS_MEMTABLE_MEMORY_BUDGET: usize = ROCKS_DB_WRITE_BUFFER_SIZE;
+const ROCKS_TARGET_FILE_SIZE_BASE: u64 = 512 * 1024 * 1024;
+const ROCKS_MAX_BYTES_FOR_LEVEL_BASE: u64 = 16 * 1024 * 1024 * 1024;
+const ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER: i32 = 64;
+const ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER: i32 = 1024;
+const ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER: i32 = 2048;
+const ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO: i32 = 10;
+const ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH: i32 = 4;
+const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;
+const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
+const ROCKS_MIN_BLOB_SIZE: u64 = 16 * 1024;
+const ROCKS_BLOB_FILE_SIZE: u64 = 512 * 1024 * 1024;
+const ROCKS_BLOCK_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+const ROCKS_BLOB_CACHE_SIZE: usize = 4 * 1024 * 1024 * 1024;
+const ROCKS_WRITE_MAX_COALESCED_REQUESTS: usize = 256;
+const ROCKS_WRITE_BUILDERS: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -83,99 +105,78 @@ fn load_settings(cli: Cli) -> (PathBuf, u16) {
     )
 }
 
-#[derive(Clone)]
-struct OrderedStore<E> {
-    inner: E,
-    put_lock: Arc<Mutex<()>>,
-}
-
-impl<E> OrderedStore<E> {
-    fn new(inner: E) -> Self {
-        Self {
-            inner,
-            put_lock: Arc::new(Mutex::new(())),
-        }
-    }
-}
-
-impl<E> Sequence for OrderedStore<E>
-where
-    E: Sequence,
-{
-    fn current_sequence(&self) -> u64 {
-        self.inner.current_sequence()
-    }
-}
-
-impl<E> Ingest for OrderedStore<E>
-where
-    E: Ingest,
-{
-    async fn put_batch(&self, kvs: Vec<(Bytes, Bytes)>) -> Result<u64, String> {
-        let _permit = self.put_lock.lock().await;
-        self.inner.put_batch(kvs).await
-    }
-}
-
-impl<E> Query for OrderedStore<E>
-where
-    E: Query,
-{
-    type RangeScan = E::RangeScan;
-
-    async fn get(&self, key: Bytes) -> Result<(Option<Vec<u8>>, QueryExtra), String> {
-        self.inner.get(key).await
-    }
-
-    async fn range_scan(
-        &self,
-        start: Bytes,
-        end: Bytes,
-        limit: usize,
-        forward: bool,
-    ) -> Result<Self::RangeScan, String> {
-        self.inner.range_scan(start, end, limit, forward).await
-    }
-
-    async fn get_many(
-        &self,
-        keys: Vec<Bytes>,
-    ) -> Result<(Vec<(Vec<u8>, Option<Vec<u8>>)>, QueryExtra), String> {
-        self.inner.get_many(keys).await
-    }
-}
-
-impl<E> Prune for OrderedStore<E>
-where
-    E: Prune,
-{
-    async fn apply_prune_policies(
-        &self,
-        document: exoware_sdk::prune_policy::PrunePolicyDocument,
-    ) -> Result<(), String> {
-        self.inner.apply_prune_policies(document).await
-    }
-}
-
-impl<E> Log for OrderedStore<E>
-where
-    E: Log,
-{
-    async fn get_batch(&self, sequence_number: u64) -> Result<Option<Vec<(Bytes, Bytes)>>, String> {
-        self.inner.get_batch(sequence_number).await
-    }
-
-    async fn oldest_retained_batch(&self) -> Result<Option<u64>, String> {
-        self.inner.oldest_retained_batch().await
-    }
-}
-
 async fn health() -> &'static str {
     "ok"
 }
 
+fn block_based_options(block_cache: &Cache) -> BlockBasedOptions {
+    let mut opts = BlockBasedOptions::default();
+    opts.set_block_cache(block_cache);
+    opts.set_cache_index_and_filter_blocks(true);
+    opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    opts.set_pin_top_level_index_and_filter(true);
+    opts
+}
+
+fn write_heavy_options(block_cache: &Cache, blob_cache: &Cache) -> Options {
+    let mut opts = Options::default();
+    let block_opts = block_based_options(block_cache);
+    opts.increase_parallelism(ROCKS_BACKGROUND_JOBS);
+    opts.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
+    opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
+    opts.set_block_based_table_factory(&block_opts);
+    opts.optimize_universal_style_compaction(ROCKS_MEMTABLE_MEMORY_BUDGET);
+    let mut universal = UniversalCompactOptions::default();
+    universal.set_size_ratio(ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO);
+    universal.set_min_merge_width(ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH);
+    opts.set_universal_compaction_options(&universal);
+    opts.set_compression_type(DBCompressionType::None);
+    opts.set_bottommost_compression_type(DBCompressionType::None);
+    opts.set_wal_compression_type(DBCompressionType::None);
+    opts.set_write_buffer_size(ROCKS_WRITE_BUFFER_SIZE);
+    opts.set_db_write_buffer_size(ROCKS_DB_WRITE_BUFFER_SIZE);
+    opts.set_max_write_buffer_number(8);
+    opts.set_target_file_size_base(ROCKS_TARGET_FILE_SIZE_BASE);
+    opts.set_max_bytes_for_level_base(ROCKS_MAX_BYTES_FOR_LEVEL_BASE);
+    opts.set_level_zero_file_num_compaction_trigger(ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER);
+    opts.set_level_zero_slowdown_writes_trigger(ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER);
+    opts.set_level_zero_stop_writes_trigger(ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER);
+    opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
+    opts.set_wal_bytes_per_sync(ROCKS_SYNC_BYTES);
+    opts.set_use_direct_io_for_flush_and_compaction(true);
+    opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
+    opts.set_enable_blob_files(true);
+    opts.set_min_blob_size(ROCKS_MIN_BLOB_SIZE);
+    opts.set_blob_file_size(ROCKS_BLOB_FILE_SIZE);
+    opts.set_blob_compression_type(DBCompressionType::None);
+    opts.set_blob_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE as u64);
+    opts.set_blob_cache(blob_cache);
+    opts
+}
+
+fn chain_indexer_rocks_config() -> RocksConfig {
+    let block_cache = Cache::new_lru_cache(ROCKS_BLOCK_CACHE_SIZE);
+    let blob_cache = Cache::new_lru_cache(ROCKS_BLOB_CACHE_SIZE);
+
+    RocksConfig {
+        db_options: write_heavy_options(&block_cache, &blob_cache),
+        default_cf_options: write_heavy_options(&block_cache, &blob_cache),
+        meta_cf_options: Options::default(),
+        log_cf_options: write_heavy_options(&block_cache, &blob_cache),
+        write_pipeline: RocksWritePipelineConfig {
+            max_coalesced_requests: NonZeroUsize::new(ROCKS_WRITE_MAX_COALESCED_REQUESTS)
+                .expect("rocks write coalescing width must be nonzero"),
+            builder_threads: NonZeroUsize::new(ROCKS_WRITE_BUILDERS)
+                .expect("rocks write builder count must be nonzero"),
+        },
+    }
+}
+
 async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let engine = Arc::new(OrderedStore::new(RocksStore::open(data_dir)?));
+    let engine = Arc::new(RocksStore::open(
+        data_dir,
+        Some(chain_indexer_rocks_config()),
+    )?);
     let connect = connect_stack(AppState::new(engine));
     let app = Router::new()
         .route("/health", get(health))
@@ -213,20 +214,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, OrderedStore, load_settings};
-    use bytes::Bytes;
+    use super::{Cli, load_settings};
     use clap::Parser;
-    use exoware_simulator::{Ingest, Sequence};
     use std::{
         fs,
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::time::{Duration, sleep};
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -234,29 +228,6 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}{suffix}"))
-    }
-
-    #[derive(Clone, Default)]
-    struct ConcurrentPutProbe {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-        next_sequence: Arc<AtomicUsize>,
-    }
-
-    impl Sequence for ConcurrentPutProbe {
-        fn current_sequence(&self) -> u64 {
-            self.next_sequence.load(Ordering::SeqCst) as u64
-        }
-    }
-
-    impl Ingest for ConcurrentPutProbe {
-        async fn put_batch(&self, _kvs: Vec<(Bytes, Bytes)>) -> Result<u64, String> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(active, Ordering::SeqCst);
-            sleep(Duration::from_millis(5)).await;
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(self.next_sequence.fetch_add(1, Ordering::SeqCst) as u64 + 1)
-        }
     }
 
     #[test]
@@ -316,27 +287,5 @@ mod tests {
         );
 
         let _ = fs::remove_file(config_path);
-    }
-
-    #[tokio::test]
-    async fn ordered_store_serializes_backend_puts() {
-        let probe = ConcurrentPutProbe::default();
-        let store = OrderedStore::new(probe.clone());
-        let mut puts = Vec::new();
-
-        for _ in 0..16 {
-            let store = store.clone();
-            puts.push(tokio::spawn(async move {
-                store
-                    .put_batch(vec![(Bytes::from_static(b"k"), Bytes::from_static(b"v"))])
-                    .await
-                    .expect("put should succeed");
-            }));
-        }
-        for put in puts {
-            put.await.expect("put task should not panic");
-        }
-
-        assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
     }
 }

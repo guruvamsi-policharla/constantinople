@@ -1,141 +1,24 @@
-//! Block reporter that fans a finalized block out to raw KV and SQL metadata.
-//!
-//! Wired into the engine via the existing `marshal` reporter slot. On every
-//! `Update::Block(block, ack)` we:
-//!
-//! 1. Encode two batches:
-//!    - **raw KV**: BLOCK, BLOCK_BY_H, TX, and TX_BY_H rows.
-//!    - **sql metadata** (`block_meta`): one row per block. The
-//!      latest-finalized-height cursor is
-//!      derived from `MAX(height)` on `block_meta`; the KV path no longer
-//!      maintains a redundant META scalar.
-//! 2. Clone the marshal acknowledgement once per backing path. Each path
-//!    fulfills its clone after its own upload succeeds; the marshal waiter only
-//!    resolves after every path has durably accepted its batch.
-//! 3. Forward each batch to its uploader and return immediately so consensus
-//!    is not blocked on the network store — marshal itself back-pressures
-//!    the engine through the still-held ack.
+//! Block row encoding shared by the combined publisher.
 
-use crate::{
-    keys,
-    publisher::{
-        SqlBatch, SqlRow, UploadBatch, dispatch_batch,
-        sql::{BlockMetaRow, dispatch_sql_batch, encode_sql_rows},
+use crate::publisher::{
+    SqlRow,
+    sql::{
+        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, encode_block_meta_row,
+        encode_tx_activity_row, encode_tx_meta_row,
     },
 };
-use bytes::Bytes;
-use commonware_actor::Feedback;
 use commonware_codec::{Encode, FixedSize};
-use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
     AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
 };
-use exoware_sdk::keys::Key;
-use std::{
-    array::TryFromSliceError,
-    marker::PhantomData,
-    time::{SystemTime, UNIX_EPOCH},
-};
-use tokio::sync::mpsc;
+use std::array::TryFromSliceError;
 use tracing::warn;
 
-const TX_BY_SENDER_ROW_BYTES: usize = 32 + 32 + 8 + 8 + 8 + 8 + 4;
-
-/// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
-///
-/// Holds one sender per active backing path. Cloning the reporter is cheap;
-/// the senders are reference-counted MPSC channels.
-pub struct BlockReporter<H, P> {
-    raw: Option<mpsc::Sender<UploadBatch>>,
-    sql: mpsc::Sender<SqlBatch>,
-    _marker: PhantomData<fn() -> (H, P)>,
-}
-
-impl<H, P> BlockReporter<H, P> {
-    /// Build a reporter that forwards raw KV and SQL metadata batches.
-    ///
-    /// The raw KV channel carries pre-encoded BLOCK, BLOCK_BY_H, TX, and
-    /// TX_BY_H rows to the existing exoware Store. The SQL channel feeds the
-    /// metadata uploader, which writes typed rows into the `block_meta` table
-    /// declared by [`crate::sql_schema`].
-    pub const fn new(raw: mpsc::Sender<UploadBatch>, sql: mpsc::Sender<SqlBatch>) -> Self {
-        Self {
-            raw: Some(raw),
-            sql,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Build a reporter that uploads only SQL metadata rows.
-    pub const fn metadata_only(sql: mpsc::Sender<SqlBatch>) -> Self {
-        Self {
-            raw: None,
-            sql,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<H, P> Clone for BlockReporter<H, P> {
-    fn clone(&self) -> Self {
-        Self {
-            raw: self.raw.clone(),
-            sql: self.sql.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<H, P> Reporter for BlockReporter<H, P>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    type Activity = Update<EngineBlock<H, P>>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match activity {
-            // Tip-only updates carry no block payload; nothing to upload.
-            Update::Tip(_, _, _) => {}
-            Update::Block(block, ack) => {
-                // Encoding is cheap and synchronous. The actual store writes
-                // are dispatched onto background tasks so this method never
-                // blocks consensus — see `dispatch_batch` for back-pressure
-                // semantics.
-                let IndexedBlockRows { raw, sql, .. } = encode_indexed_block_rows(&block);
-
-                // Clone the ack once per backing path. `Exact::clone`
-                // increments the remaining count, so the marshal waiter only
-                // resolves after each path has acknowledged.
-                if let Some(raw_tx) = &self.raw {
-                    dispatch_batch(
-                        raw_tx,
-                        UploadBatch {
-                            rows: raw,
-                            ack: Some(ack.clone()),
-                        },
-                    );
-                }
-                dispatch_sql_batch(
-                    &self.sql,
-                    SqlBatch {
-                        rows: sql,
-                        ack: Some(ack),
-                    },
-                );
-            }
-        }
-        Feedback::Ok
-    }
-}
-
-/// Encoded block rows split by index family.
+/// Encoded block rows split by index surface.
 pub(crate) struct IndexedBlockRows<D: Digest> {
-    /// Raw KV rows for the block and contained transactions.
-    pub raw: Vec<(Key, Bytes)>,
-    /// SQL metadata row for the block.
+    /// SQL rows for block metadata, transaction metadata, and account activity.
     pub sql: Vec<SqlRow>,
     /// Transaction digests in append order.
     pub transaction_digests: Vec<D>,
@@ -144,16 +27,32 @@ pub(crate) struct IndexedBlockRows<D: Digest> {
 struct IndexedTransaction<D: Digest> {
     block_index: usize,
     digest: D,
-    bytes: Bytes,
-    sender: Option<AccountKey>,
+    bytes: Vec<u8>,
+    sender: AccountKey,
     to: [u8; AccountKey::SIZE],
     value: u64,
     nonce: u64,
 }
 
 /// Build every row for a finalized block, partitioned by destination store.
+#[cfg(test)]
 pub(crate) fn encode_indexed_block_rows<H, P>(
     block: &EngineBlock<H, P>,
+) -> IndexedBlockRows<H::Digest>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let finalized_ts_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    encode_indexed_block_rows_at(block, finalized_ts_micros)
+}
+
+pub(crate) fn encode_indexed_block_rows_at<H, P>(
+    block: &EngineBlock<H, P>,
+    finalized_ts_micros: i64,
 ) -> IndexedBlockRows<H::Digest>
 where
     H: Hasher,
@@ -162,15 +61,6 @@ where
     let block_digest = block.seal();
     let height = block.header.height;
     let body_len = block.body.len();
-    // Wall-clock at the moment marshal delivered this block; microseconds
-    // since the Unix epoch (matches `Timestamp(TimeUnit::Microsecond, None)`
-    // declared by `sql_schema::build_meta_schema`). A clock-skewed validator
-    // simply records its own view of the time — the SQL store does not rely
-    // on it for ordering (height is the primary key).
-    let finalized_ts_micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
     // SQL `block_meta.digest` is `FixedSizeBinary(32)` — copy it into a
     // `[u8; 32]` for the typed CellValue path.
     let mut block_digest_arr = [0u8; 32];
@@ -191,66 +81,72 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    let mut raw = Vec::with_capacity(2 + 3 * body_len);
-    raw.push((
-        keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
-        block.encode(),
-    ));
-    raw.push((
-        keys::block_by_height(height).expect("u64 height fits family payload"),
-        Bytes::copy_from_slice(block_digest.as_ref()),
-    ));
+    let mut sql = Vec::with_capacity(1 + 3 * body_len);
 
-    // Per-transaction rows: TX, TX_BY_H, and TX_BY_SENDER for account lookup.
+    // One tx_meta row plus sender/receiver tx_activity rows per transaction.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
     for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
         transaction_digests.push(tx.digest);
         let idx_u32 = u32::try_from(tx.block_index).expect("transaction index fits u32");
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
-
-        raw.push((
-            keys::tx(tx.digest.as_ref()).expect("tx digest fits family payload"),
-            tx.bytes,
-        ));
-        raw.push((
-            keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
-            Bytes::copy_from_slice(tx.digest.as_ref()),
-        ));
-        if let Some(sender_account) = tx.sender {
-            raw.push((
-                keys::tx_by_sender(sender_account.as_ref(), height, idx_u32)
-                    .expect("sender tx index fits family payload"),
-                encode_tx_by_sender_row(
-                    tx.digest.as_ref(),
-                    &tx.to,
-                    tx.value,
-                    tx.nonce,
-                    qmdb_location,
-                    height,
-                    idx_u32,
-                ),
-            ));
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(tx.digest.as_ref());
+        let mut sender = [0u8; AccountKey::SIZE];
+        sender.copy_from_slice(tx.sender.as_ref());
+        let receiver = tx.to;
+        sql.push(encode_tx_meta_row(TxMetaRow {
+            height,
+            index: idx_u32,
+            digest,
+            sender,
+            receiver,
+            value: tx.value,
+            nonce: tx.nonce,
+            qmdb_location,
+            body: tx.bytes,
+        }));
+        sql.push(encode_tx_activity_row(TxActivityRow {
+            account: sender,
+            role: TxActivityRole::Sender,
+            height,
+            index: idx_u32,
+            digest,
+            counterparty: receiver,
+            value: tx.value,
+            nonce: tx.nonce,
+            qmdb_location,
+        }));
+        if receiver != sender {
+            sql.push(encode_tx_activity_row(TxActivityRow {
+                account: receiver,
+                role: TxActivityRole::Receiver,
+                height,
+                index: idx_u32,
+                digest,
+                counterparty: sender,
+                value: tx.value,
+                nonce: tx.nonce,
+                qmdb_location,
+            }));
         }
     }
 
-    // SQL: one block_meta row per finalized block. Per-transaction proof
-    // lookups use raw `TX_BY_H` rows on demand for the wallet's own
-    // transactions instead of maintaining a global SQL `tx_meta` index.
-    // The `latest_finalized_height` cursor that the previous KV META family
-    // carried is now derived from `MAX(block_meta.height)` instead.
-    // `view` is currently 0; see `encode_sql_rows` docs for why.
-    let sql = encode_sql_rows(BlockMetaRow {
-        height,
-        digest: block_digest_arr,
-        tx_count,
-        transactions_root,
-        transactions_tip: block.header.transactions_range.end() - 1,
-        view: 0,
-        finalized_ts_micros,
-    });
+    // SQL: one block_meta row per finalized block.
+    // `view` is currently 0; see `encode_block_meta_row` docs for why.
+    sql.insert(
+        0,
+        encode_block_meta_row(BlockMetaRow {
+            height,
+            digest: block_digest_arr,
+            tx_count,
+            transactions_root,
+            transactions_tip: block.header.transactions_range.end() - 1,
+            view: 0,
+            finalized_ts_micros,
+        }),
+    );
 
     IndexedBlockRows {
-        raw,
         sql,
         transaction_digests,
     }
@@ -278,14 +174,15 @@ where
     }
 
     let transaction_bytes = &signed_bytes[..transaction_size];
-    let sender =
-        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE]);
-    if sender.is_none() {
+    let Some(sender) =
+        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
+    else {
         warn!(
             height,
             block_index, "indexer: sender public key bytes cannot derive an account key"
         );
-    }
+        return None;
+    };
 
     let to_start = TransactionPublicKey::SIZE;
     let to_end = to_start + AccountKey::SIZE;
@@ -313,7 +210,7 @@ where
     Some(IndexedTransaction {
         block_index,
         digest: hasher.finalize(),
-        bytes: transaction.encode(),
+        bytes: transaction.encode().to_vec(),
         sender,
         to,
         value,
@@ -325,29 +222,10 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
     Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
-fn encode_tx_by_sender_row(
-    digest: &[u8],
-    to: &[u8],
-    value: u64,
-    nonce: u64,
-    qmdb_location: u64,
-    height: u64,
-    block_index: u32,
-) -> Bytes {
-    let mut row = Vec::with_capacity(TX_BY_SENDER_ROW_BYTES);
-    row.extend_from_slice(digest);
-    row.extend_from_slice(to);
-    row.extend_from_slice(&value.to_be_bytes());
-    row.extend_from_slice(&nonce.to_be_bytes());
-    row.extend_from_slice(&qmdb_location.to_be_bytes());
-    row.extend_from_slice(&height.to_be_bytes());
-    row.extend_from_slice(&block_index.to_be_bytes());
-    Bytes::from(row)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_schema::TX_ACTIVITY_TABLE;
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
@@ -366,6 +244,7 @@ mod tests {
         TransactionPublicKey,
     };
     use core::num::NonZeroU64;
+    use exoware_sql::CellValue;
     use rand::{SeedableRng, rngs::StdRng};
 
     #[test]
@@ -392,16 +271,7 @@ mod tests {
         .seal(&mut Sha256::default());
 
         let rows = encode_indexed_block_rows(&block);
-        let tx_by_sender = rows
-            .raw
-            .iter()
-            .find(|(key, _)| keys::TX_BY_SENDER.matches(key))
-            .expect("sender history row should be indexed");
-        let payload = keys::TX_BY_SENDER
-            .decode(&tx_by_sender.0, AccountKey::SIZE + 12)
-            .expect("sender history key should decode");
-
-        assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
+        assert_activity_sender(&rows.sql, sender_account.as_ref());
     }
 
     #[test]
@@ -441,17 +311,22 @@ mod tests {
         );
 
         let rows = encode_indexed_block_rows(&block);
-        let tx_by_sender = rows
-            .raw
-            .iter()
-            .find(|(key, _)| keys::TX_BY_SENDER.matches(key))
-            .expect("sender history row should be indexed from encoded bytes");
-        let payload = keys::TX_BY_SENDER
-            .decode(&tx_by_sender.0, AccountKey::SIZE + 12)
-            .expect("sender history key should decode");
-
-        assert_eq!(&payload[..AccountKey::SIZE], sender_account.as_ref());
+        assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
+    }
+
+    fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
+        let sender = rows
+            .iter()
+            .find(|row| {
+                row.table == TX_ACTIVITY_TABLE
+                    && matches!(row.values.get(3), Some(CellValue::UInt64(0)))
+            })
+            .expect("sender activity row should be indexed");
+        let Some(CellValue::FixedBinary(account)) = sender.values.first() else {
+            panic!("sender activity account should be fixed binary");
+        };
+        assert_eq!(account.as_slice(), expected_account);
     }
 
     fn test_header(
