@@ -29,7 +29,7 @@ pub(crate) const fn default_upload_buffer() -> usize {
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
-    4 * 1024 * 1024
+    8 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -704,7 +704,9 @@ mod tests {
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -770,7 +772,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -826,7 +830,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -925,7 +931,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -981,7 +989,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -1047,7 +1057,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -1122,7 +1134,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1

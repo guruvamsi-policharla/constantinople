@@ -82,6 +82,10 @@ cargo run --bin constantinople-deploy -- generate \
 
 Add `--spammer-presigned-batches N` (default `16`) to keep more fully signed batches ready
 locally per submitter. The spammer still submits only one batch at a time to each target leader.
+`--spammer-accounts` configures accounts per submitter, so the generated total is
+`spammer_accounts * relayer_submitters`.
+Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
+signing thread count in generated local commands and remote `spammer.yaml`.
 
 You can also run the spammer manually against an existing local cluster:
 
@@ -270,6 +274,7 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer \
   --spammer-accounts 10 \
   --spammer-presigned-batches 16 \
+  --spammer-rayon-threads 4 \
   --spammer-value 1 \
   remote \
   --http-cidr 0.0.0.0/0 \
