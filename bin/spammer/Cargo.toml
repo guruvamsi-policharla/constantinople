@@ -28,6 +28,7 @@ commonware-utils.workspace = true
 
 # Other
 clap = { workspace = true, features = ["derive", "std"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

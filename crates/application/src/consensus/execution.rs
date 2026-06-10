@@ -1,7 +1,7 @@
 //! Execution and commitment checks for consensus blocks.
 
 use super::{
-    MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
+    INVALID_PROOF, MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
     db::{self, StateBatch, TransactionBatch, apply_changeset, apply_transaction_digests},
     history::parent_transactions_inactivity_floor,
@@ -138,11 +138,20 @@ where
     S: Strategy,
 {
     let prepare_started_at = Instant::now();
-    let transfers = body
+    let signed = body
         .iter()
-        .map(|transaction| executor::prepare_transfer(transaction.get()?))
+        .map(|transaction| transaction.get())
         .collect::<Option<Vec<_>>>()
         .ok_or(MALFORMED_TRANSACTION)?;
+    let transfers = signed
+        .iter()
+        .map(|transaction| executor::prepare_transfer(transaction))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(MALFORMED_TRANSACTION)?;
+    // Verify every ZK proof in the block with one batched pairing check.
+    if !executor::verify_proofs(signed.iter().copied()) {
+        return Err(INVALID_PROOF);
+    }
     let prepare_ms = prepare_started_at.elapsed().as_millis();
 
     let load_started_at = Instant::now();
@@ -242,7 +251,9 @@ where
     let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
         account_keys.insert(transfer.sender.clone());
-        account_keys.insert(transfer.recipient.clone());
+        if let Some(recipient) = transfer.recipient() {
+            account_keys.insert(recipient.clone());
+        }
     }
 
     load_accounts(batch, account_keys.into_iter().collect()).await
@@ -265,9 +276,11 @@ where
     let mut unique = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
         account_keys.push(&transfer.sender);
-        account_keys.push(&transfer.recipient);
         unique.insert(&transfer.sender);
-        unique.insert(&transfer.recipient);
+        if let Some(recipient) = transfer.recipient() {
+            account_keys.push(recipient);
+            unique.insert(recipient);
+        }
     }
 
     if unique.len() == account_keys.len() {

@@ -49,6 +49,7 @@ const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MATERIALIZE_TASK_CLOSED: &str = "transaction materialization task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
+const INVALID_PROOF: &str = "invalid zk proof";
 
 /// Core Constantinople application.
 pub struct Application<E, H, C, S, P, I, B, SigSt, HashSt>

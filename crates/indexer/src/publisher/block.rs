@@ -7,13 +7,12 @@ use crate::publisher::{
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
-use commonware_codec::FixedSize;
+use commonware_codec::{EncodeSize, FixedSize, ReadExt};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
+    AccountKey, LazySignedTransaction, Payload, Transaction, TransactionPublicKey,
 };
-use std::array::TryFromSliceError;
 use tracing::warn;
 
 /// Encoded block rows split by index surface.
@@ -153,7 +152,16 @@ where
     H: Hasher,
 {
     let signed_bytes = transaction.encoded_signed_transaction();
-    let transaction_size = Transaction::<H::Digest>::SIZE;
+    let Ok(decoded) = Transaction::<H::Digest>::read(&mut &signed_bytes[..]) else {
+        warn!(
+            height,
+            block_index,
+            signed_len = signed_bytes.len(),
+            "indexer: skipping transaction with undecodable payload"
+        );
+        return None;
+    };
+    let transaction_size = decoded.encode_size();
     if signed_bytes.len() < transaction_size {
         warn!(
             height,
@@ -164,8 +172,8 @@ where
         );
         return None;
     }
-
     let transaction_bytes = &signed_bytes[..transaction_size];
+
     let Some(sender) =
         AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
     else {
@@ -176,26 +184,27 @@ where
         return None;
     };
 
-    let to_start = TransactionPublicKey::SIZE;
-    let to_end = to_start + AccountKey::SIZE;
-    let value_start = to_end;
-    let value_end = value_start + u64::SIZE;
-    let nonce_start = value_end;
-    let nonce_end = nonce_start + u64::SIZE;
-    let value = read_u64(&transaction_bytes[value_start..value_end])
-        .expect("transaction value slice has fixed width");
-    if value == 0 {
-        warn!(
-            height,
-            block_index, "indexer: skipping transaction with zero value"
-        );
-        return None;
-    }
-
-    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
-        .expect("transaction nonce slice has fixed width");
+    // Activity rows expose only public information: private transfers report a
+    // zero value with the real counterparty; fund and burn report their public
+    // value against the sender itself.
     let mut to = [0u8; AccountKey::SIZE];
-    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
+    let value = match &decoded.payload {
+        Payload::Transfer {
+            to: recipient,
+            value,
+        } => {
+            to.copy_from_slice(recipient.as_ref());
+            value.get()
+        }
+        Payload::PrivateTransfer { to: recipient, .. } => {
+            to.copy_from_slice(recipient.as_ref());
+            0
+        }
+        Payload::Fund { value, .. } | Payload::Burn { value, .. } => {
+            to.copy_from_slice(sender.as_ref());
+            value.get()
+        }
+    };
 
     let mut hasher = H::new();
     hasher.update(transaction_bytes);
@@ -206,19 +215,15 @@ where
         sender,
         to,
         value,
-        nonce,
+        nonce: decoded.nonce,
     })
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
-    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
+    use commonware_codec::{DecodeExt as _, FixedSize, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View, coding::Commitment},

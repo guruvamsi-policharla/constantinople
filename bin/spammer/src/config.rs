@@ -39,6 +39,9 @@ pub struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Submit private transfers instead of public ring transfers.
+    #[serde(default)]
+    pub private: bool,
 }
 
 const fn default_presigned_batches() -> usize {
@@ -102,6 +105,7 @@ mod tests {
             presigned_batches: DEFAULT_PRESIGNED_BATCHES,
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
+            private: true,
         };
         let yaml = serde_yaml::to_string(&config).expect("serialize");
         let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");
@@ -115,6 +119,7 @@ mod tests {
         assert_eq!(parsed.presigned_batches, config.presigned_batches);
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
+        assert_eq!(parsed.private, config.private);
     }
 
     /// Older configs that predate newer optional fields must still parse.
@@ -125,6 +130,7 @@ mod tests {
         assert_eq!(parsed.rayon_threads, DEFAULT_RAYON_THREADS);
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
+        assert!(!parsed.private);
     }
 
     #[test]

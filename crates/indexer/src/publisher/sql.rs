@@ -1,6 +1,8 @@
 //! SQL row encoding shared by the combined publisher.
 
 use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
+use commonware_codec::FixedSize;
+use constantinople_primitives::BalanceCommitment;
 use exoware_sql::CellValue;
 
 /// One row destined for a SQL metadata table.
@@ -65,6 +67,8 @@ pub(crate) struct AccountMetaRow {
     pub balance: u64,
     pub nonce_base: u64,
     pub nonce_bitmap: u64,
+    pub private: [u8; BalanceCommitment::SIZE],
+    pub pending: [u8; BalanceCommitment::SIZE],
     pub qmdb_location: u64,
 }
 
@@ -131,6 +135,8 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.balance),
             CellValue::UInt64(account.nonce_base),
             CellValue::UInt64(account.nonce_bitmap),
+            CellValue::FixedBinary(account.private.to_vec()),
+            CellValue::FixedBinary(account.pending.to_vec()),
             CellValue::UInt64(account.qmdb_location),
         ],
     }

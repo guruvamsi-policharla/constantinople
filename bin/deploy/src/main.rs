@@ -131,6 +131,10 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Run the spammer in private-transfer mode (Zether-style: fund then
+    /// commitment-chained private transfers).
+    #[arg(long, default_value_t = false)]
+    spammer_private: bool,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -240,6 +244,9 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Run in private-transfer mode.
+    #[serde(default)]
+    pub private: bool,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.

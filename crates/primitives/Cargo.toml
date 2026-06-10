@@ -21,10 +21,19 @@ commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 
+# Privacy (ZK-Pari private transfers)
+zkpari.workspace = true
+ark-bls12-381.workspace = true
+ark-ec.workspace = true
+ark-ff.workspace = true
+ark-serialize.workspace = true
+ark-std.workspace = true
+ark-relations.workspace = true
+
 # Other
 bytes.workspace = true
 p256.workspace = true
-rand.workspace = true
+rand = { workspace = true, features = ["std", "std_rng"] }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 rand_core.workspace = true
 derive_more = { workspace = true, features = ["full"] }

@@ -51,6 +51,13 @@ pub struct Cli {
     /// batch. Must be in `0..=1`.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
+
+    /// Submit private transfers instead of public ring transfers.
+    ///
+    /// Each account funds its private balance first, then sends commitment-
+    /// chained private transfers to its ring neighbor.
+    #[arg(long)]
+    pub private: bool,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {

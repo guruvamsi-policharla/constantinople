@@ -1,7 +1,7 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
-    TransactionPublicKey,
+    BalanceCommitment, TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -176,13 +176,32 @@ impl Read for Nonce {
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-#[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
+#[display(
+    "Account {{ balance: {}, nonce: {}, private: {}, pending: {} }}",
+    balance,
+    nonce,
+    private,
+    pending
+)]
 pub struct Account {
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
     /// Consumed and run-ahead transaction nonce state.
     pub nonce: Nonce,
+    /// Commitment to the spendable private balance.
+    ///
+    /// This is the input to the account's outgoing private transfer chain:
+    /// every private transfer, fund, and burn must declare this value and
+    /// replaces it with the next commitment in the chain.
+    pub private: BalanceCommitment,
+    /// Commitment accumulating incoming private payments.
+    ///
+    /// Incoming payments land here instead of [`Self::private`] so they cannot
+    /// invalidate the recipient's in-flight outgoing chain (the Zether
+    /// griefing attack). The full protocol adds an epoch rollover that folds
+    /// `pending` into `private`; this chain omits rollover.
+    pub pending: BalanceCommitment,
 }
 
 impl Default for Account {
@@ -190,18 +209,22 @@ impl Default for Account {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
             nonce: Nonce::default(),
+            private: BalanceCommitment::zero(),
+            pending: BalanceCommitment::zero(),
         }
     }
 }
 
 impl FixedSize for Account {
-    const SIZE: usize = u64::SIZE + Nonce::SIZE;
+    const SIZE: usize = u64::SIZE + Nonce::SIZE + BalanceCommitment::SIZE + BalanceCommitment::SIZE;
 }
 
 impl Write for Account {
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
+        self.private.write(buf);
+        self.pending.write(buf);
     }
 }
 
@@ -212,6 +235,8 @@ impl Read for Account {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: Nonce::read(buf)?,
+            private: BalanceCommitment::read(buf)?,
+            pending: BalanceCommitment::read(buf)?,
         })
     }
 }
@@ -305,6 +330,8 @@ mod tests {
         let account = Account {
             balance: 42,
             nonce: Nonce::new(7, 3),
+            private: BalanceCommitment::commit(13),
+            pending: BalanceCommitment::commit(99),
         };
 
         let mut buf = Vec::with_capacity(Account::SIZE);
@@ -322,6 +349,8 @@ mod tests {
             Account {
                 balance: DEFAULT_ACCOUNT_BALANCE,
                 nonce: Nonce::default(),
+                private: BalanceCommitment::zero(),
+                pending: BalanceCommitment::zero(),
             }
         );
     }

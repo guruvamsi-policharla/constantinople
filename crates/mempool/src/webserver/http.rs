@@ -13,10 +13,10 @@ use axum::{
 };
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, SignedTransaction, TransactionPublicKey,
+    Account, LazySignedTransaction, Nonce, SignedTransaction, Transaction, TransactionPublicKey,
     TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
@@ -31,9 +31,6 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
-
-/// Minimum bytes needed to encode a `u64` varint.
-const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, SigSt, HashSt>
@@ -101,10 +98,8 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
-    TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
-        + MIN_U64_VARINT_BYTES
+    // `Transaction::MIN_SIZE` is digest-independent; any digest type works.
+    Transaction::<commonware_cryptography::sha256::Digest>::MIN_SIZE
         + TransactionSignature::MIN_SIZE
 }
 
@@ -380,6 +375,8 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
+    private: String,
+    pending: String,
 }
 
 #[derive(serde::Serialize)]
@@ -393,6 +390,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
+            private: hex(account.private.as_bytes()),
+            pending: hex(account.pending.as_bytes()),
         }
     }
 }

@@ -19,6 +19,8 @@
 //! external consumers (the explorer and the SQL CLI) can hard-code the
 //! exact same identifiers without an out-of-band agreement.
 
+use commonware_codec::FixedSize;
+use constantinople_primitives::BalanceCommitment;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::StoreClient;
 use exoware_sql::{KvSchema, TableColumnConfig};
@@ -88,6 +90,10 @@ pub const ACCOUNT_META_BALANCE: &str = "balance";
 pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 /// `account_meta`: indexed account run-ahead nonce bitmap.
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
+/// `account_meta`: spendable private balance commitment, fixed-size binary.
+pub const ACCOUNT_META_PRIVATE: &str = "private";
+/// `account_meta`: pending incoming private balance commitment, fixed-size binary.
+pub const ACCOUNT_META_PENDING: &str = "pending";
 /// `account_meta`: account-state QMDB operation location.
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
@@ -185,6 +191,16 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
+                    TableColumnConfig::new(
+                        ACCOUNT_META_PRIVATE,
+                        DataType::FixedSizeBinary(BalanceCommitment::SIZE as i32),
+                        false,
+                    ),
+                    TableColumnConfig::new(
+                        ACCOUNT_META_PENDING,
+                        DataType::FixedSizeBinary(BalanceCommitment::SIZE as i32),
+                        false,
+                    ),
                     TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
                 ],
                 vec![ACCOUNT_META_ACCOUNT.to_string()],
@@ -262,6 +278,8 @@ mod tests {
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
         assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
         assert_eq!(ACCOUNT_META_NONCE_BITMAP, "nonce_bitmap");
+        assert_eq!(ACCOUNT_META_PRIVATE, "private");
+        assert_eq!(ACCOUNT_META_PENDING, "pending");
         assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
     }
 }

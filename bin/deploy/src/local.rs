@@ -344,6 +344,12 @@ fn local_run_commands(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
+        // `--private` is a presence flag: include it only when set.
+        let private = if args.spammer_private {
+            " --private"
+        } else {
+            ""
+        };
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -352,7 +358,7 @@ fn local_run_commands(
              --seed-offset {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {}{private}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -400,6 +406,7 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_private: false,
             target: GenerateTarget::Local(test_local_args()),
         }
     }

@@ -16,11 +16,17 @@ pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAP
 mod auth;
 pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};
 
+mod privacy;
+pub use privacy::{
+    BalanceCommitment, BurnProof, PrivateBalance, ProofClaim, TransferPlan, TransferProof,
+    proving_key, verify_proofs_batch,
+};
+
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 
 mod transaction;
-pub use transaction::{SignedTransaction, Transaction, VerifiedTransaction};
+pub use transaction::{Payload, SignedTransaction, Transaction, VerifiedTransaction};
 
 /// Signing namespace for transaction signatures.
 pub const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-tx";

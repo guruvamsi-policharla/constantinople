@@ -20,7 +20,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio:
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
-use signer::{Tx, sign_batch};
+use signer::{PrivateChains, Tx, sign_batch, sign_batch_private};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
@@ -43,6 +43,7 @@ fn main() {
         primary_validators,
         rayon_threads,
         accounts_jitter,
+        private,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
@@ -64,6 +65,7 @@ fn main() {
             },
             cfg.rayon_threads,
             cfg.accounts_jitter,
+            cfg.private,
         )
     } else {
         (
@@ -78,6 +80,7 @@ fn main() {
             cli.relayer_targets.clone(),
             cli.rayon_threads,
             cli.accounts_jitter,
+            cli.private,
         )
     };
     assert!(
@@ -124,6 +127,7 @@ fn main() {
             relayer_submitters,
             presigned_batches,
             relayer_targets: primary_validators,
+            private,
         };
         run_relayer_mode(config, strategy).await;
     });
@@ -138,6 +142,7 @@ struct RelayerModeConfig {
     relayer_submitters: usize,
     presigned_batches: usize,
     relayer_targets: Vec<String>,
+    private: bool,
 }
 
 async fn run_relayer_mode(
@@ -153,6 +158,7 @@ async fn run_relayer_mode(
         relayer_submitters,
         presigned_batches,
         relayer_targets,
+        private,
     } = config;
 
     info!(
@@ -163,6 +169,7 @@ async fn run_relayer_mode(
         accounts_jitter,
         %relayer_url,
         presigned_batches,
+        private,
         "starting spammer relayer mode"
     );
 
@@ -182,6 +189,7 @@ async fn run_relayer_mode(
             accounts_jitter,
             account_offset,
             presigned_batches,
+            private,
         );
         tokio::spawn(submit_presigned_batches(submitter, batches));
     }
@@ -218,6 +226,7 @@ fn spawn_presigner<St>(
     accounts_jitter: f64,
     account_offset: u64,
     presigned_batches: usize,
+    private: bool,
 ) -> mpsc::Receiver<Vec<Tx>>
 where
     St: commonware_parallel::Strategy + Send + 'static,
@@ -228,18 +237,31 @@ where
     tokio::task::spawn_blocking(move || {
         let mut rng = JitterRng::new(account_offset.wrapping_add(1));
         let mut nonces = vec![0; accounts.len()];
+        let mut chains = PrivateChains::new(accounts.len(), DEFAULT_ACCOUNT_BALANCE);
         let mut cursor = 0;
 
         loop {
             let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
-            let batch = sign_batch(
-                &strategy,
-                &accounts,
-                value,
-                &mut nonces,
-                &mut cursor,
-                batch_size,
-            );
+            let batch = if private {
+                sign_batch_private(
+                    &strategy,
+                    &accounts,
+                    value,
+                    &mut nonces,
+                    &mut chains,
+                    &mut cursor,
+                    batch_size,
+                )
+            } else {
+                sign_batch(
+                    &strategy,
+                    &accounts,
+                    value,
+                    &mut nonces,
+                    &mut cursor,
+                    batch_size,
+                )
+            };
             if sender.blocking_send(batch).is_err() {
                 return;
             }
@@ -406,8 +428,15 @@ mod tests {
         let accounts = generate_accounts(3, 1000);
         let value = NonZeroU64::new(1).expect("non-zero value");
         let presigned_batches = 4;
-        let mut batches =
-            spawn_presigner(Sequential, accounts, value, 0.0, 1000, presigned_batches);
+        let mut batches = spawn_presigner(
+            Sequential,
+            accounts,
+            value,
+            0.0,
+            1000,
+            presigned_batches,
+            false,
+        );
 
         let first = batches.recv().await.expect("first batch should be signed");
         assert_eq!(batch_nonces(&first), vec![0, 0, 0]);

@@ -25,7 +25,7 @@ use commonware_storage::{
 use commonware_utils::sequence::FixedBytes;
 use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use constantinople_primitives::{Account, AccountKey, BalanceCommitment, BlockCfg};
 use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
@@ -1396,6 +1396,8 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
             balance: account_value_balance(account),
             nonce_base: account_value_nonce_base(account),
             nonce_bitmap: account_value_nonce_bitmap(account),
+            private: account_value_private(account),
+            pending: account_value_pending(account),
             qmdb_location: location,
         }));
     }
@@ -1427,6 +1429,20 @@ fn account_value_nonce_bitmap(account: &AccountValue) -> u64 {
         .try_into()
         .expect("account nonce bitmap has fixed width");
     u64::from_be_bytes(bytes)
+}
+
+fn account_value_private(account: &AccountValue) -> [u8; BalanceCommitment::SIZE] {
+    // Account layout: balance(8) | nonce_base(8) | nonce_bitmap(8) | private | pending.
+    account.as_ref()[24..24 + BalanceCommitment::SIZE]
+        .try_into()
+        .expect("account private commitment has fixed width")
+}
+
+fn account_value_pending(account: &AccountValue) -> [u8; BalanceCommitment::SIZE] {
+    let start = 24 + BalanceCommitment::SIZE;
+    account.as_ref()[start..start + BalanceCommitment::SIZE]
+        .try_into()
+        .expect("account pending commitment has fixed width")
 }
 
 async fn load_state_ops<E, H, S>(
@@ -1713,6 +1729,7 @@ mod tests {
                     encode_account(Account {
                         balance: u64::from(seed),
                         nonce: Nonce::default(),
+                        ..Account::default()
                     }),
                 )),
                 StateOperation::CommitFloor(None, Location::new(0)),
@@ -2055,6 +2072,7 @@ mod tests {
                         Account {
                             balance: 10,
                             nonce: Nonce::default(),
+                            ..Account::default()
                         },
                     ),
                     (
@@ -2062,6 +2080,7 @@ mod tests {
                         Account {
                             balance: 20,
                             nonce: Nonce::default(),
+                            ..Account::default()
                         },
                     ),
                 ],
@@ -2088,6 +2107,7 @@ mod tests {
                         Account {
                             balance: 9,
                             nonce: Nonce::new(1, 0),
+                            ..Account::default()
                         },
                     ),
                     (
@@ -2095,6 +2115,7 @@ mod tests {
                         Account {
                             balance: 30,
                             nonce: Nonce::default(),
+                            ..Account::default()
                         },
                     ),
                 ],
@@ -2444,6 +2465,7 @@ mod tests {
                 encode_account(Account {
                     balance: u64::from(seed),
                     nonce: Nonce::default(),
+                    ..Account::default()
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
@@ -2482,6 +2504,7 @@ mod tests {
                 encode_account(Account {
                     balance: 1,
                     nonce: Nonce::default(),
+                    ..Account::default()
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
