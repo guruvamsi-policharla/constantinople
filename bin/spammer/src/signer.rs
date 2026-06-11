@@ -18,6 +18,19 @@ pub type Tx = SignedTransaction<Sha256>;
 /// funds, which is what stresses the proposer's commitment-chain packing.
 const FUND_MULTIPLE: u64 = 8;
 
+/// Fund-chunk multiple for a given salt, in `[1, FUND_MULTIPLE]`.
+///
+/// Fund transactions carry no randomness, so this is what makes a re-signed
+/// fund differ in bytes from the failed one: the mempool caches batch status
+/// by body hash and would answer a byte-identical resubmission from the cache
+/// of its dropped predecessor without ever re-pooling it. Consecutive salts
+/// yield distinct multiples (the cycle is `FUND_MULTIPLE` long, far past the
+/// consecutive-failure halt threshold), so every resign produces fresh bytes
+/// for any batch composition.
+const fn fund_multiple(salt: u64) -> u64 {
+    FUND_MULTIPLE - (salt % FUND_MULTIPLE)
+}
+
 /// Per-account private state for the spammer, mirroring the on-chain
 /// commitment chain.
 ///
@@ -39,6 +52,62 @@ impl PrivateChains {
             balances: (0..accounts).map(|_| PrivateBalance::empty()).collect(),
             public_remaining: vec![starting_public_balance; accounts],
         }
+    }
+}
+
+/// Sender-side state delta captured for one private transaction.
+///
+/// The presigner runs ahead of on-chain confirmation, so when a batch's fate
+/// diverges from the happy path (dropped, partially finalized, or lost to a
+/// transport error) it must rewind its local nonce and commitment-chain state
+/// to what is actually committed. Each meta records the sender's state on both
+/// sides of its transaction so a batch can be unwound and confirmed
+/// transactions selectively re-applied.
+#[derive(Clone)]
+pub struct TxMeta {
+    pub account: usize,
+    pub nonce: u64,
+    /// Transaction digest string, matching the relayer's included/filtered
+    /// status lists.
+    pub digest: String,
+    pub pre_balance: PrivateBalance,
+    pub pre_public_remaining: u64,
+    pub post_balance: PrivateBalance,
+    pub post_public_remaining: u64,
+}
+
+/// Rollback metadata for one signed private batch: the ring cursor before
+/// planning plus one [`TxMeta`] per transaction, in batch order.
+#[derive(Clone)]
+pub struct BatchMeta {
+    pub pre_cursor: usize,
+    pub txs: Vec<TxMeta>,
+}
+
+/// Unwinds every transaction in `meta`, newest first, restoring nonces and
+/// private-side state to the instant before the batch was planned.
+pub fn unwind_batch(meta: &BatchMeta, nonces: &mut [u64], chains: &mut PrivateChains) {
+    for tx in meta.txs.iter().rev() {
+        nonces[tx.account] = tx.nonce;
+        chains.balances[tx.account] = tx.pre_balance.clone();
+        chains.public_remaining[tx.account] = tx.pre_public_remaining;
+    }
+}
+
+/// Re-applies the post-state of the transactions at `landed` (ascending
+/// indices into `meta.txs`) after [`unwind_batch`], used when a subset of a
+/// failed batch was confirmed on-chain.
+pub fn replay_landed(
+    meta: &BatchMeta,
+    landed: &[usize],
+    nonces: &mut [u64],
+    chains: &mut PrivateChains,
+) {
+    for &index in landed {
+        let tx = &meta.txs[index];
+        nonces[tx.account] = tx.nonce + 1;
+        chains.balances[tx.account] = tx.post_balance.clone();
+        chains.public_remaining[tx.account] = tx.post_public_remaining;
     }
 }
 
@@ -126,8 +195,17 @@ pub fn sign_batch<St: Strategy>(
 /// link binds the previous commitment; the expensive part — proving — is
 /// **simulated** from the setup trapdoor and fans out across the strategy.
 ///
+/// `salt` perturbs the planning and proving randomness (transfer blinding)
+/// and the fund chunk size ([`fund_multiple`]); rolling back and re-signing
+/// with a new salt therefore yields different transaction bytes for every
+/// batch composition, which matters because the mempool caches batch status
+/// by body hash and would otherwise answer a byte-identical resubmission
+/// from the cache.
+///
 /// May return fewer than `count` transactions if accounts have drained their
-/// public and private balances.
+/// public and private balances. The returned [`BatchMeta`] carries the state
+/// deltas needed to unwind the batch if it fails.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_batch_private<St: Strategy>(
     strategy: &St,
     accounts: &[SpamAccount],
@@ -136,7 +214,8 @@ pub fn sign_batch_private<St: Strategy>(
     chains: &mut PrivateChains,
     cursor: &mut usize,
     count: usize,
-) -> Vec<Tx> {
+    salt: u64,
+) -> (Vec<Tx>, BatchMeta) {
     assert_eq!(accounts.len(), nonces.len(), "nonces must match accounts");
     assert_eq!(
         accounts.len(),
@@ -147,8 +226,11 @@ pub fn sign_batch_private<St: Strategy>(
     assert!(count > 0, "need at least one transaction");
 
     let n = accounts.len();
+    let pre_cursor = *cursor;
     let mut plans = Vec::with_capacity(count);
-    let mut planning_rng = StdRng::seed_from_u64(0x5341_4D50 ^ (*cursor as u64));
+    let mut deltas = Vec::with_capacity(count);
+    let mut planning_rng =
+        StdRng::seed_from_u64(0x5341_4D50 ^ (*cursor as u64) ^ salt.rotate_left(17));
 
     // Each produced transaction may need to scan past drained accounts, so cap
     // the walk at one full ring per slot.
@@ -158,6 +240,8 @@ pub fn sign_batch_private<St: Strategy>(
         let account = *cursor;
         *cursor = (*cursor + 1) % n;
 
+        let pre_balance = chains.balances[account].clone();
+        let pre_public_remaining = chains.public_remaining[account];
         let Some(plan) = plan_account(
             account,
             n,
@@ -166,18 +250,42 @@ pub fn sign_batch_private<St: Strategy>(
             nonces,
             chains,
             &mut planning_rng,
+            salt,
         ) else {
             continue;
         };
+        let nonce = match &plan {
+            PrivatePlan::Fund { nonce, .. } | PrivatePlan::Transfer { nonce, .. } => *nonce,
+        };
+        deltas.push(TxMeta {
+            account,
+            nonce,
+            digest: String::new(),
+            pre_balance,
+            pre_public_remaining,
+            post_balance: chains.balances[account].clone(),
+            post_public_remaining: chains.public_remaining[account],
+        });
         plans.push(plan);
     }
 
-    strategy.map_collect_vec(plans, |plan| prove_and_sign(accounts, plan))
+    let txs = strategy.map_collect_vec(plans, |plan| prove_and_sign(accounts, plan, salt));
+    for (delta, tx) in deltas.iter_mut().zip(txs.iter()) {
+        delta.digest = tx.message_digest().to_string();
+    }
+    (
+        txs,
+        BatchMeta {
+            pre_cursor,
+            txs: deltas,
+        },
+    )
 }
 
 /// Plans the next action for `account`: a transfer when its private balance
 /// covers `value`, otherwise a fund when it still has public balance, else
 /// `None` (drained — caller skips it).
+#[allow(clippy::too_many_arguments)]
 fn plan_account(
     account: usize,
     n: usize,
@@ -186,6 +294,7 @@ fn plan_account(
     nonces: &mut [u64],
     chains: &mut PrivateChains,
     rng: &mut StdRng,
+    salt: u64,
 ) -> Option<PrivatePlan> {
     let input = chains.balances[account].commitment();
 
@@ -206,7 +315,8 @@ fn plan_account(
     }
 
     if chains.public_remaining[account] >= value.get() {
-        let fund = chains.public_remaining[account].min(value.get().saturating_mul(FUND_MULTIPLE));
+        let fund =
+            chains.public_remaining[account].min(value.get().saturating_mul(fund_multiple(salt)));
         let fund = NonZeroU64::new(fund).expect("fund is at least `value`");
         chains.public_remaining[account] -= fund.get();
         chains.balances[account].fund(fund.get());
@@ -229,7 +339,7 @@ fn take_nonce(nonces: &mut [u64], account: usize) -> u64 {
 }
 
 /// Simulates the proof (if any) and signs the planned transaction.
-fn prove_and_sign(accounts: &[SpamAccount], plan: PrivatePlan) -> Tx {
+fn prove_and_sign(accounts: &[SpamAccount], plan: PrivatePlan, salt: u64) -> Tx {
     let account = match &plan {
         PrivatePlan::Fund { account, .. } | PrivatePlan::Transfer { account, .. } => *account,
     };
@@ -252,7 +362,8 @@ fn prove_and_sign(accounts: &[SpamAccount], plan: PrivatePlan) -> Tx {
         } => {
             // Per-item deterministic RNG: the simulator only samples blinding
             // for zero-knowledge, so any seed yields a verifying proof.
-            let mut rng = StdRng::seed_from_u64(((account as u64) << 32) ^ nonce);
+            let mut rng =
+                StdRng::seed_from_u64((((account as u64) << 32) ^ nonce) ^ salt.rotate_right(7));
             let amount = plan.amount_commitment();
             let proof = plan.simulate(&mut rng);
             Transaction::private_transfer(sender_key, recipient, input, amount, proof, nonce)
@@ -395,7 +506,7 @@ mod tests {
         let mut chains = PrivateChains::new(accounts.len(), 100);
         let mut cursor = 0;
 
-        let txs = sign_batch_private(
+        let (txs, _) = sign_batch_private(
             &Sequential,
             &accounts,
             value,
@@ -403,6 +514,7 @@ mod tests {
             &mut chains,
             &mut cursor,
             9,
+            0,
         );
         assert_eq!(txs.len(), 9);
 
@@ -423,7 +535,7 @@ mod tests {
         let mut chains = PrivateChains::new(accounts.len(), 100);
         let mut cursor = 0;
 
-        let first = sign_batch_private(
+        let (first, _) = sign_batch_private(
             &Sequential,
             &accounts,
             value,
@@ -431,8 +543,9 @@ mod tests {
             &mut chains,
             &mut cursor,
             2,
+            0,
         );
-        let second = sign_batch_private(
+        let (second, _) = sign_batch_private(
             &Sequential,
             &accounts,
             value,
@@ -440,6 +553,7 @@ mod tests {
             &mut chains,
             &mut cursor,
             2,
+            0,
         );
 
         // Each account's first batch funds, the second transfers from the
@@ -453,6 +567,206 @@ mod tests {
             ));
             assert_eq!(second[account].value().nonce, 1);
         }
+    }
+
+    /// Snapshot of presigner state for equality comparison in rollback tests.
+    fn state_fingerprint(
+        nonces: &[u64],
+        chains: &PrivateChains,
+    ) -> Vec<(u64, PrivateBalance, u64)> {
+        nonces
+            .iter()
+            .zip(chains.balances.iter())
+            .zip(chains.public_remaining.iter())
+            .map(|((nonce, balance), remaining)| (*nonce, balance.clone(), *remaining))
+            .collect()
+    }
+
+    /// Unwinding signed batches newest-first restores the exact pre-signing
+    /// state, and re-signing from it with the same salt is byte-identical.
+    #[test]
+    fn unwind_restores_state_and_resign_is_deterministic() {
+        use commonware_codec::Encode;
+
+        let accounts = generate_accounts(3, 1000);
+        let value = NonZeroU64::new(2).unwrap();
+        let mut nonces = vec![0; accounts.len()];
+        let mut chains = PrivateChains::new(accounts.len(), 100);
+        let mut cursor = 0;
+
+        // Advance past the all-fund phase so batches contain transfers too.
+        let (_, first_meta) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            0,
+        );
+        let checkpoint = state_fingerprint(&nonces, &chains);
+        let checkpoint_cursor = cursor;
+
+        let (second, second_meta) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            0,
+        );
+        let (_, third_meta) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            0,
+        );
+
+        // Unwind third then second, as the presigner does after a failure of
+        // the second batch.
+        unwind_batch(&third_meta, &mut nonces, &mut chains);
+        unwind_batch(&second_meta, &mut nonces, &mut chains);
+        cursor = second_meta.pre_cursor;
+        assert_eq!(state_fingerprint(&nonces, &chains), checkpoint);
+        assert_eq!(cursor, checkpoint_cursor);
+        assert_eq!(first_meta.txs.len(), 3);
+
+        // Same salt, same state: the resigned batch is byte-identical.
+        let (resigned, _) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            0,
+        );
+        assert_eq!(second.encode(), resigned.encode());
+    }
+
+    /// After an unwind, replaying the landed subset advances exactly those
+    /// senders, and the next batch chains correctly on the mixed state.
+    #[test]
+    fn replay_landed_advances_only_confirmed_transactions() {
+        let accounts = generate_accounts(3, 1000);
+        let value = NonZeroU64::new(2).unwrap();
+        let mut nonces = vec![0; accounts.len()];
+        let mut chains = PrivateChains::new(accounts.len(), 100);
+        let mut cursor = 0;
+
+        let (txs, meta) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            0,
+        );
+        assert_eq!(txs.len(), 3);
+
+        // Suppose only the first two transactions landed.
+        unwind_batch(&meta, &mut nonces, &mut chains);
+        cursor = meta.pre_cursor;
+        replay_landed(&meta, &[0, 1], &mut nonces, &mut chains);
+
+        assert_eq!(nonces, vec![1, 1, 0]);
+        assert_eq!(
+            chains.balances[0].commitment().as_bytes(),
+            meta.txs[0].post_balance.commitment().as_bytes()
+        );
+        assert_eq!(
+            chains.balances[2].commitment().as_bytes(),
+            meta.txs[2].pre_balance.commitment().as_bytes()
+        );
+
+        // The next batch must chain on the mixed state and stay valid from the
+        // chain's perspective for each account.
+        let (next, _) = sign_batch_private(
+            &Sequential,
+            &accounts,
+            value,
+            &mut nonces,
+            &mut chains,
+            &mut cursor,
+            3,
+            1,
+        );
+        assert_eq!(next.len(), 3);
+        for account in 0..accounts.len() {
+            let mut history: Vec<&Tx> = Vec::new();
+            if account < 2 {
+                history.push(&txs[account]);
+            }
+            history.push(&next[account]);
+            assert_account_chain_valid(&history);
+        }
+    }
+
+    /// A new salt changes the bytes of every batch composition: transfers
+    /// via blinding, funds via the chunk size. Re-signed batches must never
+    /// be byte-identical to a failed predecessor, because the mempool caches
+    /// batch status by body hash and would answer the resubmission from the
+    /// cache without re-pooling it.
+    #[test]
+    fn salt_changes_both_fund_and_transfer_bytes() {
+        use commonware_codec::Encode;
+
+        let accounts = generate_accounts(2, 1000);
+        let value = NonZeroU64::new(2).unwrap();
+
+        let sign_two_rounds = |salt: u64| {
+            let mut nonces = vec![0; accounts.len()];
+            let mut chains = PrivateChains::new(accounts.len(), 100);
+            let mut cursor = 0;
+            let (funds, _) = sign_batch_private(
+                &Sequential,
+                &accounts,
+                value,
+                &mut nonces,
+                &mut chains,
+                &mut cursor,
+                2,
+                salt,
+            );
+            let (transfers, _) = sign_batch_private(
+                &Sequential,
+                &accounts,
+                value,
+                &mut nonces,
+                &mut chains,
+                &mut cursor,
+                2,
+                salt,
+            );
+            (funds.encode(), transfers.encode())
+        };
+
+        let (funds_a, transfers_a) = sign_two_rounds(0);
+        let (funds_b, transfers_b) = sign_two_rounds(1);
+        assert_ne!(funds_a, funds_b, "fund chunk size must vary with salt");
+        assert_ne!(
+            transfers_a, transfers_b,
+            "transfer blinding must vary with salt"
+        );
+
+        // Consecutive salts stay distinct across the whole halt window.
+        let multiples: Vec<u64> = (0..super::FUND_MULTIPLE)
+            .map(super::fund_multiple)
+            .collect();
+        let mut deduped = multiples.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), multiples.len());
     }
 
     #[test]
