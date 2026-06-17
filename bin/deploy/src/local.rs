@@ -403,7 +403,9 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
-            spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
+            // Fixed (not the machine-scaled default) so the emitted command
+            // assertion is deterministic across machines.
+            spammer_rayon_threads: 2,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_private: false,

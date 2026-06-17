@@ -1,34 +1,26 @@
-//! Cryptographic components for private (Zether-style) transfers, backed by
-//! ZK-Pari.
+//! Cryptographic components for private (Zether-style) transfers.
 //!
-//! Private balances are Pedersen commitments over BLS12-381 G1, in the payment
-//! basis `(G_pay, G~_pay) = (Sigma_ci_2[0], Gamma_ci_2)` fixed by the ZK-Pari
-//! CRS. A private transfer is the batched one-to-many construction with a
-//! single recipient (`B = 1`): it publishes the amount commitment and **one**
-//! ZK-Pari proof of `3 G1 + 1 F` that range-checks *both* the transferred
-//! amount and the sender's remaining balance at once — replacing the two
-//! separate range proofs of the naive construction. Concretely:
+//! This is a thin adapter over [`zkpari::ledger`], which owns the actual
+//! cryptography: the range-proof relation, key generation, proving, the HVZK
+//! simulator, and random-linear-combination batch verification. This module
+//! supplies only the chain-facing types the rest of constantinople depends on
+//! (`BalanceCommitment`, `TransferProof`, `BurnProof`, `PrivateBalance`,
+//! `verify_proofs_batch`, …), their wire codecs, and a process-wide CRS.
 //!
-//! - Block 1 commits the claimed values `[amount, remaining]`; its commitment
-//!   `C_ci_1` is transmitted with the proof.
-//! - Block 2 commits the aggregate `v_theta = amount + theta * remaining`. Its
-//!   commitment `com_theta = com_amount + theta * com_remaining` is recomputed
-//!   by the verifier from the ledger commitments and is never transmitted.
-//! - `theta` is a Fiat-Shamir challenge bound to `(com_sender, com_amount,
-//!   C_ci_1)` and enters the circuit as a public input; the circuit enforces
-//!   the Horner aggregation, so by Schwartz-Zippel the range-checked claimed
-//!   values equal the values inside the ledger commitments.
-//!
-//! Verification therefore checks, with no secret knowledge: the single proof
-//! verifies (both values are in `[0, 2^64)`), `C_ci_1` matches the transmitted
-//! commitment, and balance conservation holds because `com_remaining =
-//! com_sender - com_amount` is *derived* by the verifier.
+//! Curve: **BN254** G1. Private balances are Pedersen commitments in the
+//! payment basis fixed by the ledger CRS. A private transfer publishes the
+//! amount commitment and **two** single-value range proofs — one for the
+//! amount, one for the sender's remaining balance
+//! (`com_remaining = com_sender - com_amount`, derived by the verifier). Both
+//! values lie in `[0, 2^64)`, which together with the homomorphic
+//! conservation `com_sender = com_amount + com_remaining` rules out overflow
+//! and over-spending.
 //!
 //! Funds and burns move value between the public `u64` balance and the private
 //! commitment with a public amount. Funding adds `commit(v)` (zero opening,
-//! publicly computable) and needs no proof. A burn is structurally a transfer
-//! to a public sink: its "amount" is the public `commit(value)`, so it reuses
-//! the same batched proof to range-check the remaining balance.
+//! publicly computable) and needs no proof. A burn is a transfer to a public
+//! sink: its amount is the public `commit(value)`, so it carries only the
+//! remaining-balance range proof.
 //!
 //! Incoming payments accumulate in a separate `pending` commitment so an
 //! in-flight outgoing chain can never be invalidated by a deposit (the Zether
@@ -38,21 +30,12 @@
 //! # Trusted setup
 //!
 //! The CRS is generated deterministically from a fixed seed at first use
-//! ([`proving_key`]). This stands in for a real multi-party trusted setup and
-//! is **demo-grade only**: anyone can recompute the toxic waste. Swap
-//! [`crs`] for externally distributed keys to productionize.
+//! ([`params`]). This stands in for a real multi-party trusted setup and is
+//! **demo-grade only**: anyone can recompute the toxic waste. Swap [`params`]
+//! for externally distributed keys to productionize.
 
-use ark_bls12_381::Bls12_381;
-use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM, pairing::Pairing};
-use ark_ff::Field;
-use ark_relations::{
-    gr1cs::{
-        ConstraintSystemRef, R1CS_PREDICATE_LABEL, SynthesisError, Variable,
-        predicate::{PredicateConstraintSystem, polynomial_constraint::SR1CS_PREDICATE_LABEL},
-    },
-    lc,
-};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_bn254::Bn254;
+use ark_ec::{AffineRepr, CurveGroup, pairing::Pairing};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Error as CodecError, FixedSize, Read, Write};
 use commonware_formatting::hex;
@@ -60,204 +43,74 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_core::{OsRng, RngCore};
 use std::sync::OnceLock;
 use zkpari::{
-    CommittedInputOpening, Proof, ProvingKey, Trapdoor, VerifyingKey, ZkPari, ZkPariCircuit,
-    utils::transcript::IOPTranscript,
+    CommittedInputOpening, Proof, ProvingKey, ZkPari,
+    ledger::{LedgerParams, RangeProof},
 };
 
-type E = Bls12_381;
+type E = Bn254;
 type Fr = <E as Pairing>::ScalarField;
 type G1 = <E as Pairing>::G1Affine;
 
-const G1_BYTES: usize = 48;
+/// Compressed G1 encoding length, used for the canonical identity cache
+/// (equality, ordering, hashing, hex display).
+const G1_BYTES: usize = 32;
+/// Uncompressed G1 encoding length, used on the wire: decoding skips the
+/// square root that compressed decoding pays to recover `y`.
+const G1_UNCOMPRESSED_BYTES: usize = 64;
+/// Scalar (`Fr`) encoding length.
 const FR_BYTES: usize = 32;
 
-/// One recipient per private transfer: the batched circuit's `B`.
-const BATCH_SIZE: usize = 1;
-
-/// CRS block index of the payment basis that ledger commitments live in
-/// (block 2 of the batched circuit: `[claimed values]`, then `[aggregate]`).
-const LEDGER_BLOCK: usize = 1;
-
-/// Fiat-Shamir domain for the transfer-aggregation challenge `theta`.
-const THETA_DOMAIN: &[u8] = b"constantinople-private-transfer-theta";
+/// One transmitted range proof: `T`, `U` (uncompressed G1) and the scalar
+/// `v_a`. The committed-input commitment is not transmitted — the verifier
+/// reconstructs it from ledger state.
+const RANGE_PROOF_BYTES: usize = 2 * G1_UNCOMPRESSED_BYTES + FR_BYTES;
 
 /// Seed for the deterministic demo CRS. See the module docs: demo-grade only.
 const CRS_SEED: u64 = 0xC0457A47_71400713;
 
-// ---------------------------------------------------------------------------
-// Batched range circuit (native SR1CS), from the zkpari
-// `batched_private_transfer` example, specialized via `batch_size`. With
-// `B = 1` it range-checks the claimed amount and the remaining balance and
-// enforces the Horner aggregation `amount + theta * remaining = v_theta`,
-// declaring two committed-input blocks:
-//   block 1: [amount, remaining]      -> C_ci_1 (transmitted)
-//   block 2: [v_theta]                -> com_theta (verifier-recomputed)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct BatchedRangeCircuit<F: Field> {
-    theta: Option<F>,
-    amounts: Option<Vec<u64>>,
-    remaining: Option<u64>,
-    batch_size: usize,
-}
-
-impl<F: Field> ZkPariCircuit<F> for BatchedRangeCircuit<F> {
-    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
-        cs.remove_predicate(R1CS_PREDICATE_LABEL);
-        let _ = cs.register_predicate(
-            SR1CS_PREDICATE_LABEL,
-            PredicateConstraintSystem::new_sr1cs_predicate()
-                .map_err(|_| SynthesisError::Unsatisfiable)?,
-        );
-
-        let b = self.batch_size;
-        let theta = self.theta;
-
-        // Committed values: the B claimed amounts followed by the remaining balance.
-        let raw_values: Option<Vec<u64>> = match (self.amounts.as_ref(), self.remaining) {
-            (Some(amounts), Some(remaining)) => {
-                assert_eq!(amounts.len(), b);
-                Some(amounts.iter().copied().chain([remaining]).collect())
-            }
-            _ => None,
-        };
-        let values: Option<Vec<F>> = raw_values
-            .as_ref()
-            .map(|raw| raw.iter().map(|v| F::from(*v)).collect());
-
-        // Block 1 (committed inputs, allocated first): v^_1, ..., v^_B, v^_rem.
-        let mut value_vars = Vec::with_capacity(b + 1);
-        for i in 0..=b {
-            let vals = values.clone();
-            let v = cs.new_witness_variable(move || {
-                vals.ok_or(SynthesisError::AssignmentMissing).map(|v| v[i])
-            })?;
-            value_vars.push(v);
-        }
-
-        // Block 2 (single committed input): v_theta = sum_i theta^i * values[i].
-        let v_theta_value: Option<F> = match (values.as_ref(), theta) {
-            (Some(vals), Some(th)) => {
-                let mut acc = vals[b];
-                for v in vals[..b].iter().rev() {
-                    acc = acc * th + v;
-                }
-                Some(acc)
-            }
-            _ => None,
-        };
-        let v_theta_var =
-            cs.new_witness_variable(|| v_theta_value.ok_or(SynthesisError::AssignmentMissing))?;
-
-        // theta is an ordinary public input (chosen after the ledger
-        // commitments and the block-1 commitment are fixed).
-        let theta_var = cs.new_input_variable(|| theta.ok_or(SynthesisError::AssignmentMissing))?;
-
-        // 64-bit range check for every committed value.
-        for (i, &v) in value_vars.iter().enumerate() {
-            let mut bit_vars = Vec::with_capacity(64);
-            for bit in 0..64u32 {
-                let raw = raw_values.clone();
-                let bv = cs.new_witness_variable(move || {
-                    let raw = raw.ok_or(SynthesisError::AssignmentMissing)?;
-                    Ok(if (raw[i] >> bit) & 1 == 1 {
-                        F::ONE
-                    } else {
-                        F::ZERO
-                    })
-                })?;
-                bit_vars.push(bv);
-            }
-            let mut recon_minus_v = lc!() - v;
-            let mut coeff = F::ONE;
-            for &bv in &bit_vars {
-                recon_minus_v += (coeff, bv);
-                coeff.double_in_place();
-            }
-            let zero_lc = lc!() + v - v;
-            cs.enforce_sr1cs_constraint(|| recon_minus_v, || zero_lc)?;
-            for &bv in &bit_vars {
-                cs.enforce_sr1cs_constraint(|| lc!() + bv, || lc!() + bv)?;
-            }
-        }
-
-        // Horner aggregation: acc = v^_rem; acc = acc * theta + v^_i for i = B..1,
-        // with each product realized as (a+t)^2, (a-t)^2 so a*t = (s_plus - s_minus)/4.
-        let quarter = F::from(4u64).inverse().unwrap();
-        let mut acc_lc = lc!() + value_vars[b];
-        let mut acc_val: Option<F> = values.as_ref().map(|vals| vals[b]);
-        for i in (0..b).rev() {
-            let (av, th) = (acc_val, theta);
-            let s_plus = cs.new_witness_variable(move || {
-                let a = av.ok_or(SynthesisError::AssignmentMissing)?;
-                let t = th.ok_or(SynthesisError::AssignmentMissing)?;
-                Ok((a + t).square())
-            })?;
-            let s_minus = cs.new_witness_variable(move || {
-                let a = av.ok_or(SynthesisError::AssignmentMissing)?;
-                let t = th.ok_or(SynthesisError::AssignmentMissing)?;
-                Ok((a - t).square())
-            })?;
-            let lhs_plus = acc_lc.clone() + theta_var;
-            let lhs_minus = acc_lc.clone() - theta_var;
-            cs.enforce_sr1cs_constraint(|| lhs_plus, || lc!() + s_plus)?;
-            cs.enforce_sr1cs_constraint(|| lhs_minus, || lc!() + s_minus)?;
-            acc_lc = lc!() + (quarter, s_plus) + (-quarter, s_minus) + value_vars[i];
-            acc_val = match (acc_val, theta, values.as_ref()) {
-                (Some(a), Some(t), Some(vals)) => Some(a * t + vals[i]),
-                _ => None,
-            };
-        }
-
-        // (acc - v_theta)^2 = 0.
-        let final_lhs = acc_lc - v_theta_var;
-        let zero_lc = lc!() + value_vars[0] - value_vars[0];
-        cs.enforce_sr1cs_constraint(|| final_lhs, || zero_lc)?;
-
-        Ok(vec![value_vars, vec![v_theta_var]])
-    }
-}
-
-const fn setup_circuit() -> BatchedRangeCircuit<Fr> {
-    BatchedRangeCircuit {
-        theta: None,
-        amounts: None,
-        remaining: None,
-        batch_size: BATCH_SIZE,
-    }
-}
-
-/// Returns the process-wide CRS, generating it deterministically on first use.
+/// Returns the process-wide ledger parameters (proving/verifying keys and the
+/// retained setup trapdoor), generating them deterministically on first use.
 ///
-/// The [`Trapdoor`] is retained alongside the keys. In a real deployment this
-/// is toxic waste that must be destroyed; here the CRS is demo-grade (see the
-/// module docs) and the trapdoor powers the fast simulated-proof path
-/// ([`PrivateBalance::simulate_transfer`]) used by load generators.
-fn crs() -> &'static (ProvingKey<E>, VerifyingKey<E>, Trapdoor<E>) {
-    static CRS: OnceLock<(ProvingKey<E>, VerifyingKey<E>, Trapdoor<E>)> = OnceLock::new();
-    CRS.get_or_init(|| {
-        let mut rng = StdRng::seed_from_u64(CRS_SEED);
-        ZkPari::<E>::keygen_with_trapdoor(setup_circuit(), &mut rng)
-    })
+/// The trapdoor is toxic waste in a real deployment; here the CRS is
+/// demo-grade and the trapdoor powers the fast simulated-proof path used by
+/// load generators ([`PrivateBalance::simulate_transfer`]).
+fn params() -> &'static LedgerParams<E> {
+    static PARAMS: OnceLock<LedgerParams<E>> = OnceLock::new();
+    PARAMS.get_or_init(|| LedgerParams::<E>::setup(&mut StdRng::seed_from_u64(CRS_SEED)))
 }
 
 /// Returns the ZK-Pari proving key shared by clients and validators.
 ///
 /// Exposed so external tooling can commit and prove against the same CRS.
 pub fn proving_key() -> &'static ProvingKey<E> {
-    &crs().0
+    &params().pk
 }
 
-fn g1_to_bytes(point: &G1) -> [u8; G1_BYTES] {
+fn g1_to_compressed(point: &G1) -> [u8; G1_BYTES] {
     let mut bytes = [0u8; G1_BYTES];
     point
         .serialize_compressed(&mut bytes[..])
-        .expect("compressed G1 fits 48 bytes");
+        .expect("compressed G1 fits its encoding");
     bytes
 }
 
-fn g1_from_bytes(bytes: &[u8]) -> Option<G1> {
+fn g1_to_uncompressed(point: &G1) -> [u8; G1_UNCOMPRESSED_BYTES] {
+    let mut bytes = [0u8; G1_UNCOMPRESSED_BYTES];
+    point
+        .serialize_uncompressed(&mut bytes[..])
+        .expect("uncompressed G1 fits its encoding");
+    bytes
+}
+
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+
+/// Validated uncompressed decode: canonical, on-curve, **and prime-order
+/// subgroup**. Load-bearing — these points enter unchecked MSMs and pairings.
+fn g1_from_uncompressed(bytes: &[u8]) -> Option<G1> {
+    G1::deserialize_uncompressed(bytes).ok()
+}
+
+fn g1_from_compressed(bytes: &[u8]) -> Option<G1> {
     G1::deserialize_compressed(bytes).ok()
 }
 
@@ -274,12 +127,13 @@ fn read_array<const N: usize>(buf: &mut impl Buf) -> Result<[u8; N], CodecError>
 // BalanceCommitment
 // ---------------------------------------------------------------------------
 
-/// A Pedersen commitment to a private balance (a BLS12-381 G1 point).
+/// A Pedersen commitment to a private balance (a BN254 G1 point).
 ///
 /// The chain stores and homomorphically updates these: a private transfer
 /// subtracts the amount commitment from the sender's balance commitment and
 /// adds it to the recipient's pending commitment. The identity point commits
-/// to zero with zero blinding.
+/// to zero with zero blinding. A compressed-bytes cache backs equality,
+/// ordering, hashing, and hex display; the wire codec is uncompressed.
 #[derive(Debug, Clone, Copy)]
 pub struct BalanceCommitment {
     point: G1,
@@ -287,43 +141,36 @@ pub struct BalanceCommitment {
 }
 
 impl BalanceCommitment {
-    /// The commitment to a zero balance (the identity point).
-    pub fn zero() -> Self {
-        Self::from_point(G1::identity())
-    }
-
     fn from_point(point: G1) -> Self {
         Self {
+            bytes: g1_to_compressed(&point),
             point,
-            bytes: g1_to_bytes(&point),
         }
     }
 
-    /// Creates a commitment from canonical compressed bytes, validating the
-    /// point.
-    pub fn from_bytes(bytes: &[u8; G1_BYTES]) -> Option<Self> {
-        Some(Self {
-            point: g1_from_bytes(bytes)?,
-            bytes: *bytes,
-        })
+    /// The commitment to a zero balance (the identity point).
+    pub fn zero() -> Self {
+        Self::from_point(G1::zero())
     }
 
-    /// Returns the canonical compressed encoding.
+    /// Reconstructs a commitment from its canonical compressed encoding.
+    pub fn from_bytes(bytes: &[u8; G1_BYTES]) -> Option<Self> {
+        Some(Self::from_point(g1_from_compressed(bytes)?))
+    }
+
+    /// The canonical compressed encoding (identity for equality/hashing/hex).
     pub const fn as_bytes(&self) -> &[u8; G1_BYTES] {
         &self.bytes
     }
 
-    /// Commitment to a public amount with zero blinding: `value * G_pay`.
-    ///
-    /// Publicly computable, which is what makes fund and burn amounts
-    /// verifiable without a proof of opening.
+    /// Publicly computable commitment to `value` with zero blinding.
     pub fn commit(value: u64) -> Self {
-        Self::commit_with(value, &CommittedInputOpening::zero())
+        Self::from_point(params().commit(value))
     }
 
     /// Commitment to `value` with blinding `opening`, in the payment basis.
     pub fn commit_with(value: u64, opening: &CommittedInputOpening<Fr>) -> Self {
-        Self::from_point(proving_key().pedersen_commit(LEDGER_BLOCK, &[Fr::from(value)], opening))
+        Self::from_point(params().commit_with(value, opening))
     }
 
     /// Homomorphic addition.
@@ -334,6 +181,11 @@ impl BalanceCommitment {
     /// Homomorphic subtraction.
     pub fn sub(&self, amount: &Self) -> Self {
         Self::from_point((self.point.into_group() - amount.point.into_group()).into_affine())
+    }
+
+    /// The underlying group element (for proof-claim construction).
+    const fn point(&self) -> G1 {
+        self.point
     }
 }
 
@@ -370,12 +222,12 @@ impl core::hash::Hash for BalanceCommitment {
 }
 
 impl FixedSize for BalanceCommitment {
-    const SIZE: usize = G1_BYTES;
+    const SIZE: usize = G1_UNCOMPRESSED_BYTES;
 }
 
 impl Write for BalanceCommitment {
     fn write(&self, buf: &mut impl BufMut) {
-        buf.put_slice(&self.bytes);
+        buf.put_slice(&g1_to_uncompressed(&self.point));
     }
 }
 
@@ -383,11 +235,12 @@ impl Read for BalanceCommitment {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        let bytes = read_array::<G1_BYTES>(buf)?;
-        Self::from_bytes(&bytes).ok_or(CodecError::Invalid(
+        let bytes = read_array::<G1_UNCOMPRESSED_BYTES>(buf)?;
+        let point = g1_from_uncompressed(&bytes).ok_or(CodecError::Invalid(
             "BalanceCommitment",
             "invalid G1 point encoding",
-        ))
+        ))?;
+        Ok(Self::from_point(point))
     }
 }
 
@@ -405,207 +258,111 @@ impl arbitrary::Arbitrary<'_> for BalanceCommitment {
 }
 
 // ---------------------------------------------------------------------------
-// Batched transfer proofs
+// Range-proof wire bytes
 // ---------------------------------------------------------------------------
 
-/// The Fiat-Shamir aggregation challenge `theta`, bound to everything fixed
-/// before it is drawn: the sender's balance commitment, the amount
-/// commitment, and the block-1 commitment to the claimed values.
-///
-/// Prover and verifier derive it identically, so neither transmits it.
-fn derive_theta(input: &BalanceCommitment, amount: &BalanceCommitment, c_ci_1: &G1) -> Fr {
-    let mut transcript = IOPTranscript::<Fr>::new(THETA_DOMAIN);
-    let _ = transcript.append_serializable_element(b"com_sender", &input.point);
-    let _ = transcript.append_serializable_element(b"com_amount", &amount.point);
-    let _ = transcript.append_serializable_element(b"c_ci_1", c_ci_1);
-    transcript
-        .get_and_append_challenge(b"theta")
-        .expect("transcript challenge")
-}
-
-/// The aggregate commitment the verifier recomputes:
-/// `com_theta = com_amount + theta * com_remaining`, with
-/// `com_remaining = input - amount`.
-fn aggregate_commitment(input: &BalanceCommitment, amount: &BalanceCommitment, theta: Fr) -> G1 {
-    let com_remaining = input.sub(amount);
-    <E as Pairing>::G1::msm_unchecked(&[amount.point, com_remaining.point], &[Fr::ONE, theta])
-        .into_affine()
-}
-
-/// One batched ZK-Pari proof: `C_ci_1` plus `(T, U, v_a)` = `3 G1 + 1 F`
-/// (176 bytes). `com_theta` (block 2) is recomputed by the verifier and never
-/// transmitted.
-///
-/// Range-checks both the transferred amount and the sender's remaining balance
-/// in a single proof; see the module docs.
+/// A single range proof in its wire form: `(T, U)` uncompressed plus the
+/// scalar `v_a`. Stored as raw bytes so the chain-facing proof types stay
+/// `Copy`, `Hash`, `Arbitrary`, and codec-trivial; group elements are decoded
+/// and validated only at verification time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-struct BatchedProof {
-    c_ci_1: [u8; G1_BYTES],
-    t_g: [u8; G1_BYTES],
-    u_g: [u8; G1_BYTES],
+struct RangeProofBytes {
+    t_g: [u8; G1_UNCOMPRESSED_BYTES],
+    u_g: [u8; G1_UNCOMPRESSED_BYTES],
     v_a: [u8; FR_BYTES],
 }
 
-impl BatchedProof {
-    const SIZE: usize = G1_BYTES + G1_BYTES + G1_BYTES + FR_BYTES;
+impl RangeProofBytes {
+    const SIZE: usize = RANGE_PROOF_BYTES;
 
-    fn from_proof(proof: &Proof<E>) -> Self {
+    fn from_proof(proof: &RangeProof<E>) -> Self {
         let mut v_a = [0u8; FR_BYTES];
         proof
             .v_a
             .serialize_compressed(&mut v_a[..])
-            .expect("Fr fits 32 bytes");
+            .expect("Fr fits its encoding");
         Self {
-            c_ci_1: g1_to_bytes(&proof.c_ci[0]),
-            t_g: g1_to_bytes(&proof.t_g),
-            u_g: g1_to_bytes(&proof.u_g),
+            t_g: g1_to_uncompressed(&proof.t_g),
+            u_g: g1_to_uncompressed(&proof.u_g),
             v_a,
         }
     }
 
-    /// Honestly proves a one-recipient batched transfer.
-    ///
-    /// `amount_com` is the published amount commitment (opening `r_amount`);
-    /// `remaining`/`r_rem` describe the sender's balance afterwards.
-    fn prove(
-        input: &BalanceCommitment,
-        amount: u64,
-        amount_com: &BalanceCommitment,
-        r_amount: &CommittedInputOpening<Fr>,
-        remaining: u64,
-        r_rem: &CommittedInputOpening<Fr>,
-        rng: &mut impl RngCore,
-    ) -> Self {
-        let rho_1 = CommittedInputOpening::<Fr>::rand(rng);
-        let c_ci_1 = proving_key().pedersen_commit(0, &claimed_values(amount, remaining), &rho_1);
-        let theta = derive_theta(input, amount_com, &c_ci_1);
-        let rho_2 = CommittedInputOpening {
-            rho: r_amount.rho + theta * r_rem.rho,
+    /// Decodes and validates the proof's group elements, returning a
+    /// verification claim bound to `commitment`. `None` on bad encoding.
+    fn to_claim(self, commitment: G1) -> Option<(Proof<E>, Vec<Fr>)> {
+        let range = RangeProof::<E> {
+            t_g: g1_from_uncompressed(&self.t_g)?,
+            u_g: g1_from_uncompressed(&self.u_g)?,
+            v_a: Fr::deserialize_compressed(&self.v_a[..]).ok()?,
         };
-        let proof = ZkPari::<E>::prove_with_openings(
-            BatchedRangeCircuit {
-                theta: Some(theta),
-                amounts: Some(vec![amount]),
-                remaining: Some(remaining),
-                batch_size: BATCH_SIZE,
-            },
-            proving_key(),
-            &[rho_1, rho_2],
-            rng,
-        )
-        .expect("batched range proof synthesis cannot fail for in-range values");
-        Self::from_proof(&proof)
+        Some(range.to_claim(commitment))
     }
 
-    /// Forges an accepting batched transcript via the HVZK simulator, using the
-    /// setup trapdoor instead of a witness.
-    ///
-    /// This is **not** a proof of range validity: it exists for load
-    /// generation, where honestly proving every transfer (circuit synthesis +
-    /// MSMs) would dwarf the cost being measured. The block-1 commitment is
-    /// formed honestly (one cheap Pedersen commit) so the transcript is
-    /// distributed like a real one; only the expensive proof body is forged.
-    /// Relies on the demo CRS trapdoor and must never gate real value.
-    fn simulate(
-        input: &BalanceCommitment,
-        amount: u64,
-        amount_com: &BalanceCommitment,
-        remaining: u64,
-        rng: &mut impl RngCore,
-    ) -> Self {
-        let rho_1 = CommittedInputOpening::<Fr>::rand(rng);
-        let c_ci_1 = proving_key().pedersen_commit(0, &claimed_values(amount, remaining), &rho_1);
-        let theta = derive_theta(input, amount_com, &c_ci_1);
-        let com_theta = aggregate_commitment(input, amount_com, theta);
-        let proof = ZkPari::<E>::simulate(&crs().2, &crs().1, &[c_ci_1, com_theta], &[theta], rng);
-        Self::from_proof(&proof)
-    }
-
-    /// Reconstructs the full ZK-Pari proof and its public input `[theta]` from
-    /// the transmitted material plus the declared commitments. Returns `None`
-    /// if a group element fails to decode.
-    fn to_verification(
-        self,
-        input: &BalanceCommitment,
-        amount: &BalanceCommitment,
-    ) -> Option<(Proof<E>, Vec<Fr>)> {
-        let c_ci_1 = g1_from_bytes(&self.c_ci_1)?;
-        let t_g = g1_from_bytes(&self.t_g)?;
-        let u_g = g1_from_bytes(&self.u_g)?;
-        let v_a = Fr::deserialize_compressed(&self.v_a[..]).ok()?;
-        let theta = derive_theta(input, amount, &c_ci_1);
-        let com_theta = aggregate_commitment(input, amount, theta);
-        Some((
-            Proof::<E> {
-                c_ci: vec![c_ci_1, com_theta],
-                t_g,
-                u_g,
-                v_a,
-            },
-            vec![theta],
-        ))
-    }
-
-    fn verify(&self, input: &BalanceCommitment, amount: &BalanceCommitment) -> bool {
-        self.to_verification(input, amount)
-            .is_some_and(|(proof, public_input)| {
-                ZkPari::<E>::verify(&proof, &crs().1, &public_input)
-            })
-    }
-}
-
-impl Write for BatchedProof {
     fn write(&self, buf: &mut impl BufMut) {
-        buf.put_slice(&self.c_ci_1);
         buf.put_slice(&self.t_g);
         buf.put_slice(&self.u_g);
         buf.put_slice(&self.v_a);
     }
-}
 
-impl Read for BatchedProof {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        // Group elements are validated lazily at verification time, keeping
-        // decode cheap; a malformed proof simply fails to verify.
+    fn read(buf: &mut impl Buf) -> Result<Self, CodecError> {
         Ok(Self {
-            c_ci_1: read_array::<G1_BYTES>(buf)?,
-            t_g: read_array::<G1_BYTES>(buf)?,
-            u_g: read_array::<G1_BYTES>(buf)?,
+            t_g: read_array::<G1_UNCOMPRESSED_BYTES>(buf)?,
+            u_g: read_array::<G1_UNCOMPRESSED_BYTES>(buf)?,
             v_a: read_array::<FR_BYTES>(buf)?,
         })
     }
 }
 
-/// The block-1 claimed values `[amount, remaining]` as field elements.
-fn claimed_values(amount: u64, remaining: u64) -> [Fr; BATCH_SIZE + 1] {
-    [Fr::from(amount), Fr::from(remaining)]
+/// Proves `commitment = commit_with(value, opening)` opens to a 64-bit value.
+fn prove_range(
+    value: u64,
+    opening: &CommittedInputOpening<Fr>,
+    rng: &mut impl RngCore,
+) -> RangeProofBytes {
+    RangeProofBytes::from_proof(&RangeProof::prove(params(), value, opening, rng))
 }
 
-/// Proof attached to a private transfer: one batched ZK-Pari proof
-/// (`3 G1 + 1 F`, 176 bytes) range-checking the transferred amount and the
-/// sender's remaining balance together.
+/// Forges a range proof for `commitment` from the setup trapdoor (HVZK
+/// simulation). Attests no range validity; load generation only.
+fn simulate_range(commitment: &BalanceCommitment, rng: &mut impl RngCore) -> RangeProofBytes {
+    RangeProofBytes::from_proof(&RangeProof::simulate(params(), commitment.point(), rng))
+}
+
+// ---------------------------------------------------------------------------
+// Transfer / burn proofs
+// ---------------------------------------------------------------------------
+
+/// Proof attached to a private transfer: two single-value range proofs (the
+/// transferred amount and the sender's remaining balance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-pub struct TransferProof(BatchedProof);
+pub struct TransferProof {
+    amount: RangeProofBytes,
+    remaining: RangeProofBytes,
+}
 
 impl TransferProof {
     /// Verifies the transfer proof against the sender's declared input
     /// commitment and the published amount commitment.
     pub fn verify_transfer(&self, input: &BalanceCommitment, amount: &BalanceCommitment) -> bool {
-        self.0.verify(input, amount)
+        verify_proofs_batch(&[ProofClaim::Transfer {
+            input: *input,
+            amount: *amount,
+            proof: *self,
+        }])
     }
 }
 
 impl FixedSize for TransferProof {
-    const SIZE: usize = BatchedProof::SIZE;
+    const SIZE: usize = 2 * RangeProofBytes::SIZE;
 }
 
 impl Write for TransferProof {
     fn write(&self, buf: &mut impl BufMut) {
-        self.0.write(buf);
+        self.amount.write(buf);
+        self.remaining.write(buf);
     }
 }
 
@@ -613,32 +370,40 @@ impl Read for TransferProof {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self(BatchedProof::read_cfg(buf, &())?))
+        Ok(Self {
+            amount: RangeProofBytes::read(buf)?,
+            remaining: RangeProofBytes::read(buf)?,
+        })
     }
 }
 
-/// Proof attached to a burn. A burn is a transfer to a public sink: its
-/// "amount" is the publicly recomputable `commit(value)`, so it reuses the
-/// same batched proof (176 bytes) to range-check the remaining balance.
+/// Proof attached to a burn: one range proof for the sender's remaining
+/// private balance (the amount is the public `commit(value)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-pub struct BurnProof(BatchedProof);
+pub struct BurnProof {
+    remaining: RangeProofBytes,
+}
 
 impl BurnProof {
-    /// Verifies the burn proof against `input` and the public withdrawn
-    /// `value`, whose commitment `commit(value)` plays the role of the amount.
+    /// Verifies the burn proof against the sender's declared input commitment
+    /// and the public burned value.
     pub fn verify_burn(&self, input: &BalanceCommitment, value: u64) -> bool {
-        self.0.verify(input, &BalanceCommitment::commit(value))
+        verify_proofs_batch(&[ProofClaim::Burn {
+            input: *input,
+            value,
+            proof: *self,
+        }])
     }
 }
 
 impl FixedSize for BurnProof {
-    const SIZE: usize = BatchedProof::SIZE;
+    const SIZE: usize = RangeProofBytes::SIZE;
 }
 
 impl Write for BurnProof {
     fn write(&self, buf: &mut impl BufMut) {
-        self.0.write(buf);
+        self.remaining.write(buf);
     }
 }
 
@@ -646,7 +411,9 @@ impl Read for BurnProof {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self(BatchedProof::read_cfg(buf, &())?))
+        Ok(Self {
+            remaining: RangeProofBytes::read(buf)?,
+        })
     }
 }
 
@@ -654,14 +421,14 @@ impl Read for BurnProof {
 // Batch verification
 // ---------------------------------------------------------------------------
 
-/// A single proof to verify, paired with the public commitments it must bind
-/// to.
+/// A single transaction's proof obligation, paired with the public
+/// commitments it must bind to.
 ///
 /// Collect one per private-side transaction in a block and hand them to
-/// [`verify_proofs_batch`], which checks them all in a single
+/// [`verify_proofs_batch`], which checks every range proof in a single
 /// random-linear-combination pairing equation.
 // The transfer variant carries two range proofs; boxing to equalize variant
-// size would only add allocations to a short-lived, by-value verification type.
+// size would only add allocations to a short-lived, by-value type.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum ProofClaim {
@@ -673,7 +440,7 @@ pub enum ProofClaim {
         input: BalanceCommitment,
         /// The published amount commitment.
         amount: BalanceCommitment,
-        /// The transfer's range proofs.
+        /// The transfer's two range proofs.
         proof: TransferProof,
     },
     /// A burn: the remaining proof binds to `input - commit(value)`.
@@ -688,43 +455,57 @@ pub enum ProofClaim {
 }
 
 impl ProofClaim {
-    /// Appends this claim's reconstructed ZK-Pari proof (one batched proof,
-    /// with public input `[theta]`) to `out`. Returns `false` if the proof's
-    /// group elements fail to decode.
+    /// Decodes this claim's range proof(s) and appends one verification claim
+    /// per proof to `out`. Returns `false` on a bad group-element encoding.
     fn collect_into(&self, out: &mut Vec<(Proof<E>, Vec<Fr>)>) -> bool {
-        let verification = match self {
+        match self {
             Self::Transfer {
                 input,
                 amount,
                 proof,
-            } => proof.0.to_verification(input, amount),
+            } => {
+                let remaining_commitment = input.sub(amount).point();
+                let Some(amount_claim) = proof.amount.to_claim(amount.point()) else {
+                    return false;
+                };
+                let Some(remaining_claim) = proof.remaining.to_claim(remaining_commitment) else {
+                    return false;
+                };
+                out.push(amount_claim);
+                out.push(remaining_claim);
+                true
+            }
             Self::Burn {
                 input,
                 value,
                 proof,
-            } => proof
-                .0
-                .to_verification(input, &BalanceCommitment::commit(*value)),
-        };
-        verification.is_some_and(|verification| {
-            out.push(verification);
-            true
-        })
+            } => {
+                let amount = BalanceCommitment::commit(*value);
+                let remaining_commitment = input.sub(&amount).point();
+                let Some(remaining_claim) = proof.remaining.to_claim(remaining_commitment) else {
+                    return false;
+                };
+                out.push(remaining_claim);
+                true
+            }
+        }
     }
 }
 
 /// Verifies every proof in `claims` with a single batched pairing check.
 ///
-/// Each transfer and burn contributes one batched ZK-Pari proof; all are
-/// folded into one `batch_verify` (a random linear combination, replacing
-/// per-proof pairings with one 128-bit MSM per proof element). Returns `true`
-/// iff every proof verifies. An empty slice trivially passes.
+/// Each transfer contributes two range-proof claims (amount and remaining);
+/// each burn contributes one. All are folded into one
+/// [`ZkPari::batch_verify`] — a random linear combination that replaces
+/// per-proof pairings with a handful of size-`n` MSMs and one final pairing
+/// product. Returns `true` iff every proof verifies. An empty slice trivially
+/// passes.
 ///
 /// The batched check is all-or-nothing: it does not identify which claim
 /// failed. Callers that must isolate a culprit (e.g. a proposer filtering its
 /// mempool) should re-check failing batches one claim at a time.
 pub fn verify_proofs_batch(claims: &[ProofClaim]) -> bool {
-    let mut proofs_and_inputs: Vec<(Proof<E>, Vec<Fr>)> = Vec::with_capacity(claims.len());
+    let mut proofs_and_inputs: Vec<(Proof<E>, Vec<Fr>)> = Vec::with_capacity(claims.len() * 2);
     for claim in claims {
         if !claim.collect_into(&mut proofs_and_inputs) {
             return false;
@@ -736,7 +517,7 @@ pub fn verify_proofs_batch(claims: &[ProofClaim]) -> bool {
     // Batch-verification randomness must be unpredictable to proof submitters;
     // each verifier samples its own from OS entropy. A valid batch verifies
     // for any randomness, so this does not affect determinism.
-    ZkPari::<E>::batch_verify(&proofs_and_inputs, &crs().1, &mut OsRng)
+    ZkPari::<E>::batch_verify(&proofs_and_inputs, &params().vk, &mut OsRng)
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +543,6 @@ pub struct PrivateBalance {
 /// [`TransferPlan::prove`] calls run in parallel.
 #[derive(Debug, Clone)]
 pub struct TransferPlan {
-    input: BalanceCommitment,
     amount: u64,
     remaining: u64,
     delta_opening: CommittedInputOpening<Fr>,
@@ -782,30 +562,26 @@ impl TransferPlan {
         &self.delta_opening
     }
 
-    /// Produces the single batched transfer proof.
+    /// Produces the transfer proof (amount and remaining range proofs).
     pub fn prove(&self, rng: &mut impl RngCore) -> TransferProof {
-        TransferProof(BatchedProof::prove(
-            &self.input,
-            self.amount,
-            &self.amount_commitment(),
-            &self.delta_opening,
-            self.remaining,
-            &self.remaining_opening,
-            rng,
-        ))
+        TransferProof {
+            amount: prove_range(self.amount, &self.delta_opening, rng),
+            remaining: prove_range(self.remaining, &self.remaining_opening, rng),
+        }
     }
 
     /// Produces a simulated transfer proof, binding to the same commitments as
     /// [`Self::prove`] but forged from the setup trapdoor via the HVZK
     /// simulator instead of a witness. For load generation only.
     pub fn simulate(&self, rng: &mut impl RngCore) -> TransferProof {
-        TransferProof(BatchedProof::simulate(
-            &self.input,
-            self.amount,
-            &self.amount_commitment(),
-            self.remaining,
-            rng,
-        ))
+        // The remaining commitment `commit_with(remaining, remaining_opening)`
+        // equals what the verifier reconstructs as `input - amount` (the
+        // openings are pinned so the homomorphism holds).
+        let remaining_com = BalanceCommitment::commit_with(self.remaining, &self.remaining_opening);
+        TransferProof {
+            amount: simulate_range(&self.amount_commitment(), rng),
+            remaining: simulate_range(&remaining_com, rng),
+        }
     }
 }
 
@@ -843,12 +619,10 @@ impl PrivateBalance {
     /// (the remaining-balance range proof would be unsatisfiable).
     pub fn plan_transfer(&mut self, amount: u64, rng: &mut impl RngCore) -> Option<TransferPlan> {
         let remaining = self.value.checked_sub(amount)?;
-        let input = self.commitment();
         let delta_opening = CommittedInputOpening::rand(rng);
         let remaining_opening = &self.opening - &delta_opening;
 
         let plan = TransferPlan {
-            input,
             amount,
             remaining,
             delta_opening,
@@ -870,9 +644,8 @@ impl PrivateBalance {
     }
 
     /// Like [`Self::transfer`], but forges the proof from the setup trapdoor
-    /// via the HVZK simulator instead of proving a witness. The published
-    /// commitments are identical and real; only the range proof is simulated,
-    /// so it attests no range validity. For load generation only.
+    /// via the HVZK simulator instead of proving a witness. For load
+    /// generation only.
     pub fn simulate_transfer(
         &mut self,
         amount: u64,
@@ -882,25 +655,17 @@ impl PrivateBalance {
         Some((plan.amount_commitment(), plan.simulate(rng)))
     }
 
-    /// Burns `value` back to the public balance, proving the remaining
-    /// private balance is non-negative. A burn is a transfer to a public sink:
-    /// the "amount" is the public `commit(value)` (zero opening), so the
-    /// opening of the remaining balance is unchanged.
+    /// Burns `value` back to the public balance, proving the remaining private
+    /// balance is non-negative. A burn is a transfer to a public sink: the
+    /// "amount" is the public `commit(value)` (zero opening), so the opening
+    /// of the remaining balance is unchanged.
     pub fn burn(&mut self, value: u64, rng: &mut impl RngCore) -> Option<BurnProof> {
         let remaining = self.value.checked_sub(value)?;
-        let input = self.commitment();
-        let amount_com = BalanceCommitment::commit(value);
-        let proof = BatchedProof::prove(
-            &input,
-            value,
-            &amount_com,
-            &CommittedInputOpening::zero(),
-            remaining,
-            &self.opening,
-            rng,
-        );
+        let proof = BurnProof {
+            remaining: prove_range(remaining, &self.opening, rng),
+        };
         self.value = remaining;
-        Some(BurnProof(proof))
+        Some(proof)
     }
 
     /// Like [`Self::burn`], but forges the proof from the setup trapdoor via
@@ -910,9 +675,12 @@ impl PrivateBalance {
         let remaining = self.value.checked_sub(value)?;
         let input = self.commitment();
         let amount_com = BalanceCommitment::commit(value);
-        let proof = BatchedProof::simulate(&input, value, &amount_com, remaining, rng);
+        let remaining_com = input.sub(&amount_com);
+        let proof = BurnProof {
+            remaining: simulate_range(&remaining_com, rng),
+        };
         self.value = remaining;
-        Some(BurnProof(proof))
+        Some(proof)
     }
 
     /// Mirrors an incoming payment: the recipient learns `(amount, opening)`
@@ -931,6 +699,13 @@ mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, Encode};
     use commonware_utils::test_rng;
+
+    #[test]
+    fn encoded_sizes_match_bn254() {
+        assert_eq!(BalanceCommitment::SIZE, 64);
+        assert_eq!(TransferProof::SIZE, 320);
+        assert_eq!(BurnProof::SIZE, 160);
+    }
 
     #[test]
     fn commitment_codec_roundtrip() {
@@ -954,7 +729,6 @@ mod tests {
 
     #[test]
     fn commitments_are_homomorphic() {
-        // commit(a) + commit(b) == commit(a + b) with zero openings.
         let a = BalanceCommitment::commit(30);
         let b = BalanceCommitment::commit(12);
         assert_eq!(a.add(&b), BalanceCommitment::commit(42));
@@ -1022,8 +796,6 @@ mod tests {
         let plan = plan_input.plan_transfer(25, &mut rng).expect("in range");
         let amount_com = plan.amount_commitment();
 
-        // The on-chain pending slot accumulates the amount commitment; the
-        // recipient folds in (amount, opening) learned out of band.
         let mut pending = PrivateBalance::empty();
         pending.receive(25, plan.amount_opening());
         assert_eq!(
@@ -1075,25 +847,63 @@ mod tests {
         assert!(!burn.verify_burn(&burn_input, 11));
     }
 
+    /// The batched check must bind every claim to its declared commitments:
+    /// tampering with any claim's amount, value, or input — or swapping inputs
+    /// between claims — must reject the whole batch.
     #[test]
-    fn batched_proof_is_three_g1_plus_one_field() {
-        // One batched proof per transfer/burn: 3 G1 + 1 F = 176 bytes,
-        // replacing the naive two range proofs (256 bytes) for transfers.
-        assert_eq!(TransferProof::SIZE, 3 * G1_BYTES + FR_BYTES);
-        assert_eq!(BurnProof::SIZE, 3 * G1_BYTES + FR_BYTES);
-        assert_eq!(TransferProof::SIZE, 176);
-    }
+    fn batch_verification_binds_claims_to_commitments() {
+        let mut rng = test_rng();
 
-    #[test]
-    fn garbage_proof_fails_verification_without_panicking() {
-        let proof = TransferProof(BatchedProof {
-            c_ci_1: [3u8; G1_BYTES],
-            t_g: [7u8; G1_BYTES],
-            u_g: [7u8; G1_BYTES],
-            v_a: [9u8; FR_BYTES],
+        let mut claims = Vec::new();
+        for value in [10u64, 20, 30] {
+            let mut balance = PrivateBalance::empty();
+            balance.fund(value * 2);
+            let input = balance.commitment();
+            let (amount, proof) = balance.transfer(value, &mut rng).expect("in range");
+            claims.push(ProofClaim::Transfer {
+                input,
+                amount,
+                proof,
+            });
+        }
+        let mut balance = PrivateBalance::empty();
+        balance.fund(40);
+        let burn_input = balance.commitment();
+        let burn = balance.burn(15, &mut rng).expect("in range");
+        claims.push(ProofClaim::Burn {
+            input: burn_input,
+            value: 15,
+            proof: burn,
         });
-        assert!(
-            !proof.verify_transfer(&BalanceCommitment::commit(1), &BalanceCommitment::commit(1))
-        );
+
+        assert!(verify_proofs_batch(&claims));
+        assert!(verify_proofs_batch(&claims[..1]));
+
+        for index in 0..claims.len() {
+            let mut tampered = claims.clone();
+            match &mut tampered[index] {
+                ProofClaim::Transfer { amount, .. } => {
+                    *amount = amount.add(&BalanceCommitment::commit(1));
+                }
+                ProofClaim::Burn { value, .. } => *value += 1,
+            }
+            assert!(!verify_proofs_batch(&tampered), "tampered claim {index}");
+        }
+
+        let mut swapped = claims.clone();
+        let (first_input, second_input) = match (&claims[0], &claims[1]) {
+            (
+                ProofClaim::Transfer { input: first, .. },
+                ProofClaim::Transfer { input: second, .. },
+            ) => (*first, *second),
+            _ => unreachable!("first two claims are transfers"),
+        };
+        if let ProofClaim::Transfer { input, .. } = &mut swapped[0] {
+            *input = second_input;
+        }
+        if let ProofClaim::Transfer { input, .. } = &mut swapped[1] {
+            *input = first_input;
+        }
+        assert!(!verify_proofs_batch(&swapped), "swapped inputs");
     }
 }

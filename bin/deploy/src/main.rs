@@ -56,7 +56,6 @@ const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
-const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,8 +118,9 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
-    /// Number of rayon threads for spammer parallel signing.
-    #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
+    /// Number of rayon threads for spammer parallel signing (defaults to half
+    /// the machine's cores, leaving headroom for co-located validators).
+    #[arg(long, default_value_t = default_spammer_rayon_threads())]
     spammer_rayon_threads: usize,
     /// Fractional account-count jitter per spammer batch.
     ///
@@ -402,8 +402,18 @@ const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
 }
 
-const fn default_spammer_rayon_threads() -> usize {
-    DEFAULT_SPAMMER_RAYON_THREADS
+/// Default rayon threads for the generated spammer.
+///
+/// Signing is the spammer's throughput bottleneck, so this scales with the
+/// machine — but for the `local` target the spammer is co-located with the
+/// validators, secondaries, and indexers, so it takes only half the cores
+/// (floor 2) to leave headroom for consensus. Override with
+/// `--spammer-rayon-threads`.
+pub(crate) fn default_spammer_rayon_threads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (cores / 2).max(2)
 }
 
 fn main() {

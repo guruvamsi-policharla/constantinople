@@ -2,7 +2,7 @@ use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use constantinople_application::executor::{self, State};
 use constantinople_primitives::{
-    Account, AccountKey, Transaction, TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, PrivateBalance, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -14,6 +14,9 @@ type TestTransaction = VerifiedTransaction<TestHasher>;
 
 const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
+
+/// Private fixtures simulate one proof per transaction, so cap the size.
+const PRIVATE_TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192];
 
 fn executor(c: &mut Criterion) {
     let mut group = c.benchmark_group("executor");
@@ -42,6 +45,99 @@ fn executor(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+/// Measures `executor::execute` over all-private-transfer blocks: the
+/// per-transaction commitment arithmetic (add/sub on BLS12-381 G1) plus the
+/// usual bookkeeping. Proof verification is NOT included here — blocks check
+/// every ZK proof in one batched pairing (`executor::verify_proofs`), which
+/// the `privacy/verify/batch` bench in `constantinople-primitives` measures.
+fn executor_private(c: &mut Criterion) {
+    let mut group = c.benchmark_group("executor");
+
+    for &transaction_count in PRIVATE_TRANSACTION_COUNTS {
+        group.throughput(Throughput::Elements(transaction_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("execution_private", transaction_count),
+            &transaction_count,
+            |bencher, &transaction_count| {
+                let (state, transactions) = build_private_fixture(transaction_count);
+                let transfers = transactions
+                    .iter()
+                    .map(executor::prepare_transfer)
+                    .collect::<Option<Vec<_>>>()
+                    .expect("bench transactions should prepare");
+                bencher.iter(|| {
+                    black_box(
+                        executor::execute(black_box(&state), black_box(&transfers))
+                            .expect("bench transfers should execute")
+                            .len(),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn build_private_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
+    let mut accounts = State::new();
+    let mut transactions = Vec::with_capacity(transaction_count);
+
+    for index in 0..transaction_count {
+        let signer = TestSigner::new(index as u64);
+        let recipient = TestSigner::new(index as u64 + transaction_count as u64).public_key;
+        let sender_public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
+        let recipient_public_key = TransactionPublicKey::ed25519(recipient);
+
+        // Sender holds a funded private balance; the transaction spends part
+        // of it with a simulated (setup-trapdoor) proof, exactly what the
+        // executor sees from the spammer.
+        let mut rng = StdRng::seed_from_u64(index as u64);
+        let amount = 1 + (index as u64 % 7);
+        let mut balance = PrivateBalance::empty();
+        balance.fund(amount * 8);
+        let input = balance.commitment();
+        let plan = balance
+            .plan_transfer(amount, &mut rng)
+            .expect("funded balance covers the transfer");
+        let amount_commitment = plan.amount_commitment();
+        let proof = plan.simulate(&mut rng);
+
+        accounts.insert(
+            AccountKey::from_public_key(&sender_public_key),
+            Account {
+                private: input,
+                ..Account::default()
+            },
+        );
+        accounts.insert(
+            AccountKey::from_public_key(&recipient_public_key),
+            Account::default(),
+        );
+        let transaction = Transaction::private_transfer(
+            sender_public_key,
+            AccountKey::from_public_key(&recipient_public_key),
+            input,
+            amount_commitment,
+            proof,
+            0,
+        );
+        transactions.push(transaction.seal_and_sign(
+            &signer.key,
+            NAMESPACE,
+            &mut TestHasher::default(),
+        ));
+    }
+
+    let valid = executor::propose(&accounts, transactions).valid;
+    assert_eq!(
+        valid.len(),
+        transaction_count,
+        "fixture must be fully valid"
+    );
+    (accounts, valid)
 }
 
 fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
@@ -97,6 +193,6 @@ impl TestSigner {
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = executor
+    targets = executor, executor_private
 }
 criterion_main!(benches);

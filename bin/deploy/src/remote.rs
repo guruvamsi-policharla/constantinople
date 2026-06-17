@@ -506,7 +506,7 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
-            spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
+            spammer_rayon_threads: crate::default_spammer_rayon_threads(),
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_private: false,
@@ -664,7 +664,10 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
-        assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
+        assert_eq!(
+            relayed.rayon_threads,
+            crate::default_spammer_rayon_threads()
+        );
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES

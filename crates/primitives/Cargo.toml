@@ -23,7 +23,7 @@ commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 
 # Privacy (ZK-Pari private transfers)
 zkpari.workspace = true
-ark-bls12-381.workspace = true
+ark-bn254.workspace = true
 ark-ec.workspace = true
 ark-ff.workspace = true
 ark-serialize.workspace = true
@@ -50,6 +50,11 @@ commonware-cryptography = { workspace = true, features = ["arbitrary"] }
 # Other
 rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"] }
+criterion.workspace = true
+
+[[bench]]
+name = "privacy"
+harness = false
 
 [features]
 arbitrary = [
