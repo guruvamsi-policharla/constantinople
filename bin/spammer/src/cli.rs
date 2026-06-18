@@ -1,5 +1,6 @@
 //! CLI definition.
 
+use crate::config::{PrivateProofMode, Workload};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Parser)]
@@ -41,6 +42,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 1000)]
     pub seed_offset: u64,
 
+    /// Number of async runtime worker threads.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKER_THREADS)]
+    pub worker_threads: usize,
+
     /// Number of rayon threads for parallel signing.
     #[arg(long, default_value_t = crate::config::DEFAULT_RAYON_THREADS)]
     pub rayon_threads: usize,
@@ -51,6 +56,20 @@ pub struct Cli {
     /// batch. Must be in `0..=1`.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
+
+    /// Transaction workload to submit.
+    #[arg(long, value_enum, default_value_t = Workload::Public)]
+    pub workload: Workload,
+
+    /// Independent private global-ring groups per relayer submitter.
+    ///
+    /// Only used for private workload. `--accounts` is the size of each group.
+    #[arg(long, default_value_t = crate::config::DEFAULT_PRIVATE_GROUPS)]
+    pub private_groups: usize,
+
+    /// Private transfer proof generation mode.
+    #[arg(long, value_enum, default_value_t = PrivateProofMode::Real)]
+    pub private_proof_mode: PrivateProofMode,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
@@ -66,6 +85,7 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::Cli;
+    use crate::config::{PrivateProofMode, Workload};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -86,6 +106,10 @@ mod tests {
         );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
+        assert_eq!(cli.workload, Workload::Public);
+        assert_eq!(cli.private_groups, crate::config::DEFAULT_PRIVATE_GROUPS);
+        assert_eq!(cli.private_proof_mode, PrivateProofMode::Real);
+        assert_eq!(cli.worker_threads, crate::config::DEFAULT_WORKER_THREADS);
     }
 
     #[test]
@@ -142,6 +166,62 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.accounts_jitter, 0.25);
+    }
+
+    #[test]
+    fn parses_worker_threads() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--worker-threads",
+            "6",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.worker_threads, 6);
+    }
+
+    #[test]
+    fn parses_private_workload() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--workload",
+            "private",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.workload, Workload::Private);
+    }
+
+    #[test]
+    fn parses_private_groups() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--private-groups",
+            "4",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.private_groups, 4);
+    }
+
+    #[test]
+    fn parses_private_proof_mode() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--private-proof-mode",
+            "simulated",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.private_proof_mode, PrivateProofMode::Simulated);
     }
 
     #[test]

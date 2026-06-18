@@ -18,10 +18,17 @@ use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
-use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
+use config::{PrivateProofMode, Workload};
+use constantinople_primitives::{ChainPrivatePaymentBackend, DEFAULT_ACCOUNT_BALANCE};
 use core::num::NonZeroU64;
-use signer::{Tx, sign_batch};
+use private_payments::Backend as _;
+use rand::{SeedableRng as _, rngs::StdRng};
+use signer::{
+    PrivateBatchSpec, PrivateBatchState, PrivateSpamState, Tx, apply_private_finalized_batch,
+    sign_batch, sign_private_batch,
+};
 use std::{
+    collections::HashSet,
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
@@ -41,8 +48,12 @@ fn main() {
         relayer_submitters,
         presigned_batches,
         primary_validators,
+        worker_threads,
         rayon_threads,
         accounts_jitter,
+        workload,
+        private_groups,
+        private_proof_mode,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
@@ -62,8 +73,12 @@ fn main() {
             } else {
                 cfg.primary_validators
             },
+            cfg.worker_threads,
             cfg.rayon_threads,
             cfg.accounts_jitter,
+            cfg.workload,
+            cfg.private_groups,
+            cfg.private_proof_mode,
         )
     } else {
         (
@@ -76,8 +91,12 @@ fn main() {
             cli.relayer_submitters.max(1),
             cli.presigned_batches,
             cli.relayer_targets.clone(),
+            cli.worker_threads,
             cli.rayon_threads,
             cli.accounts_jitter,
+            cli.workload,
+            cli.private_groups,
+            cli.private_proof_mode,
         )
     };
     assert!(
@@ -85,6 +104,9 @@ fn main() {
         "--accounts-jitter must be between 0 and 1"
     );
     assert!(presigned_batches > 0, "--presigned-batches must be > 0");
+    assert!(worker_threads > 0, "--worker-threads must be > 0");
+    assert!(rayon_threads > 0, "--rayon-threads must be > 0");
+    assert!(private_groups > 0, "--private-groups must be > 0");
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -93,9 +115,16 @@ fn main() {
         value <= DEFAULT_ACCOUNT_BALANCE,
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
+    assert!(
+        workload != Workload::Private
+            || private_proof_mode != PrivateProofMode::Simulated
+            || ChainPrivatePaymentBackend::SUPPORTS_SIMULATED_TRANSFER,
+        "--private-proof-mode simulated requires building the spammer with --features private-payment-simulator"
+    );
     let value = NonZeroU64::new(value).expect("checked above");
 
-    let runtime_cfg = commonware_runtime::tokio::Config::default();
+    let runtime_cfg =
+        commonware_runtime::tokio::Config::default().with_worker_threads(worker_threads);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -124,6 +153,10 @@ fn main() {
             relayer_submitters,
             presigned_batches,
             relayer_targets: primary_validators,
+            worker_threads,
+            workload,
+            private_groups,
+            private_proof_mode,
         };
         run_relayer_mode(config, strategy).await;
     });
@@ -138,6 +171,10 @@ struct RelayerModeConfig {
     relayer_submitters: usize,
     presigned_batches: usize,
     relayer_targets: Vec<String>,
+    worker_threads: usize,
+    workload: Workload,
+    private_groups: usize,
+    private_proof_mode: PrivateProofMode,
 }
 
 async fn run_relayer_mode(
@@ -153,6 +190,10 @@ async fn run_relayer_mode(
         relayer_submitters,
         presigned_batches,
         relayer_targets,
+        worker_threads,
+        workload,
+        private_groups,
+        private_proof_mode,
     } = config;
 
     info!(
@@ -161,6 +202,10 @@ async fn run_relayer_mode(
         value = value.get(),
         seed_offset,
         accounts_jitter,
+        worker_threads,
+        workload = ?workload,
+        private_proof_mode = ?private_proof_mode,
+        private_groups,
         %relayer_url,
         presigned_batches,
         "starting spammer relayer mode"
@@ -171,19 +216,34 @@ async fn run_relayer_mode(
 
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
-        let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
         let strategy = strategy.clone();
-        let batches = spawn_presigner(
-            strategy,
-            accounts,
-            value,
-            accounts_jitter,
-            account_offset,
-            presigned_batches,
-        );
-        tokio::spawn(submit_presigned_batches(submitter, batches));
+        match workload {
+            Workload::Public => {
+                let accounts = generate_accounts(accounts_count, account_offset);
+                let batches = spawn_presigner(
+                    strategy,
+                    accounts,
+                    value,
+                    accounts_jitter,
+                    account_offset,
+                    presigned_batches,
+                );
+                tokio::spawn(submit_presigned_batches(submitter, batches));
+            }
+            Workload::Private => {
+                let private_config = PrivateGroupConfig {
+                    accounts_count,
+                    value,
+                    seed_offset,
+                    relayer_submitters,
+                    private_groups,
+                    proof_mode: private_proof_mode,
+                };
+                spawn_outcome_aware_private_groups(submitter, index, private_config, strategy);
+            }
+        }
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -253,8 +313,149 @@ async fn submit_presigned_batches(
     mut batches: mpsc::Receiver<Vec<Tx>>,
 ) {
     while let Some(batch) = batches.recv().await {
-        submitter.submit(batch).await;
+        let _ = submitter.submit(batch).await;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrivateGroupConfig {
+    accounts_count: u32,
+    value: NonZeroU64,
+    seed_offset: u64,
+    relayer_submitters: usize,
+    private_groups: usize,
+    proof_mode: PrivateProofMode,
+}
+
+fn spawn_outcome_aware_private_groups(
+    submitter: RelayerSubmitter,
+    submitter_index: usize,
+    config: PrivateGroupConfig,
+    strategy: impl commonware_parallel::Strategy + 'static,
+) {
+    for group_index in 0..config.private_groups {
+        let account_offset = private_group_account_offset(
+            config.seed_offset,
+            config.accounts_count,
+            config.relayer_submitters,
+            config.private_groups,
+            submitter_index,
+            group_index,
+        );
+        let accounts = generate_accounts(config.accounts_count, account_offset);
+        tokio::spawn(submit_outcome_aware_private_group(
+            submitter.clone(),
+            accounts,
+            config.value,
+            group_index,
+            account_offset,
+            config.proof_mode,
+            strategy.clone(),
+        ));
+    }
+}
+
+async fn submit_outcome_aware_private_group<St>(
+    submitter: RelayerSubmitter,
+    accounts: Vec<SpamAccount>,
+    value: NonZeroU64,
+    group_index: usize,
+    proof_seed: u64,
+    private_proof_mode: PrivateProofMode,
+    strategy: St,
+) where
+    St: commonware_parallel::Strategy + Send + 'static,
+{
+    let accounts = Arc::new(accounts);
+    let mut nonces = vec![0; accounts.len()];
+    let mut states = vec![PrivateSpamState::default(); accounts.len()];
+    let mut cursor = group_index % accounts.len();
+    let mut proof_rng = StdRng::seed_from_u64(proof_seed ^ 0xD1B5_4A32_D192_ED03);
+    loop {
+        let accounts_for_signer = accounts.clone();
+        let strategy_for_signer = strategy.clone();
+        let candidate_nonces = nonces.clone();
+        let candidate_states = states.clone();
+        let candidate_cursor = cursor;
+        let proof_rng_for_signer = proof_rng;
+        let (batch, candidate_nonces, candidate_states, candidate_cursor, returned_proof_rng) =
+            tokio::task::spawn_blocking(move || {
+                let mut candidate_nonces = candidate_nonces;
+                let mut candidate_states = candidate_states;
+                let mut candidate_cursor = candidate_cursor;
+                let mut proof_rng = proof_rng_for_signer;
+                let batch = sign_private_batch(
+                    &strategy_for_signer,
+                    accounts_for_signer.as_slice(),
+                    value,
+                    PrivateBatchState {
+                        nonces: &mut candidate_nonces,
+                        states: &mut candidate_states,
+                        cursor: &mut candidate_cursor,
+                    },
+                    PrivateBatchSpec {
+                        count: accounts_for_signer.len(),
+                        proof_mode: private_proof_mode,
+                    },
+                    &mut proof_rng,
+                );
+                (
+                    batch,
+                    candidate_nonces,
+                    candidate_states,
+                    candidate_cursor,
+                    proof_rng,
+                )
+            })
+            .await
+            .expect("private signing task panicked");
+        proof_rng = returned_proof_rng;
+        if batch.txs.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+        let outcome = submitter.submit(batch.txs.clone()).await;
+        if outcome.is_fully_finalized() {
+            nonces = candidate_nonces;
+            states = candidate_states;
+            cursor = candidate_cursor;
+            continue;
+        }
+
+        let included = outcome.included().iter().cloned().collect::<HashSet<_>>();
+        if included.is_empty() {
+            continue;
+        }
+
+        let _ = apply_private_finalized_batch(value, &mut nonces, &mut states, &batch, &included);
+    }
+}
+
+fn private_group_account_offset(
+    seed_offset: u64,
+    accounts_count: u32,
+    relayer_submitters: usize,
+    private_groups: usize,
+    submitter_index: usize,
+    group_index: usize,
+) -> u64 {
+    let group_number = submitter_index
+        .checked_mul(private_groups)
+        .and_then(|base| base.checked_add(group_index))
+        .expect("private spammer group index overflow");
+    let total_groups = relayer_submitters
+        .checked_mul(private_groups)
+        .expect("private spammer group count overflow");
+    assert!(
+        group_number < total_groups,
+        "private spammer group index out of range"
+    );
+    let group_delta = u64::from(accounts_count)
+        .checked_mul(group_number as u64)
+        .expect("private spammer account offset overflow");
+    seed_offset
+        .checked_add(group_delta)
+        .expect("private spammer account offset overflow")
 }
 
 fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
@@ -317,7 +518,8 @@ impl JitterRng {
 #[cfg(test)]
 mod tests {
     use super::{
-        JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for, spawn_presigner,
+        JitterRng, jittered_batch_size, max_extra_accounts, private_group_account_offset,
+        relayer_target_for, spawn_presigner,
     };
     use crate::accounts::generate_accounts;
     use commonware_parallel::Sequential;
@@ -420,6 +622,15 @@ mod tests {
 
         let second = batches.recv().await.expect("second batch should be ready");
         assert_eq!(batch_nonces(&second), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn private_group_account_offsets_are_disjoint() {
+        assert_eq!(private_group_account_offset(1000, 10, 2, 3, 0, 0), 1000);
+        assert_eq!(private_group_account_offset(1000, 10, 2, 3, 0, 1), 1010);
+        assert_eq!(private_group_account_offset(1000, 10, 2, 3, 0, 2), 1020);
+        assert_eq!(private_group_account_offset(1000, 10, 2, 3, 1, 0), 1030);
+        assert_eq!(private_group_account_offset(1000, 10, 2, 3, 1, 2), 1050);
     }
 
     async fn wait_for_presigned_batches(

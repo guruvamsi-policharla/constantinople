@@ -1,7 +1,7 @@
 //! Constantinople transaction type and transaction wrappers.
 
 use crate::{
-    AccountKey, MockPrivatePaymentBackend, PrivatePaymentBackend, Sealable, Sealed,
+    AccountKey, ChainPrivatePaymentBackend, PrivatePaymentBackend, Sealable, Sealed,
     TransactionPublicKey, TransactionSignature,
 };
 use bytes::{Buf, BufMut};
@@ -24,7 +24,7 @@ pub const PRIVATE_ROLLOVER_TAG: u8 = 4;
 
 /// A signed transaction accepted by the canonical block format.
 #[derive(Debug, Clone)]
-pub struct SignedTransaction<H, B = MockPrivatePaymentBackend>
+pub struct SignedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,
@@ -132,7 +132,7 @@ where
 }
 
 /// A signed transaction whose signature has been accepted by the caller.
-pub type VerifiedTransaction<H, B = MockPrivatePaymentBackend> = SignedTransaction<H, B>;
+pub type VerifiedTransaction<H, B = ChainPrivatePaymentBackend> = SignedTransaction<H, B>;
 
 impl<H, B> SignedTransaction<H, B>
 where
@@ -318,7 +318,7 @@ where
 
 /// The action performed by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Payload<B: PrivatePaymentBackend = MockPrivatePaymentBackend>
+pub enum Payload<B: PrivatePaymentBackend = ChainPrivatePaymentBackend>
 where
     B::Params: Send + Sync + 'static,
     B::Commitment:
@@ -604,7 +604,7 @@ fn read_non_zero_value(buf: &mut impl Buf) -> Result<NonZeroU64, Error> {
 
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Transaction<D: Digest, B = MockPrivatePaymentBackend>
+pub struct Transaction<D: Digest, B = ChainPrivatePaymentBackend>
 where
     B: PrivatePaymentBackend,
     B::Params: Send + Sync + 'static,

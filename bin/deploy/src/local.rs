@@ -348,25 +348,41 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        let spammer_cargo = match args.spammer_private_proof_mode {
+            crate::SpammerPrivateProofMode::Real => {
+                "cargo run --release --bin constantinople-spammer"
+            }
+            crate::SpammerPrivateProofMode::Simulated => {
+                "cargo run --release -p constantinople-spammer --features private-payment-simulator --bin constantinople-spammer"
+            }
+        };
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
         commands.push(format!(
-            "cargo run --release --bin constantinople-spammer -- \
+            "{spammer_cargo} -- \
              {network_source} \
              --accounts {} \
              --value {} \
              --seed-offset {} \
+             --worker-threads {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {} \
+             --workload {} \
+             --private-groups {} \
+             --private-proof-mode {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
+            args.spammer_worker_threads,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
+            args.spammer_workload.as_str(),
+            args.spammer_private_groups,
+            args.spammer_private_proof_mode.as_str(),
         ));
     }
 
@@ -405,9 +421,13 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
+            spammer_worker_threads: crate::DEFAULT_SPAMMER_WORKER_THREADS,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_workload: crate::SpammerWorkload::Public,
+            spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
+            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -488,8 +508,11 @@ mod tests {
         assert!(commands[3].contains("--accounts 10"));
         assert!(commands[3].contains("--value 1"));
         assert!(commands[3].contains("--seed-offset 1000"));
+        assert!(commands[3].contains("--worker-threads 2"));
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
+        assert!(commands[3].contains("--workload public"));
+        assert!(commands[3].contains("--private-proof-mode real"));
     }
 
     #[test]
@@ -549,6 +572,57 @@ mod tests {
     }
 
     #[test]
+    fn local_run_commands_propagate_private_workload_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--workload private"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_private_groups_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_private_groups = 4;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--private-groups 4"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_simulated_private_proof_mode_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_private_proof_mode = crate::SpammerPrivateProofMode::Simulated;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("-p constantinople-spammer"));
+        assert!(commands[3].contains("--features private-payment-simulator"));
+        assert!(commands[3].contains("--private-proof-mode simulated"));
+    }
+
+    #[test]
     fn local_run_commands_propagate_presigned_batches_to_spammer() {
         let mut args = test_args(true);
         args.relayer = true;
@@ -578,6 +652,22 @@ mod tests {
         );
 
         assert!(commands[3].contains("--rayon-threads 6"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_worker_threads_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_worker_threads = 6;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--worker-threads 6"));
     }
 
     #[test]

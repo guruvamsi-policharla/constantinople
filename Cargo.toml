@@ -16,7 +16,6 @@ members = [
   "crates/engine",
   "crates/indexer",
   "crates/mempool",
-  "crates/payments",
   "crates/primitives",
   "bin/deploy",
   "bin/spammer",
@@ -42,7 +41,9 @@ redundant-clone = "warn"
 constantinople-engine = { path = "crates/engine" }
 constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
-private-payments = { path = "crates/payments" }
+private-payments = { path = "../private-payments/crates/payments" }
+private-payments-mock = { path = "../private-payments/crates/mock", features = ["commonware-codec"] }
+zkpari = { path = "../private-payments/crates/zkpari", features = ["commonware-codec"] }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
@@ -77,6 +78,7 @@ datafusion = "52"
 # Other
 axum = "0.8"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
+ark-bn254 = { version = "^0.6.0", default-features = false, features = ["curve"] }
 clap = { version = "4", default-features = false }
 rand = { version = "0.8.5", default-features = false }
 bytes = { version = "1.11.1", default-features = false }

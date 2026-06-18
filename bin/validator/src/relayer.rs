@@ -601,9 +601,7 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 const fn min_signed_transaction_bytes() -> usize {
     constantinople_primitives::TransactionPublicKey::SIZE
         + 1
-        + constantinople_primitives::TransactionPublicKey::SIZE
-        + 1
-        + 1
+        + u64::SIZE
         + constantinople_primitives::TransactionSignature::MIN_SIZE
 }
 

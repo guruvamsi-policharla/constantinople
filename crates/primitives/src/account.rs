@@ -1,7 +1,7 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
-    MockPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, TransactionPublicKey,
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -176,7 +176,7 @@ impl Read for Nonce {
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, PartialEq, Eq, Hash)]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
-pub struct Account<B: PrivatePaymentBackend = MockPrivatePaymentBackend>
+pub struct Account<B: PrivatePaymentBackend = ChainPrivatePaymentBackend>
 where
     B::Params: Send + Sync + 'static,
     B::Commitment:
@@ -415,6 +415,7 @@ fn consume_current_nonce(base: u64, bitmap: u64) -> Option<Nonce> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MockPrivatePaymentBackend;
     use commonware_codec::{DecodeExt, FixedSize};
     use commonware_cryptography::{
         Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,

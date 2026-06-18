@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 # Workspace
 private-payments.workspace = true
+private-payments-mock.workspace = true
+zkpari.workspace = true
 
 # Commonware
 commonware-math.workspace = true
@@ -27,6 +29,7 @@ commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 # Other
 bytes.workspace = true
 p256.workspace = true
+ark-bn254.workspace = true
 rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 rand_core.workspace = true
@@ -54,3 +57,4 @@ arbitrary = [
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
 ]
+private-payment-simulator = ["zkpari/simulator"]

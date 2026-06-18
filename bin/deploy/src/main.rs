@@ -56,7 +56,9 @@ const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
+const DEFAULT_SPAMMER_WORKER_THREADS: usize = 2;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+const DEFAULT_SPAMMER_PRIVATE_GROUPS: usize = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +66,40 @@ pub(crate) enum StartupModeConfig {
     #[default]
     MarshalSync,
     StateSync,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerWorkload {
+    #[default]
+    Public,
+    Private,
+}
+
+impl SpammerWorkload {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerPrivateProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
+impl SpammerPrivateProofMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -119,6 +155,9 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
+    /// Number of async runtime worker threads for the spammer.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_WORKER_THREADS)]
+    spammer_worker_threads: usize,
     /// Number of rayon threads for spammer parallel signing.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
     spammer_rayon_threads: usize,
@@ -131,6 +170,21 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Transaction workload emitted by the spammer.
+    #[arg(long, value_enum, default_value_t = SpammerWorkload::Public)]
+    spammer_workload: SpammerWorkload,
+    /// Independent private global-ring groups per spammer submitter.
+    ///
+    /// Only used with `--spammer-workload private`; `--spammer-accounts` is
+    /// the size of each group.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_PRIVATE_GROUPS)]
+    spammer_private_groups: usize,
+    /// Private transfer proof generation mode for the spammer.
+    ///
+    /// `simulated` is for local/private testnets only and requires building the
+    /// spammer with the private-payment simulator feature.
+    #[arg(long, value_enum, default_value_t = SpammerPrivateProofMode::Real)]
+    spammer_private_proof_mode: SpammerPrivateProofMode,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -226,6 +280,9 @@ pub(crate) struct SpammerConfig {
     pub accounts: u32,
     pub value: u64,
     pub seed_offset: u64,
+    /// Number of async runtime worker threads.
+    #[serde(default = "default_spammer_worker_threads")]
+    pub worker_threads: usize,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
@@ -250,6 +307,15 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Transaction workload to submit.
+    #[serde(default)]
+    pub workload: SpammerWorkload,
+    /// Independent private global-ring groups per relayer submitter.
+    #[serde(default = "default_spammer_private_groups")]
+    pub private_groups: usize,
+    /// Private transfer proof generation mode.
+    #[serde(default)]
+    pub private_proof_mode: SpammerPrivateProofMode,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -422,8 +488,16 @@ const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
 }
 
+const fn default_spammer_worker_threads() -> usize {
+    DEFAULT_SPAMMER_WORKER_THREADS
+}
+
 const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
+}
+
+const fn default_spammer_private_groups() -> usize {
+    DEFAULT_SPAMMER_PRIVATE_GROUPS
 }
 
 fn main() {
@@ -631,9 +705,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
-        generate_local_cluster_material, simplex_verification_material_from_config,
-        write_simplex_verification_material,
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerPrivateProofMode,
+        SpammerWorkload, generate_local_cluster_material,
+        simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::Parser;
     use commonware_codec::Encode;
@@ -829,6 +903,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_spammer_workload() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-workload",
+            "private",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_workload, SpammerWorkload::Private);
+    }
+
+    #[test]
+    fn parses_spammer_private_groups() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-private-groups",
+            "4",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_private_groups, 4);
+    }
+
+    #[test]
+    fn parses_spammer_private_proof_mode() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-private-proof-mode",
+            "simulated",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(
+            generate.spammer_private_proof_mode,
+            SpammerPrivateProofMode::Simulated
+        );
+    }
+
+    #[test]
     fn parses_spammer_rayon_threads() {
         let cli = Cli::try_parse_from([
             "constantinople-deploy",
@@ -848,6 +991,28 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    #[test]
+    fn parses_spammer_worker_threads() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-worker-threads",
+            "6",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_worker_threads, 6);
     }
 
     #[test]

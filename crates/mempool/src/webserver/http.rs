@@ -32,8 +32,6 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 
-/// Minimum bytes needed to encode a `u64` varint.
-const MIN_U64_VARINT_BYTES: usize = 1;
 const MIN_PAYLOAD_TAG_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
@@ -102,12 +100,7 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
-    TransactionPublicKey::SIZE
-        + MIN_PAYLOAD_TAG_BYTES
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
-        + MIN_U64_VARINT_BYTES
-        + TransactionSignature::MIN_SIZE
+    TransactionPublicKey::SIZE + MIN_PAYLOAD_TAG_BYTES + u64::SIZE + TransactionSignature::MIN_SIZE
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {
@@ -442,6 +435,15 @@ mod tests {
         });
 
         router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential, Sequential>(state)
+    }
+
+    #[test]
+    fn transaction_count_bound_accepts_minimal_private_payloads() {
+        let txs = 16;
+        let body_len =
+            super::MIN_BATCH_LENGTH_PREFIX_BYTES + txs * super::min_signed_transaction_bytes();
+
+        assert_eq!(super::max_transaction_count(body_len), Some(txs));
     }
 
     #[test]

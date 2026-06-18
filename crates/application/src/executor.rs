@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
 use constantinople_primitives::{
-    Account, AccountKey, MockPrivatePaymentBackend, Payload, PrivatePaymentBackend,
+    Account, AccountKey, ChainPrivatePaymentBackend, Payload, PrivatePaymentBackend,
     SignedTransaction, TransactionPublicKey,
 };
 use hashbrown::HashMap;
@@ -13,14 +13,14 @@ use rand_core::OsRng;
 use tracing::info_span;
 
 /// Fully loaded account state for one execution batch.
-pub type State<B = MockPrivatePaymentBackend> = HashMap<AccountKey, Account<B>>;
+pub type State<B = ChainPrivatePaymentBackend> = HashMap<AccountKey, Account<B>>;
 
 /// Deterministic account writes produced by execution.
-pub type Changeset<B = MockPrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
+pub type Changeset<B = ChainPrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
 
 /// Prepared transaction operation.
 #[derive(Debug, Clone)]
-pub struct PreparedOperation<H, B = MockPrivatePaymentBackend>
+pub struct PreparedOperation<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,
@@ -37,7 +37,7 @@ where
 
 /// Prepared payload with decoded account keys.
 #[derive(Debug, Clone)]
-pub enum PreparedPayload<B: PrivatePaymentBackend = MockPrivatePaymentBackend> {
+pub enum PreparedPayload<B: PrivatePaymentBackend = ChainPrivatePaymentBackend> {
     /// Public transfer.
     PublicTransfer { recipient: AccountKey, value: u64 },
     /// Private fund.
@@ -60,7 +60,7 @@ pub enum PreparedPayload<B: PrivatePaymentBackend = MockPrivatePaymentBackend> {
 
 /// Transaction paired with its prepared execution data.
 #[derive(Debug, Clone)]
-pub(crate) struct PreparedTransaction<H, B = MockPrivatePaymentBackend>
+pub(crate) struct PreparedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,
@@ -73,7 +73,7 @@ where
 
 /// Proposal-side transaction preparation.
 #[derive(Debug)]
-pub(crate) struct ProposalInput<H, B = MockPrivatePaymentBackend>
+pub(crate) struct ProposalInput<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,
@@ -86,7 +86,7 @@ where
 
 /// The result of proposal-side filtering and execution.
 #[derive(Debug)]
-pub struct ProposalOutput<H, B = MockPrivatePaymentBackend>
+pub struct ProposalOutput<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,

@@ -6,7 +6,7 @@
 //! - [`Block`] - Execution payload and required consensus metadata.
 
 use crate::{
-    LazySignedTransaction, MockPrivatePaymentBackend, PrivatePaymentBackend, Sealable, Sealed,
+    ChainPrivatePaymentBackend, LazySignedTransaction, PrivatePaymentBackend, Sealable, Sealed,
     SignedTransaction,
 };
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
@@ -168,7 +168,7 @@ impl Default for BlockCfg {
 
 /// A block containing signed transactions and required epoch-consensus metadata.
 #[derive(Debug, Clone)]
-pub struct Block<C, P, H, B = MockPrivatePaymentBackend>
+pub struct Block<C, P, H, B = ChainPrivatePaymentBackend>
 where
     C: Digest,
     P: PublicKey,
@@ -187,7 +187,7 @@ where
 }
 
 /// A sealed canonical block.
-pub type SealedBlock<C, P, H, B = MockPrivatePaymentBackend> = Sealed<Block<C, P, H, B>, H>;
+pub type SealedBlock<C, P, H, B = ChainPrivatePaymentBackend> = Sealed<Block<C, P, H, B>, H>;
 
 #[cfg(any(feature = "arbitrary", test))]
 impl<C, P, H, B> arbitrary::Arbitrary<'_> for Block<C, P, H, B>

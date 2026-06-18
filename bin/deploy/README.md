@@ -86,6 +86,17 @@ locally per submitter. The spammer still submits only one batch at a time to eac
 `spammer_accounts * relayer_submitters`.
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
+Add `--spammer-worker-threads N` (default `2`) to set the spammer's async
+runtime worker thread count.
+Add `--spammer-workload private` to submit a private-payment workload using
+the chain backend. Each account funds most of its starting balance, keeps a
+small public reserve for recovery, explicitly rolls funded or incoming private
+balance over, then submits private transfers until its current private balance
+is exhausted.
+Add `--spammer-private-proof-mode simulated` for local/private testnets that
+should use the backend's trapdoor simulator instead of generating real private
+transfer proofs. The generated local command automatically builds
+`constantinople-spammer` with `--features private-payment-simulator`.
 
 You can also run the spammer manually against an existing local cluster:
 

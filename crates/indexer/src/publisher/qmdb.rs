@@ -25,7 +25,7 @@ use commonware_storage::{
 use commonware_utils::sequence::FixedBytes;
 use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{Account, AccountKey, BlockCfg, MockPrivatePaymentBackend};
+use constantinople_primitives::{Account, AccountKey, BlockCfg};
 use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
@@ -56,7 +56,7 @@ pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
 type QmdbFamily = mmr::Family;
-type ChainAccount = Account<MockPrivatePaymentBackend>;
+type ChainAccount = Account;
 type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
 type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<ChainAccount>>;

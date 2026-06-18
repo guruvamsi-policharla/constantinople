@@ -8,7 +8,7 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    MockPrivatePaymentBackend, PrivatePaymentBackend, Sealable, Sealed, SignedTransaction,
+    ChainPrivatePaymentBackend, PrivatePaymentBackend, Sealable, Sealed, SignedTransaction,
     Transaction, TransactionBatchVerifier, TransactionSignature,
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -196,7 +196,7 @@ impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
 #[derive(Clone)]
-pub struct LazySignedTransaction<H, B = MockPrivatePaymentBackend>
+pub struct LazySignedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,

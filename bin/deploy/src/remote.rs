@@ -272,6 +272,7 @@ fn remote_spammer_config(
         accounts: args.spammer_accounts,
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
+        worker_threads: args.spammer_worker_threads,
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
@@ -279,6 +280,9 @@ fn remote_spammer_config(
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
+        workload: args.spammer_workload,
+        private_groups: args.spammer_private_groups,
+        private_proof_mode: args.spammer_private_proof_mode,
     }
 }
 
@@ -509,9 +513,13 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
+            spammer_worker_threads: crate::DEFAULT_SPAMMER_WORKER_THREADS,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_workload: crate::SpammerWorkload::Public,
+            spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
+            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -671,10 +679,19 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert_eq!(
+            relayed.worker_threads,
+            crate::DEFAULT_SPAMMER_WORKER_THREADS
+        );
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
+        );
+        assert_eq!(relayed.workload, crate::SpammerWorkload::Public);
+        assert_eq!(
+            relayed.private_groups,
+            crate::DEFAULT_SPAMMER_PRIVATE_GROUPS
         );
     }
 

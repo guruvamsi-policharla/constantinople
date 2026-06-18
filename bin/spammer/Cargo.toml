@@ -16,6 +16,7 @@ workspace = true
 # Workspace
 constantinople-primitives.workspace = true
 constantinople-mempool.workspace = true
+private-payments.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
@@ -35,6 +36,10 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 serde_yaml.workspace = true
 reqwest.workspace = true
+rand.workspace = true
+
+[features]
+private-payment-simulator = ["constantinople-primitives/private-payment-simulator"]
 
 [[bin]]
 name = "constantinople-spammer"

@@ -36,6 +36,7 @@ impl Stats {
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Submits batches through a relayer and records each batch outcome.
+#[derive(Clone)]
 pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,
@@ -58,6 +59,38 @@ enum RelayerBatchStatus {
     Dropped,
 }
 
+/// Outcome returned after one relayer submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Every transaction in the submitted batch finalized.
+    Finalized { height: u64, included: Vec<String> },
+    /// Some transactions finalized and the rest were filtered.
+    PartiallyFinalized {
+        height: u64,
+        included: Vec<String>,
+        filtered: Vec<String>,
+    },
+    /// No transactions from the submitted batch finalized.
+    Dropped,
+    /// The relayer rejected the submission or the request failed.
+    Error,
+}
+
+impl SubmitOutcome {
+    pub fn included(&self) -> &[String] {
+        match self {
+            Self::Finalized { included, .. } | Self::PartiallyFinalized { included, .. } => {
+                included
+            }
+            Self::Dropped | Self::Error => &[],
+        }
+    }
+
+    pub const fn is_fully_finalized(&self) -> bool {
+        matches!(self, Self::Finalized { .. })
+    }
+}
+
 impl RelayerSubmitter {
     pub fn new(
         url: String,
@@ -76,13 +109,21 @@ impl RelayerSubmitter {
 
     /// Submits a signed batch once. Failed or dropped batches are abandoned so
     /// the next outer loop iteration uses a fresh nonce set.
-    pub async fn submit(&self, batch: Vec<Tx>) {
+    pub async fn submit(&self, batch: Vec<Tx>) -> SubmitOutcome {
         let count = batch.len() as u64;
+        let batch_digests = batch
+            .iter()
+            .map(|tx| tx.message_digest().to_string())
+            .collect::<Vec<_>>();
         let body = batch.encode();
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
                 self.stats.finalized.fetch_add(count, Ordering::Relaxed);
                 debug!(height, count, "relayed batch finalized");
+                SubmitOutcome::Finalized {
+                    height,
+                    included: batch_digests,
+                }
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
                 height,
@@ -101,10 +142,16 @@ impl RelayerSubmitter {
                     filtered = filtered.len(),
                     "relayed batch partially finalized, advancing"
                 );
+                SubmitOutcome::PartiallyFinalized {
+                    height,
+                    included,
+                    filtered,
+                }
             }
             Ok(RelayerBatchStatus::Dropped) => {
                 self.stats.dropped.fetch_add(count, Ordering::Relaxed);
                 debug!(count, "relayed batch dropped, advancing");
+                SubmitOutcome::Dropped
             }
             Err(error) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -114,6 +161,7 @@ impl RelayerSubmitter {
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                SubmitOutcome::Error
             }
         }
     }
@@ -153,7 +201,7 @@ impl RelayerSubmitter {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelayerSubmitter, Stats};
+    use super::{RelayerSubmitter, Stats, SubmitOutcome};
     use crate::{
         accounts::generate_accounts,
         signer::{Tx, sign_batch},
@@ -181,10 +229,11 @@ mod tests {
         let batch = test_batch();
         let count = batch.len() as u64;
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
             .expect("dropped batch should not be retried");
 
+        assert_eq!(outcome, SubmitOutcome::Dropped);
         assert_eq!(stats.dropped.load(Ordering::Relaxed), count);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
@@ -196,10 +245,11 @@ mod tests {
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
+        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
             .expect("submit error should not be retried");
 
+        assert_eq!(outcome, SubmitOutcome::Error);
         assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
@@ -216,10 +266,18 @@ mod tests {
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
             .expect("filtered transactions should not be retried");
 
+        assert_eq!(
+            outcome,
+            SubmitOutcome::PartiallyFinalized {
+                height: 7,
+                included: vec![included],
+                filtered: vec![filtered],
+            }
+        );
         assert_eq!(stats.finalized.load(Ordering::Relaxed), 1);
         assert_eq!(stats.filtered.load(Ordering::Relaxed), 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);

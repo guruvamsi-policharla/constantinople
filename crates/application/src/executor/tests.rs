@@ -1,16 +1,18 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, MockCommitment, MockProof, NONCE_BITMAP_CAPACITY,
-    Nonce, Payload, PrivateAccount, Transaction, TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, MockCommitment, MockPrivatePaymentBackend,
+    MockProof, NONCE_BITMAP_CAPACITY, Nonce, Payload, PrivateAccount, Transaction,
+    TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 
 const NAMESPACE: &[u8] = b"executor-test";
 
 type TestHasher = sha256::Sha256;
-type TestTransaction = VerifiedTransaction<TestHasher>;
-type TestProposal = ProposalOutput<TestHasher>;
+type TestBackend = MockPrivatePaymentBackend;
+type TestTransaction = VerifiedTransaction<TestHasher, TestBackend>;
+type TestProposal = ProposalOutput<TestHasher, TestBackend>;
 
 #[derive(Debug, Clone)]
 struct TestSigner {
@@ -35,7 +37,7 @@ impl TestSigner {
         .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
 
-    fn sign_payload(&self, payload: Payload, nonce: u64) -> TestTransaction {
+    fn sign_payload(&self, payload: Payload<TestBackend>, nonce: u64) -> TestTransaction {
         Transaction::from_payload(
             TransactionPublicKey::ed25519(self.key.public_key()),
             payload,
@@ -45,7 +47,7 @@ impl TestSigner {
     }
 }
 
-fn account(balance: u64, nonce: u64) -> Account {
+fn account(balance: u64, nonce: u64) -> Account<TestBackend> {
     Account {
         balance,
         nonce: Nonce::new(nonce, 0),
@@ -58,7 +60,7 @@ fn account_with_private(
     nonce: u64,
     current: MockCommitment,
     pending: MockCommitment,
-) -> Account {
+) -> Account<TestBackend> {
     Account {
         balance,
         nonce: Nonce::new(nonce, 0),
@@ -71,9 +73,9 @@ fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
 }
 
 fn changeset_account(
-    changeset: &[(AccountKey, Account)],
+    changeset: &[(AccountKey, Account<TestBackend>)],
     public_key: ed25519::PublicKey,
-) -> Option<Account> {
+) -> Option<Account<TestBackend>> {
     let account_key = account_key(&public_key);
     changeset
         .iter()
@@ -569,9 +571,9 @@ fn invalid_private_fund_proof_does_not_mutate_overlay() {
 }
 
 fn execute_prepared(
-    accounts: &State,
+    accounts: &State<TestBackend>,
     transactions: &[TestTransaction],
-) -> Option<super::Changeset> {
+) -> Option<super::Changeset<TestBackend>> {
     let transfers = transactions
         .iter()
         .map(prepare_transfer)
