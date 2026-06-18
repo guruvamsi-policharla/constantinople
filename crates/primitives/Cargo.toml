@@ -12,6 +12,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+# Workspace
+private-payments.workspace = true
+
 # Commonware
 commonware-math.workspace = true
 commonware-codec.workspace = true

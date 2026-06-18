@@ -1,7 +1,7 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
-    TransactionPublicKey,
+    MockPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -174,44 +174,197 @@ impl Read for Nonce {
 }
 
 /// An account, as represented in the state of the chain.
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
+#[derive(Debug, Display, Clone, PartialEq, Eq, Hash)]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
-pub struct Account {
+pub struct Account<B: PrivatePaymentBackend = MockPrivatePaymentBackend>
+where
+    B::Params: Send + Sync + 'static,
+    B::Commitment:
+        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
+    B::FundProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::TransferProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::BurnProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+{
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
     /// Consumed and run-ahead transaction nonce state.
     pub nonce: Nonce,
+    /// Private-payment commitment state.
+    pub private: PrivateAccount<B>,
 }
 
-impl Default for Account {
+impl<B> Default for Account<B>
+where
+    B: PrivatePaymentBackend,
+    B::Params: Send + Sync + 'static,
+    B::Commitment:
+        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
+    B::FundProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::TransferProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::BurnProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+{
     fn default() -> Self {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
             nonce: Nonce::default(),
+            private: PrivateAccount::default(),
         }
     }
 }
 
-impl FixedSize for Account {
-    const SIZE: usize = u64::SIZE + Nonce::SIZE;
+impl<B> FixedSize for Account<B>
+where
+    B: PrivatePaymentBackend,
+    B::Params: Send + Sync + 'static,
+    B::Commitment:
+        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
+    B::FundProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::TransferProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::BurnProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+{
+    const SIZE: usize = u64::SIZE + Nonce::SIZE + PrivateAccount::<B>::SIZE;
 }
 
-impl Write for Account {
+impl<B> Write for Account<B>
+where
+    B: PrivatePaymentBackend,
+    B::Params: Send + Sync + 'static,
+    B::Commitment:
+        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
+    B::FundProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::TransferProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::BurnProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+{
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
+        self.private.write(buf);
     }
 }
 
-impl Read for Account {
+impl<B> Read for Account<B>
+where
+    B: PrivatePaymentBackend,
+    B::Params: Send + Sync + 'static,
+    B::Commitment:
+        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
+    B::FundProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::TransferProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+    B::BurnProof: FixedSize
+        + Read<Cfg = ()>
+        + Write
+        + Clone
+        + core::fmt::Debug
+        + core::hash::Hash
+        + Send
+        + Sync,
+{
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: Nonce::read(buf)?,
+            private: PrivateAccount::read(buf)?,
         })
     }
 }
@@ -302,14 +455,15 @@ mod tests {
 
     #[test]
     fn account_codec_roundtrip() {
-        let account = Account {
+        let account = Account::<MockPrivatePaymentBackend> {
             balance: 42,
             nonce: Nonce::new(7, 3),
+            private: PrivateAccount::default(),
         };
 
-        let mut buf = Vec::with_capacity(Account::SIZE);
+        let mut buf = Vec::with_capacity(Account::<MockPrivatePaymentBackend>::SIZE);
         account.write(&mut buf);
-        assert_eq!(buf.len(), Account::SIZE);
+        assert_eq!(buf.len(), Account::<MockPrivatePaymentBackend>::SIZE);
 
         let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
         assert_eq!(decoded, account);
@@ -319,9 +473,10 @@ mod tests {
     fn account_default_starts_funded() {
         assert_eq!(
             Account::default(),
-            Account {
+            Account::<MockPrivatePaymentBackend> {
                 balance: DEFAULT_ACCOUNT_BALANCE,
                 nonce: Nonce::default(),
+                private: PrivateAccount::default(),
             }
         );
     }

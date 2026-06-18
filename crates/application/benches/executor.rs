@@ -58,6 +58,7 @@ fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
             Account {
                 balance: 1,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
         accounts.insert(

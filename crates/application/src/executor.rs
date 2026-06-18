@@ -1,90 +1,124 @@
-//! Transfer execution for the Constantinople account model.
+//! Transaction execution for the Constantinople account model.
 
 use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{
+    Account, AccountKey, MockPrivatePaymentBackend, Payload, PrivatePaymentBackend,
+    SignedTransaction, TransactionPublicKey,
+};
 use hashbrown::HashMap;
+use private_payments::Transaction as PrivateTransaction;
+use rand_core::OsRng;
+use tracing::info_span;
 
 /// Fully loaded account state for one execution batch.
-pub type State = HashMap<AccountKey, Account>;
+pub type State<B = MockPrivatePaymentBackend> = HashMap<AccountKey, Account<B>>;
 
 /// Deterministic account writes produced by execution.
-pub type Changeset = Vec<(AccountKey, Account)>;
+pub type Changeset<B = MockPrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
 
-/// Transfer data used by the executor.
+/// Prepared transaction operation.
 #[derive(Debug, Clone)]
-pub struct PreparedTransfer<H>
+pub struct PreparedOperation<H, B = MockPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     /// Sender account key.
     pub sender: AccountKey,
-    /// Recipient account key.
-    pub recipient: AccountKey,
-    /// Amount transferred.
-    pub value: u64,
+    /// Operation payload.
+    pub payload: PreparedPayload<B>,
     /// Sender nonce required by the transaction.
     pub nonce: u64,
     /// Transaction digest written to the transaction history.
     pub digest: H::Digest,
 }
 
+/// Prepared payload with decoded account keys.
+#[derive(Debug, Clone)]
+pub enum PreparedPayload<B: PrivatePaymentBackend = MockPrivatePaymentBackend> {
+    /// Public transfer.
+    PublicTransfer { recipient: AccountKey, value: u64 },
+    /// Private fund.
+    PrivateFund {
+        value: u64,
+        commitment: B::Commitment,
+        proof: B::FundProof,
+    },
+    /// Private transfer.
+    PrivateTransfer {
+        recipient: AccountKey,
+        amount: B::Commitment,
+        proof: B::TransferProof,
+    },
+    /// Private burn.
+    PrivateBurn { value: u64, proof: B::BurnProof },
+    /// Explicit private rollover.
+    PrivateRollover,
+}
+
 /// Transaction paired with its prepared execution data.
 #[derive(Debug, Clone)]
-pub(crate) struct PreparedTransaction<H>
+pub(crate) struct PreparedTransaction<H, B = MockPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     /// Original signed transaction.
-    pub transaction: SignedTransaction<H>,
-    /// Prepared transfer data.
-    pub transfer: PreparedTransfer<H>,
+    pub transaction: SignedTransaction<H, B>,
+    /// Prepared operation data.
+    pub operation: PreparedOperation<H, B>,
 }
 
 /// Proposal-side transaction preparation.
 #[derive(Debug)]
-pub(crate) struct ProposalInput<H>
+pub(crate) struct ProposalInput<H, B = MockPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     /// Transactions with decodable execution metadata.
-    pub candidates: Vec<PreparedTransaction<H>>,
+    pub candidates: Vec<PreparedTransaction<H, B>>,
     /// Transactions rejected before account execution.
-    pub invalid: Vec<SignedTransaction<H>>,
+    pub invalid: Vec<SignedTransaction<H, B>>,
 }
 
 /// The result of proposal-side filtering and execution.
 #[derive(Debug)]
-pub struct ProposalOutput<H>
+pub struct ProposalOutput<H, B = MockPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     /// Transactions included in the proposed block.
-    pub valid: Vec<SignedTransaction<H>>,
+    pub valid: Vec<SignedTransaction<H, B>>,
     /// Transactions excluded from the proposed block.
-    pub invalid: Vec<SignedTransaction<H>>,
+    pub invalid: Vec<SignedTransaction<H, B>>,
     /// Persistent account writes produced by included transactions.
-    pub changeset: Changeset,
-    pub(crate) transfers: Vec<PreparedTransfer<H>>,
+    pub changeset: Changeset<B>,
+    pub(crate) operations: Vec<PreparedOperation<H, B>>,
 }
 
 /// Prepares transactions for proposal-side execution.
-pub(crate) fn prepare_proposal<H>(transactions: Vec<SignedTransaction<H>>) -> ProposalInput<H>
+pub(crate) fn prepare_proposal<H, B>(
+    transactions: Vec<SignedTransaction<H, B>>,
+) -> ProposalInput<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     let mut candidates = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
 
     for transaction in transactions {
-        let Some(transfer) = prepare_transfer(&transaction) else {
+        let Some(operation) = prepare_operation(&transaction) else {
             invalid.push(transaction);
             continue;
         };
         candidates.push(PreparedTransaction {
             transaction,
-            transfer,
+            operation,
         });
     }
 
@@ -94,19 +128,23 @@ where
     }
 }
 
-/// Executes proposal candidates and filters statically invalid transfers.
-pub(crate) fn propose_prepared<H>(state: &State, input: ProposalInput<H>) -> ProposalOutput<H>
+/// Executes proposal candidates and filters statically invalid operations.
+pub(crate) fn propose_prepared<H, B>(
+    state: &State<B>,
+    input: ProposalInput<H, B>,
+) -> ProposalOutput<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     let mut overlay = Overlay::new(state, input.candidates.len());
     let mut valid = Vec::with_capacity(input.candidates.len());
-    let mut transfers = Vec::with_capacity(input.candidates.len());
+    let mut operations = Vec::with_capacity(input.candidates.len());
     let mut invalid = input.invalid;
 
     for candidate in input.candidates {
-        if apply_transfer(&mut overlay, &candidate.transfer) {
-            transfers.push(candidate.transfer);
+        if apply_one::<H, B>(&mut overlay, &candidate.operation, true) {
+            operations.push(candidate.operation);
             valid.push(candidate.transaction);
         } else {
             invalid.push(candidate.transaction);
@@ -117,42 +155,117 @@ where
         valid,
         invalid,
         changeset: overlay.into_changeset(),
-        transfers,
+        operations,
     }
 }
 
 /// Prepares and executes proposal transactions.
-pub fn propose<H>(state: &State, transactions: Vec<SignedTransaction<H>>) -> ProposalOutput<H>
+pub fn propose<H, B>(
+    state: &State<B>,
+    transactions: Vec<SignedTransaction<H, B>>,
+) -> ProposalOutput<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     propose_prepared(state, prepare_proposal(transactions))
 }
 
-/// Prepares one transaction for account execution.
-pub fn prepare_transfer<H>(transaction: &SignedTransaction<H>) -> Option<PreparedTransfer<H>>
+/// Backward-compatible public name.
+pub fn prepare_transfer<H, B>(
+    transaction: &SignedTransaction<H, B>,
+) -> Option<PreparedOperation<H, B>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    let transfer = transaction.value();
-    Some(PreparedTransfer {
-        sender: account_key_from_sender(transfer.sender_lazy())?,
-        recipient: transfer.to.clone(),
-        value: transfer.value.get(),
-        nonce: transfer.nonce,
+    prepare_operation(transaction)
+}
+
+/// Prepares one transaction for account execution.
+pub fn prepare_operation<H, B>(
+    transaction: &SignedTransaction<H, B>,
+) -> Option<PreparedOperation<H, B>>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+{
+    let tx = transaction.value();
+    let payload = match &tx.payload {
+        Payload::PublicTransfer { to, value } => PreparedPayload::PublicTransfer {
+            recipient: to.clone(),
+            value: value.get(),
+        },
+        Payload::PrivateFund {
+            value,
+            commitment,
+            proof,
+        } => PreparedPayload::PrivateFund {
+            value: value.get(),
+            commitment: commitment.clone(),
+            proof: proof.clone(),
+        },
+        Payload::PrivateTransfer { to, amount, proof } => PreparedPayload::PrivateTransfer {
+            recipient: to.clone(),
+            amount: amount.clone(),
+            proof: proof.clone(),
+        },
+        Payload::PrivateBurn { value, proof } => PreparedPayload::PrivateBurn {
+            value: value.get(),
+            proof: proof.clone(),
+        },
+        Payload::PrivateRollover => PreparedPayload::PrivateRollover,
+    };
+
+    Some(PreparedOperation {
+        sender: account_key_from_sender(tx.sender_lazy())?,
+        payload,
+        nonce: tx.nonce,
         digest: *transaction.message_digest(),
     })
 }
 
-/// Executes already prepared transfers.
-pub fn execute<H>(state: &State, transfers: &[PreparedTransfer<H>]) -> Option<Changeset>
+/// Executes already prepared operations.
+pub fn execute<H, B>(
+    state: &State<B>,
+    operations: &[PreparedOperation<H, B>],
+) -> Option<Changeset<B>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    let mut overlay = Overlay::new(state, transfers.len());
+    let _span = info_span!(
+        "application.executor.execute",
+        txs = operations.len(),
+        backend = B::NAME
+    )
+    .entered();
 
-    for transfer in transfers {
-        if !apply_transfer(&mut overlay, transfer) {
+    let mut overlay = Overlay::new(state, operations.len());
+    let mut private_txs = Vec::new();
+    let mut sender_currents = Vec::new();
+
+    for operation in operations {
+        if !apply_operation::<H, B>(
+            &mut overlay,
+            operation,
+            false,
+            &mut private_txs,
+            &mut sender_currents,
+        ) {
+            return None;
+        }
+    }
+
+    if !private_txs.is_empty() {
+        let verified = info_span!(
+            "application.executor.private_batch_verify",
+            backend = B::NAME,
+            private_txs = private_txs.len(),
+            sender_currents = sender_currents.len()
+        )
+        .in_scope(|| B::batch_verify(B::params(), &private_txs, &sender_currents, &mut OsRng));
+        if !verified {
             return None;
         }
     }
@@ -160,35 +273,19 @@ where
     Some(overlay.into_changeset())
 }
 
-pub(crate) fn execute_unique<H>(
-    transfers: &[PreparedTransfer<H>],
-    accounts: &[Account],
-) -> Option<Changeset>
+pub(crate) fn execute_unique<H, B>(
+    operations: &[PreparedOperation<H, B>],
+    accounts: &[(AccountKey, Account<B>)],
+) -> Option<Changeset<B>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    if accounts.len() != transfers.len().saturating_mul(2) {
-        return None;
+    let mut state = State::with_capacity(accounts.len());
+    for (account_key, account) in accounts {
+        state.insert(account_key.clone(), account.clone());
     }
-    let mut changeset = Vec::with_capacity(transfers.len().saturating_mul(2));
-
-    for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
-        let mut sender = accounts[0];
-        if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
-            return None;
-        }
-
-        let mut recipient = accounts[1];
-        let recipient_balance = recipient.balance.checked_add(transfer.value)?;
-
-        sender.balance -= transfer.value;
-        recipient.balance = recipient_balance;
-        changeset.push((transfer.sender.clone(), sender));
-        changeset.push((transfer.recipient.clone(), recipient));
-    }
-
-    changeset.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-    Some(changeset)
+    execute(&state, operations)
 }
 
 fn account_key_from_sender(
@@ -200,13 +297,16 @@ fn account_key_from_sender(
 }
 
 #[derive(Debug)]
-struct Overlay<'a> {
-    base: &'a State,
-    writes: HashMap<AccountKey, Account>,
+struct Overlay<'a, B: PrivatePaymentBackend> {
+    base: &'a State<B>,
+    writes: HashMap<AccountKey, Account<B>>,
 }
 
-impl<'a> Overlay<'a> {
-    fn new(base: &'a State, transaction_count: usize) -> Self {
+impl<'a, B> Overlay<'a, B>
+where
+    B: PrivatePaymentBackend,
+{
+    fn new(base: &'a State<B>, transaction_count: usize) -> Self {
         let capacity = base.len().min(transaction_count.saturating_mul(2));
         Self {
             base,
@@ -214,53 +314,165 @@ impl<'a> Overlay<'a> {
         }
     }
 
-    fn get(&self, account_key: &AccountKey) -> Option<Account> {
+    fn get(&self, account_key: &AccountKey) -> Option<Account<B>> {
         self.writes
             .get(account_key)
             .or_else(|| self.base.get(account_key))
-            .copied()
+            .cloned()
     }
 
-    fn set(&mut self, account_key: AccountKey, account: Account) {
+    fn set(&mut self, account_key: AccountKey, account: Account<B>) {
         self.writes.insert(account_key, account);
     }
 
-    fn into_changeset(self) -> Changeset {
-        let mut changeset: Changeset = self.writes.into_iter().collect();
+    fn into_changeset(self) -> Changeset<B> {
+        let mut changeset: Changeset<B> = self.writes.into_iter().collect();
         changeset.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         changeset
     }
 }
 
-fn apply_transfer<H>(state: &mut Overlay<'_>, transfer: &PreparedTransfer<H>) -> bool
+fn apply_one<H, B>(
+    state: &mut Overlay<'_, B>,
+    operation: &PreparedOperation<H, B>,
+    verify_private: bool,
+) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    let Some(mut sender) = state.get(&transfer.sender) else {
+    let mut private_txs = Vec::new();
+    let mut sender_currents = Vec::new();
+    apply_operation(
+        state,
+        operation,
+        verify_private,
+        &mut private_txs,
+        &mut sender_currents,
+    )
+}
+
+fn apply_operation<H, B>(
+    state: &mut Overlay<'_, B>,
+    operation: &PreparedOperation<H, B>,
+    verify_private: bool,
+    private_txs: &mut Vec<PrivateTransaction<B>>,
+    sender_currents: &mut Vec<B::Commitment>,
+) -> bool
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+{
+    let Some(mut sender) = state.get(&operation.sender) else {
         return false;
     };
-    if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
+    if !sender.nonce.consume(operation.nonce) {
         return false;
     }
 
-    if transfer.sender == transfer.recipient {
-        state.set(transfer.sender.clone(), sender);
-        return true;
+    match &operation.payload {
+        PreparedPayload::PublicTransfer { recipient, value } => {
+            if sender.balance < *value {
+                return false;
+            }
+            if operation.sender == *recipient {
+                state.set(operation.sender.clone(), sender);
+                return true;
+            }
+            let Some(mut recipient_account) = state.get(recipient) else {
+                return false;
+            };
+            let Some(recipient_balance) = recipient_account.balance.checked_add(*value) else {
+                return false;
+            };
+            sender.balance -= *value;
+            recipient_account.balance = recipient_balance;
+            state.set(operation.sender.clone(), sender);
+            state.set(recipient.clone(), recipient_account);
+            true
+        }
+        PreparedPayload::PrivateFund {
+            value,
+            commitment,
+            proof,
+        } => {
+            if sender.balance < *value {
+                return false;
+            }
+            let tx = PrivateTransaction::Fund {
+                sender: 0,
+                value: *value,
+                fund_commitment: commitment.clone(),
+                proof: proof.clone(),
+            };
+            if verify_private && !verify_single::<B>(&tx, &[]) {
+                return false;
+            }
+            sender.balance -= *value;
+            sender.private.deposit(commitment);
+            private_txs.push(tx);
+            state.set(operation.sender.clone(), sender);
+            true
+        }
+        PreparedPayload::PrivateTransfer {
+            recipient,
+            amount,
+            proof,
+        } => {
+            let Some(mut recipient_account) = state.get(recipient) else {
+                return false;
+            };
+            let current = sender.private.current.clone();
+            let tx = PrivateTransaction::Transfer {
+                sender: 0,
+                recipient: 1,
+                amount_commitment: amount.clone(),
+                proof: proof.clone(),
+            };
+            if verify_private && !verify_single::<B>(&tx, core::slice::from_ref(&current)) {
+                return false;
+            }
+            sender.private.withdraw(amount);
+            recipient_account.private.deposit(amount);
+            private_txs.push(tx);
+            sender_currents.push(current);
+            state.set(operation.sender.clone(), sender);
+            state.set(recipient.clone(), recipient_account);
+            true
+        }
+        PreparedPayload::PrivateBurn { value, proof } => {
+            let current = sender.private.current.clone();
+            let tx = PrivateTransaction::Burn {
+                sender: 0,
+                value: *value,
+                proof: proof.clone(),
+            };
+            if verify_private && !verify_single::<B>(&tx, core::slice::from_ref(&current)) {
+                return false;
+            }
+            let Some(next_balance) = sender.balance.checked_add(*value) else {
+                return false;
+            };
+            sender.balance = next_balance;
+            sender.private.burn();
+            private_txs.push(tx);
+            sender_currents.push(current);
+            state.set(operation.sender.clone(), sender);
+            true
+        }
+        PreparedPayload::PrivateRollover => {
+            sender.private.rollover();
+            state.set(operation.sender.clone(), sender);
+            true
+        }
     }
+}
 
-    let Some(mut recipient) = state.get(&transfer.recipient) else {
-        return false;
-    };
-    let Some(recipient_balance) = recipient.balance.checked_add(transfer.value) else {
-        return false;
-    };
-
-    sender.balance -= transfer.value;
-    recipient.balance = recipient_balance;
-    state.set(transfer.sender.clone(), sender);
-    state.set(transfer.recipient.clone(), recipient);
-
-    true
+fn verify_single<B>(tx: &PrivateTransaction<B>, currents: &[B::Commitment]) -> bool
+where
+    B: PrivatePaymentBackend,
+{
+    B::batch_verify(B::params(), core::slice::from_ref(tx), currents, &mut OsRng)
 }
 
 #[cfg(test)]

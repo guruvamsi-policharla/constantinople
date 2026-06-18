@@ -16,6 +16,7 @@ members = [
   "crates/engine",
   "crates/indexer",
   "crates/mempool",
+  "crates/payments",
   "crates/primitives",
   "bin/deploy",
   "bin/spammer",
@@ -41,6 +42,7 @@ redundant-clone = "warn"
 constantinople-engine = { path = "crates/engine" }
 constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
+private-payments = { path = "crates/payments" }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 

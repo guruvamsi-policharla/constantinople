@@ -7,7 +7,7 @@ use super::{
     history::parent_transactions_inactivity_floor,
     reject_verify,
 };
-use crate::executor::{self, PreparedTransfer, State};
+use crate::executor::{self, PreparedOperation, PreparedPayload, State};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
@@ -42,7 +42,7 @@ where
 }
 
 enum LoadedState {
-    Unique(Vec<Account>),
+    Unique(Vec<(AccountKey, Account)>),
     Shared(State),
 }
 
@@ -62,7 +62,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     input: executor::ProposalInput<H>,
-    candidate_transfers: &[PreparedTransfer<H>],
+    candidate_operations: &[PreparedOperation<H>],
 ) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -71,7 +71,7 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let state = load_state(&state_batch, candidate_transfers)
+    let state = load_state(&state_batch, candidate_operations)
         .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("proposal state loading must succeed");
@@ -79,7 +79,7 @@ where
     let output = info_span!("application.execute.transfers")
         .in_scope(|| executor::propose_prepared(&state, input));
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let digests = transfer_digests(&output.transfers);
+        let digests = operation_digests(&output.operations);
         let state_batch = apply_changeset(state_batch, &output.changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
         (state_batch, transaction_batch)
@@ -111,23 +111,23 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let transfers = info_span!("application.execute.prepare").in_scope(|| {
+    let operations = info_span!("application.execute.prepare").in_scope(|| {
         body.iter()
             .map(|transaction| executor::prepare_transfer(transaction.get()?))
             .collect::<Option<Vec<_>>>()
             .ok_or(MALFORMED_TRANSACTION)
     })?;
 
-    let state = load_execution_state(&state_batch, &transfers)
+    let state = load_execution_state(&state_batch, &operations)
         .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("block state loading must succeed");
 
-    let changeset = info_span!("application.execute.transfers")
-        .in_scope(|| execute_loaded(&state, &transfers))
+    let changeset = info_span!("application.execute.operations")
+        .in_scope(|| execute_loaded(&state, &operations))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let digests = transfer_digests(&transfers);
+        let digests = operation_digests(&operations);
         let state_batch = apply_changeset(state_batch, &changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
         (state_batch, transaction_batch)
@@ -137,7 +137,7 @@ where
         state_batch,
         transaction_batch,
         parent,
-        transfers.len(),
+        operations.len(),
         "database merkleization during verification must succeed",
     )
     .await)
@@ -147,22 +147,22 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
-    transfers: &[PreparedTransfer<H>],
+    operations: &[PreparedOperation<H>],
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let state = load_execution_state(&state_batch, transfers)
+    let state = load_execution_state(&state_batch, operations)
         .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("state loading must succeed for certified apply");
-    let changeset = info_span!("application.execute.transfers")
-        .in_scope(|| execute_loaded(&state, transfers))
+    let changeset = info_span!("application.execute.operations")
+        .in_scope(|| execute_loaded(&state, operations))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let digests = transfer_digests(transfers);
+        let digests = operation_digests(operations);
         let state_batch = apply_changeset(state_batch, &changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
             .with_inactivity_floor(transaction_floor);
@@ -207,21 +207,20 @@ where
 
 async fn load_state<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer<H>],
+    operations: &[PreparedOperation<H>],
 ) -> core::result::Result<State, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    if transfers.is_empty() {
+    if operations.is_empty() {
         return Ok(State::new());
     }
 
-    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        account_keys.insert(transfer.sender.clone());
-        account_keys.insert(transfer.recipient.clone());
+    let mut account_keys = HashSet::with_capacity(operations.len().saturating_mul(2));
+    for operation in operations {
+        insert_touched_accounts(&mut account_keys, operation);
     }
 
     load_accounts(batch, account_keys.into_iter().collect()).await
@@ -229,31 +228,34 @@ where
 
 async fn load_execution_state<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer<H>],
+    operations: &[PreparedOperation<H>],
 ) -> core::result::Result<LoadedState, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    if transfers.is_empty() {
+    if operations.is_empty() {
         return Ok(LoadedState::Unique(Vec::new()));
     }
 
-    let mut account_keys = Vec::with_capacity(transfers.len().saturating_mul(2));
-    let mut unique = HashSet::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        account_keys.push(&transfer.sender);
-        account_keys.push(&transfer.recipient);
-        unique.insert(&transfer.sender);
-        unique.insert(&transfer.recipient);
+    let mut account_keys = Vec::with_capacity(operations.len().saturating_mul(2));
+    let mut unique = HashSet::with_capacity(operations.len().saturating_mul(2));
+    for operation in operations {
+        account_keys.push(&operation.sender);
+        unique.insert(&operation.sender);
+        if let Some(recipient) = operation_recipient(operation) {
+            account_keys.push(recipient);
+            unique.insert(recipient);
+        }
     }
 
     if unique.len() == account_keys.len() {
         let values = batch.get_many(&account_keys).await?;
         let accounts = values
             .into_iter()
-            .map(|account| account.unwrap_or_default())
+            .zip(account_keys)
+            .map(|(account, key)| (key.clone(), account.unwrap_or_default()))
             .collect();
         return Ok(LoadedState::Unique(accounts));
     }
@@ -287,14 +289,14 @@ where
 
 fn execute_loaded<H>(
     state: &LoadedState,
-    transfers: &[PreparedTransfer<H>],
+    operations: &[PreparedOperation<H>],
 ) -> Option<executor::Changeset>
 where
     H: Hasher,
 {
     match state {
-        LoadedState::Unique(accounts) => executor::execute_unique(transfers, accounts),
-        LoadedState::Shared(accounts) => executor::execute(accounts, transfers),
+        LoadedState::Unique(accounts) => executor::execute_unique(operations, accounts),
+        LoadedState::Shared(accounts) => executor::execute(accounts, operations),
     }
 }
 
@@ -337,11 +339,39 @@ where
     non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
 }
 
-fn transfer_digests<H>(transfers: &[PreparedTransfer<H>]) -> Vec<H::Digest>
+fn operation_digests<H>(operations: &[PreparedOperation<H>]) -> Vec<H::Digest>
 where
     H: Hasher,
 {
-    transfers.iter().map(|transfer| transfer.digest).collect()
+    operations
+        .iter()
+        .map(|operation| operation.digest)
+        .collect()
+}
+
+fn insert_touched_accounts<H>(
+    account_keys: &mut HashSet<AccountKey>,
+    operation: &PreparedOperation<H>,
+) where
+    H: Hasher,
+{
+    account_keys.insert(operation.sender.clone());
+    if let Some(recipient) = operation_recipient(operation) {
+        account_keys.insert(recipient.clone());
+    }
+}
+
+const fn operation_recipient<H>(operation: &PreparedOperation<H>) -> Option<&AccountKey>
+where
+    H: Hasher,
+{
+    match &operation.payload {
+        PreparedPayload::PublicTransfer { recipient, .. }
+        | PreparedPayload::PrivateTransfer { recipient, .. } => Some(recipient),
+        PreparedPayload::PrivateFund { .. }
+        | PreparedPayload::PrivateBurn { .. }
+        | PreparedPayload::PrivateRollover => None,
+    }
 }
 
 #[cfg(test)]

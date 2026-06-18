@@ -15,6 +15,7 @@ workspace = true
 # Workspace
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
+private-payments.workspace = true
 
 # Commonware
 commonware-glue.workspace = true

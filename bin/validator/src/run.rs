@@ -1019,11 +1019,12 @@ mod tests {
     };
     use commonware_utils::{non_empty_range, sequence::FixedBytes};
     use constantinople_primitives::{
-        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
+        Account, AccountKey, Block, Header, MockPrivatePaymentBackend, Sealable, SignedTransaction,
     };
     use std::{future::pending, time::Duration};
 
-    type TestAccountValue = FixedBytes<{ Account::SIZE }>;
+    type TestAccount = Account<MockPrivatePaymentBackend>;
+    type TestAccountValue = FixedBytes<{ TestAccount::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 

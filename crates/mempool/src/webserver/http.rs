@@ -11,9 +11,9 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, SignedTransaction, TransactionPublicKey,
@@ -34,6 +34,7 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 
 /// Minimum bytes needed to encode a `u64` varint.
 const MIN_U64_VARINT_BYTES: usize = 1;
+const MIN_PAYLOAD_TAG_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, SigSt, HashSt>
@@ -102,6 +103,7 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 
 const fn min_signed_transaction_bytes() -> usize {
     TransactionPublicKey::SIZE
+        + MIN_PAYLOAD_TAG_BYTES
         + TransactionPublicKey::SIZE
         + MIN_U64_VARINT_BYTES
         + MIN_U64_VARINT_BYTES
@@ -252,7 +254,7 @@ where
         .map(LazySignedTransaction::new)
         .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<H, _, _>(
+        verify_transaction_chunks::<H, _, _, _>(
             &signature_strategy,
             &hash_strategy,
             namespace,
@@ -380,6 +382,8 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
+    private: String,
+    pending: String,
 }
 
 #[derive(serde::Serialize)]
@@ -393,6 +397,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
+            private: hex(&account.private.current.encode()),
+            pending: hex(&account.private.pending.encode()),
         }
     }
 }

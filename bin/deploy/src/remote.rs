@@ -168,6 +168,7 @@ fn build_validators(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             traces: remote.traces,
+            otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
             relayer: None,
@@ -221,6 +222,7 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             traces: remote.traces,
+            otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| remote_indexer_config(remote.chain_indexer_port)),
@@ -517,6 +519,8 @@ mod tests {
                 chain_indexer_port: 8090,
                 metadata_indexer_port: 8091,
                 qmdb_indexer_port: 8092,
+                traces: 0.0,
+                otel_endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
             }),
         }
     }
@@ -569,6 +573,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 traces: 0.0,
+                otel_endpoint: None,
                 bootstrappers: Vec::new(),
                 indexer: None,
                 relayer: None,

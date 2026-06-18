@@ -123,7 +123,7 @@ mod tests {
         let body = txs.as_slice().encode();
 
         // Decode as the server would.
-        let max_transactions = body.len() / 118; // conservative min tx size
+        let max_transactions = body.len() / 119; // conservative min tx size
         let cfg = (RangeCfg::new(1..=max_transactions), ());
         let decoded = Vec::<Tx>::decode_cfg(&mut &body[..], &cfg).expect("decode should succeed");
         assert_eq!(decoded.len(), txs.len());
@@ -135,7 +135,7 @@ mod tests {
             .map(constantinople_primitives::LazySignedTransaction::new)
             .collect();
         assert!(
-            verify_transaction_batch::<Sha256, _>(
+            verify_transaction_batch::<Sha256, _, _>(
                 &Sequential,
                 TRANSACTION_NAMESPACE,
                 &mut rng,

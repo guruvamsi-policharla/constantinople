@@ -160,6 +160,12 @@ pub(crate) struct LocalArgs {
     /// Local `qmdb-indexer` read-service port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
+    /// Trace sampling rate (0.0..=1.0) for local validator OTLP uploads.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_sampling_rate)]
+    traces: f64,
+    /// OTLP HTTP traces endpoint used when `--traces` is non-zero.
+    #[arg(long, default_value = "http://127.0.0.1:4318/v1/traces")]
+    otel_endpoint: String,
 }
 
 #[derive(Debug, Args)]
@@ -313,6 +319,10 @@ pub(crate) struct ValidatorConfig {
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
+    /// Optional OTLP HTTP traces endpoint. Local deploys set this directly;
+    /// remote deploys derive the endpoint from `hosts.yaml` monitoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    otel_endpoint: Option<String>,
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.
@@ -712,6 +722,34 @@ mod tests {
             panic!("expected remote target");
         };
         assert_eq!(remote.traces, 0.5);
+    }
+
+    #[test]
+    fn local_parses_otel_tracing_config() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "local",
+            "--traces",
+            "1.0",
+            "--otel-endpoint",
+            "http://127.0.0.1:4318/v1/traces",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        let GenerateTarget::Local(local) = generate.target else {
+            panic!("expected local target");
+        };
+        assert_eq!(local.traces, 1.0);
+        assert_eq!(local.otel_endpoint, "http://127.0.0.1:4318/v1/traces");
     }
 
     #[test]

@@ -112,7 +112,8 @@ fn build_validators(
             metrics_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
-            traces: 0.0,
+            traces: local.traces,
+            otel_endpoint: local_otel_endpoint(local),
             bootstrappers: bootstrappers.clone(),
             indexer: None,
             relayer: None,
@@ -185,7 +186,8 @@ fn build_secondaries(
             metrics_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
-            traces: 0.0,
+            traces: local.traces,
+            otel_endpoint: local_otel_endpoint(local),
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| local_indexer_config(local.chain_indexer_port)),
@@ -237,6 +239,10 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
         chain_indexer_url: url,
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
+}
+
+fn local_otel_endpoint(local: &LocalArgs) -> Option<String> {
+    (local.traces > 0.0).then(|| local.otel_endpoint.clone())
 }
 
 fn print_local_run_commands(
@@ -414,6 +420,8 @@ mod tests {
             chain_indexer_port: 8090,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
+            traces: 0.0,
+            otel_endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
         }
     }
 
@@ -439,6 +447,25 @@ mod tests {
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
+    }
+
+    #[test]
+    fn local_validator_configs_include_otel_when_traces_enabled() {
+        let mut args = test_args(false);
+        let GenerateTarget::Local(local) = &mut args.target else {
+            panic!("expected local target");
+        };
+        local.traces = 0.5;
+        local.otel_endpoint = "http://127.0.0.1:4318/v1/traces".to_string();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(&args, local_args(&args), Path::new("/tmp"), &material);
+
+        assert_eq!(validators[0].config.traces, 0.5);
+        assert_eq!(
+            validators[0].config.otel_endpoint.as_deref(),
+            Some("http://127.0.0.1:4318/v1/traces")
+        );
     }
 
     #[test]

@@ -63,15 +63,15 @@ where
             .instrument(info_span!("application.propose.input"))
             .await;
 
-        let (input, candidate_transfers) =
+        let (input, candidate_operations) =
             info_span!("application.propose.prepare").in_scope(|| {
                 let input = executor::prepare_proposal(body);
-                let candidate_transfers = input
+                let candidate_operations = input
                     .candidates
                     .iter()
-                    .map(|candidate| candidate.transfer.clone())
+                    .map(|candidate| candidate.operation.clone())
                     .collect::<Vec<_>>();
-                (input, candidate_transfers)
+                (input, candidate_operations)
             });
 
         let (state_batch, transaction_batch) = batches;
@@ -80,7 +80,7 @@ where
             transaction_batch,
             parent,
             input,
-            &candidate_transfers,
+            &candidate_operations,
         )
         .await;
 

@@ -198,6 +198,25 @@ mprocs ...   # paste the line printed by `generate`
 Then open <http://localhost:5173> in your browser to watch transactions
 arrive in real time.
 
+### Local OTLP Traces
+
+Local validator configs can export tracing spans over OTLP HTTP. Start an
+OpenTelemetry-compatible collector such as Tempo on `127.0.0.1:4318`, then add
+`--traces` to the local target:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --indexer --relayer \
+  --output-dir ./local \
+  --spammer \
+  local \
+  --traces 1.0 \
+  --otel-endpoint http://127.0.0.1:4318/v1/traces
+```
+
+`--traces` is a sampling rate in `0.0..=1.0`; `0.0` disables OTLP export. The
+endpoint defaults to `http://127.0.0.1:4318/v1/traces`.
+
 To recover explorer verification material from an existing generated node
 config:
 

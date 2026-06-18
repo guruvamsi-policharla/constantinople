@@ -25,7 +25,7 @@ use commonware_storage::{
 use commonware_utils::sequence::FixedBytes;
 use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use constantinople_primitives::{Account, AccountKey, BlockCfg, MockPrivatePaymentBackend};
 use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
@@ -56,9 +56,10 @@ pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
 type QmdbFamily = mmr::Family;
-type AccountValue = FixedBytes<{ Account::SIZE }>;
+type ChainAccount = Account<MockPrivatePaymentBackend>;
+type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
-type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<Account>>;
+type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<ChainAccount>>;
 type StateOperation = UnorderedOperation<QmdbFamily, AccountKey, StateEncoding>;
 type TransactionEncoding<H> = FixedEncoding<<H as Hasher>::Digest>;
 type TransactionOperation<H> = keyless::Operation<QmdbFamily, TransactionEncoding<H>>;
@@ -1475,7 +1476,7 @@ fn encode_account_operation(operation: LocalStateOperation) -> StateOperation {
 
 fn encode_account(account: Account) -> AccountValue {
     let bytes = account.encode();
-    let mut out = [0u8; Account::SIZE];
+    let mut out = [0u8; ChainAccount::SIZE];
     out.copy_from_slice(&bytes);
     FixedBytes::new(out)
 }
@@ -1715,6 +1716,7 @@ mod tests {
                     encode_account(Account {
                         balance: u64::from(seed),
                         nonce: Nonce::default(),
+                        private: Default::default(),
                     }),
                 )),
                 StateOperation::CommitFloor(None, Location::new(0)),
@@ -2057,6 +2059,7 @@ mod tests {
                         Account {
                             balance: 10,
                             nonce: Nonce::default(),
+                            private: Default::default(),
                         },
                     ),
                     (
@@ -2064,6 +2067,7 @@ mod tests {
                         Account {
                             balance: 20,
                             nonce: Nonce::default(),
+                            private: Default::default(),
                         },
                     ),
                 ],
@@ -2090,6 +2094,7 @@ mod tests {
                         Account {
                             balance: 9,
                             nonce: Nonce::new(1, 0),
+                            private: Default::default(),
                         },
                     ),
                     (
@@ -2097,6 +2102,7 @@ mod tests {
                         Account {
                             balance: 30,
                             nonce: Nonce::default(),
+                            private: Default::default(),
                         },
                     ),
                 ],
@@ -2453,6 +2459,7 @@ mod tests {
                 encode_account(Account {
                     balance: u64::from(seed),
                     nonce: Nonce::default(),
+                    private: Default::default(),
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
@@ -2491,6 +2498,7 @@ mod tests {
                 encode_account(Account {
                     balance: 1,
                     nonce: Nonce::default(),
+                    private: Default::default(),
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),

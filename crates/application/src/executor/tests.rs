@@ -1,8 +1,8 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
-    TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, MockCommitment, MockProof, NONCE_BITMAP_CAPACITY,
+    Nonce, Payload, PrivateAccount, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 
@@ -34,12 +34,35 @@ impl TestSigner {
         )
         .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
+
+    fn sign_payload(&self, payload: Payload, nonce: u64) -> TestTransaction {
+        Transaction::from_payload(
+            TransactionPublicKey::ed25519(self.key.public_key()),
+            payload,
+            nonce,
+        )
+        .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
+    }
 }
 
 fn account(balance: u64, nonce: u64) -> Account {
     Account {
         balance,
         nonce: Nonce::new(nonce, 0),
+        private: PrivateAccount::default(),
+    }
+}
+
+fn account_with_private(
+    balance: u64,
+    nonce: u64,
+    current: MockCommitment,
+    pending: MockCommitment,
+) -> Account {
+    Account {
+        balance,
+        nonce: Nonce::new(nonce, 0),
+        private: PrivateAccount { current, pending },
     }
 }
 
@@ -54,7 +77,7 @@ fn changeset_account(
     let account_key = account_key(&public_key);
     changeset
         .iter()
-        .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
+        .find_map(|(candidate, account)| (candidate == &account_key).then_some(account.clone()))
 }
 
 #[test]
@@ -76,7 +99,9 @@ fn proposal_tracks_pending_nonce_and_balance() {
     assert_eq!(proposal.invalid.len(), 1);
     assert_eq!(proposal.valid[0].value().nonce, 0);
     assert_eq!(proposal.valid[1].value().nonce, 1);
-    assert_eq!(proposal.invalid[0].value().value.get(), 7);
+    assert!(
+        matches!(&proposal.invalid[0].value().payload, Payload::PublicTransfer { value, .. } if value.get() == 7)
+    );
 }
 
 #[test]
@@ -209,7 +234,16 @@ fn unique_loaded_execution_matches_overlay_execution() {
         .expect("test transactions should prepare");
     let loaded = transfers
         .iter()
-        .flat_map(|transfer| [accounts[&transfer.sender], accounts[&transfer.recipient]])
+        .flat_map(|transfer| {
+            let recipient = match &transfer.payload {
+                super::PreparedPayload::PublicTransfer { recipient, .. } => recipient,
+                _ => unreachable!("test uses public transfers"),
+            };
+            [
+                (transfer.sender.clone(), accounts[&transfer.sender].clone()),
+                (recipient.clone(), accounts[recipient].clone()),
+            ]
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -270,6 +304,262 @@ fn recipient_overflow_rejects_without_charging_sender() {
     accounts.insert(account_key(&recipient.public_key), account(u64::MAX, 0));
 
     let transactions = vec![signer.sign(recipient.public_key, 1, 0)];
+    let proposal = propose(&accounts, transactions);
+
+    assert!(proposal.valid.is_empty());
+    assert_eq!(proposal.invalid.len(), 1);
+    assert!(proposal.changeset.is_empty());
+    assert!(execute_prepared(&accounts, &proposal.invalid).is_none());
+}
+
+#[test]
+fn private_fund_reduces_public_balance_and_adds_pending() {
+    let signer = TestSigner::from_seed(50);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+
+    let transactions = vec![signer.sign_payload(
+        Payload::PrivateFund {
+            value: NonZeroU64::new(4).unwrap(),
+            commitment: MockCommitment::new(4, 0),
+            proof: MockProof,
+        },
+        0,
+    )];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.invalid.len(), 0);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            6,
+            1,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(4, 0)
+        ))
+    );
+}
+
+#[test]
+fn private_rollover_explicitly_moves_pending_to_current() {
+    let signer = TestSigner::from_seed(51);
+    let mut accounts = State::new();
+    accounts.insert(
+        account_key(&signer.public_key),
+        account_with_private(10, 0, MockCommitment::new(2, 7), MockCommitment::new(4, 3)),
+    );
+
+    let transactions = vec![signer.sign_payload(Payload::PrivateRollover, 0)];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.invalid.len(), 0);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            10,
+            1,
+            MockCommitment::new(6, 10),
+            MockCommitment::new(0, 0)
+        ))
+    );
+}
+
+#[test]
+fn private_transfer_spends_current_and_credits_recipient_pending() {
+    let signer = TestSigner::from_seed(52);
+    let recipient = TestSigner::from_seed(53);
+    let mut accounts = State::new();
+    accounts.insert(
+        account_key(&signer.public_key),
+        account_with_private(10, 0, MockCommitment::new(7, 11), MockCommitment::new(0, 0)),
+    );
+    accounts.insert(account_key(&recipient.public_key), account(5, 0));
+
+    let amount = MockCommitment::new(3, 2);
+    let transactions = vec![signer.sign_payload(
+        Payload::PrivateTransfer {
+            to: account_key(&recipient.public_key),
+            amount,
+            proof: MockProof,
+        },
+        0,
+    )];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.invalid.len(), 0);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            10,
+            1,
+            MockCommitment::new(4, 9),
+            MockCommitment::new(0, 0)
+        ))
+    );
+    assert_eq!(
+        changeset_account(&changeset, recipient.public_key),
+        Some(account_with_private(
+            5,
+            0,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(3, 2)
+        ))
+    );
+}
+
+#[test]
+fn private_fund_cannot_be_spent_before_explicit_rollover() {
+    let signer = TestSigner::from_seed(54);
+    let recipient = TestSigner::from_seed(55);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), account(0, 0));
+
+    let transactions = vec![
+        signer.sign_payload(
+            Payload::PrivateFund {
+                value: NonZeroU64::new(4).unwrap(),
+                commitment: MockCommitment::new(4, 0),
+                proof: MockProof,
+            },
+            0,
+        ),
+        signer.sign_payload(
+            Payload::PrivateTransfer {
+                to: account_key(&recipient.public_key),
+                amount: MockCommitment::new(4, 0),
+                proof: MockProof,
+            },
+            1,
+        ),
+    ];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.valid.len(), 1);
+    assert_eq!(proposal.invalid.len(), 1);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            6,
+            1,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(4, 0)
+        ))
+    );
+}
+
+#[test]
+fn private_fund_rollover_then_transfer_is_valid() {
+    let signer = TestSigner::from_seed(56);
+    let recipient = TestSigner::from_seed(57);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), account(0, 0));
+
+    let transactions = vec![
+        signer.sign_payload(
+            Payload::PrivateFund {
+                value: NonZeroU64::new(4).unwrap(),
+                commitment: MockCommitment::new(4, 0),
+                proof: MockProof,
+            },
+            0,
+        ),
+        signer.sign_payload(Payload::PrivateRollover, 1),
+        signer.sign_payload(
+            Payload::PrivateTransfer {
+                to: account_key(&recipient.public_key),
+                amount: MockCommitment::new(4, 0),
+                proof: MockProof,
+            },
+            2,
+        ),
+    ];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.invalid.len(), 0);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            6,
+            3,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(0, 0)
+        ))
+    );
+    assert_eq!(
+        changeset_account(&changeset, recipient.public_key),
+        Some(account_with_private(
+            0,
+            0,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(4, 0)
+        ))
+    );
+}
+
+#[test]
+fn private_burn_resets_current_and_credits_public_balance() {
+    let signer = TestSigner::from_seed(58);
+    let mut accounts = State::new();
+    accounts.insert(
+        account_key(&signer.public_key),
+        account_with_private(10, 0, MockCommitment::new(4, 7), MockCommitment::new(2, 3)),
+    );
+
+    let transactions = vec![signer.sign_payload(
+        Payload::PrivateBurn {
+            value: NonZeroU64::new(4).unwrap(),
+            proof: MockCommitment::new(4, 7),
+        },
+        0,
+    )];
+    let proposal = propose(&accounts, transactions);
+    let changeset = execute_prepared(&accounts, &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(proposal.invalid.len(), 0);
+    assert_eq!(proposal.changeset, changeset);
+    assert_eq!(
+        changeset_account(&changeset, signer.public_key),
+        Some(account_with_private(
+            14,
+            1,
+            MockCommitment::new(0, 0),
+            MockCommitment::new(2, 3)
+        ))
+    );
+}
+
+#[test]
+fn invalid_private_fund_proof_does_not_mutate_overlay() {
+    let signer = TestSigner::from_seed(59);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+
+    let transactions = vec![signer.sign_payload(
+        Payload::PrivateFund {
+            value: NonZeroU64::new(4).unwrap(),
+            commitment: MockCommitment::new(5, 0),
+            proof: MockProof,
+        },
+        0,
+    )];
     let proposal = propose(&accounts, transactions);
 
     assert!(proposal.valid.is_empty());

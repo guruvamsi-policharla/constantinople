@@ -80,7 +80,7 @@ where
     changeset
         .iter()
         .fold(batch, |batch, (account_key, account)| {
-            batch.write(account_key.clone(), Some(*account))
+            batch.write(account_key.clone(), Some(account.clone()))
         })
 }
 

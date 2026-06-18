@@ -100,6 +100,10 @@ pub struct ValidatorConfig {
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
     pub traces: f64,
+    /// Optional OTLP HTTP traces endpoint. Local configs set this directly;
+    /// deployer configs usually derive it from the monitoring host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_endpoint: Option<String>,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -371,13 +375,15 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
         })
         .collect();
 
+    let otel = local_otel(&config);
+
     decode_with_network(
         config,
         public_listen,
         primary_participants,
         secondary_participants,
         bootstrappers,
-        None,
+        otel,
         false,
     )
 }
@@ -431,10 +437,11 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .collect();
 
     let otel = (config.traces > 0.0).then(|| {
-        (
-            format!("http://{}:4318/v1/traces", hosts.monitoring.private),
-            config.traces,
-        )
+        let endpoint = config
+            .otel_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:4318/v1/traces", hosts.monitoring.private));
+        (endpoint, config.traces)
     });
 
     decode_with_network(
@@ -446,6 +453,16 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         otel,
         true,
     )
+}
+
+fn local_otel(config: &ValidatorConfig) -> Option<(String, f64)> {
+    (config.traces > 0.0).then(|| {
+        let endpoint = config
+            .otel_endpoint
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:4318/v1/traces".to_string());
+        (endpoint, config.traces)
+    })
 }
 
 #[cfg(test)]
@@ -574,6 +591,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 traces: 0.0,
+                otel_endpoint: None,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -607,6 +625,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 traces: 0.0,
+                otel_endpoint: None,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -955,6 +974,54 @@ hosts:
         let loaded = load_local_config(&peers_path, &config_path);
 
         assert_eq!(loaded.startup, StartupModeConfig::StateSync);
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(peers_path);
+    }
+
+    #[test]
+    fn local_config_enables_otel_traces() {
+        let cluster = Cluster::new(2, 0);
+        let self_key = &cluster.primary_keys[0];
+        let peer_key = &cluster.primary_keys[1];
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("validator-peers", ".yaml");
+
+        let mut config = cluster.primary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            vec![bootstrapper_entry(peer_key)],
+        );
+        config.traces = 1.0;
+        config.otel_endpoint = Some("http://127.0.0.1:4318/v1/traces".to_string());
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &peers_path,
+            format!(
+                r#"validators:
+  - name: "{self_name}"
+    p2p: "127.0.0.1:9000"
+    http: "127.0.0.1:8080"
+  - name: "{peer_name}"
+    p2p: "127.0.0.1:9001"
+    http: "127.0.0.1:8081"
+"#,
+                self_name = hex(&self_key.encode()),
+                peer_name = hex(&peer_key.encode()),
+            ),
+        )
+        .expect("peers should write");
+
+        let loaded = load_local_config(&peers_path, &config_path);
+
+        assert_eq!(
+            loaded.otel,
+            Some(("http://127.0.0.1:4318/v1/traces".to_string(), 1.0))
+        );
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);

@@ -12,7 +12,7 @@ use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
 use commonware_consensus::{Reporter, Viewable};
 use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
@@ -423,6 +423,8 @@ async fn account(
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
+    private: String,
+    pending: String,
 }
 
 #[derive(Serialize)]
@@ -436,6 +438,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
+            private: hex(&account.private.current.encode()),
+            pending: hex(&account.private.pending.encode()),
         }
     }
 }
@@ -596,6 +600,7 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 
 const fn min_signed_transaction_bytes() -> usize {
     constantinople_primitives::TransactionPublicKey::SIZE
+        + 1
         + constantinople_primitives::TransactionPublicKey::SIZE
         + 1
         + 1
