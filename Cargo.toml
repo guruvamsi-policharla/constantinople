@@ -62,7 +62,7 @@ commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", r
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
-commonware-privacy = { path = "../monorepo/privacy", default-features = false }
+commonware-privacy = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6", default-features = false }
 
 # Exoware
 exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }

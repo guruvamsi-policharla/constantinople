@@ -364,8 +364,7 @@ fn local_run_commands(
              --accounts-jitter {} \
              --presigned-batches {} \
              --workload {} \
-             --private-groups {} \
-             --private-proof-mode {}",
+             --private-groups {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -375,7 +374,6 @@ fn local_run_commands(
             args.spammer_presigned_batches,
             args.spammer_workload.as_str(),
             args.spammer_private_groups,
-            args.spammer_private_proof_mode.as_str(),
         ));
     }
 
@@ -420,7 +418,6 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
-            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -505,7 +502,6 @@ mod tests {
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
         assert!(commands[3].contains("--workload public"));
-        assert!(commands[3].contains("--private-proof-mode real"));
     }
 
     #[test]
@@ -594,24 +590,6 @@ mod tests {
         );
 
         assert!(commands[3].contains("--private-groups 4"));
-    }
-
-    #[test]
-    fn local_run_commands_propagate_simulated_private_proof_mode_to_spammer() {
-        let mut args = test_args(true);
-        args.relayer = true;
-        args.spammer_workload = crate::SpammerWorkload::Private;
-        args.spammer_private_proof_mode = crate::SpammerPrivateProofMode::Simulated;
-        let commands = local_run_commands(
-            Path::new("/tmp/configs"),
-            &args,
-            local_args(&args),
-            &[],
-            TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
-
-        assert!(commands[3].contains("cargo run --release --bin constantinople-spammer"));
-        assert!(commands[3].contains("--private-proof-mode simulated"));
     }
 
     #[test]

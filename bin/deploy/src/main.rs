@@ -85,23 +85,6 @@ impl SpammerWorkload {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SpammerPrivateProofMode {
-    #[default]
-    Real,
-    Simulated,
-}
-
-impl SpammerPrivateProofMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Simulated => "simulated",
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
 struct Cli {
@@ -179,12 +162,6 @@ pub(crate) struct GenerateArgs {
     /// the size of each group.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRIVATE_GROUPS)]
     spammer_private_groups: usize,
-    /// Private transfer proof generation mode for the spammer.
-    ///
-    /// `simulated` is for local/private testnets only and requires building the
-    /// spammer with the private-payment simulator feature.
-    #[arg(long, value_enum, default_value_t = SpammerPrivateProofMode::Real)]
-    spammer_private_proof_mode: SpammerPrivateProofMode,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -313,9 +290,6 @@ pub(crate) struct SpammerConfig {
     /// Independent private global-ring groups per relayer submitter.
     #[serde(default = "default_spammer_private_groups")]
     pub private_groups: usize,
-    /// Private transfer proof generation mode.
-    #[serde(default)]
-    pub private_proof_mode: SpammerPrivateProofMode,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -705,9 +679,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerPrivateProofMode,
-        SpammerWorkload, generate_local_cluster_material,
-        simplex_verification_material_from_config, write_simplex_verification_material,
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerWorkload,
+        generate_local_cluster_material, simplex_verification_material_from_config,
+        write_simplex_verification_material,
     };
     use clap::Parser;
     use commonware_codec::Encode;
@@ -944,31 +918,6 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_private_groups, 4);
-    }
-
-    #[test]
-    fn parses_spammer_private_proof_mode() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-private-proof-mode",
-            "simulated",
-            "local",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        assert_eq!(
-            generate.spammer_private_proof_mode,
-            SpammerPrivateProofMode::Simulated
-        );
     }
 
     #[test]

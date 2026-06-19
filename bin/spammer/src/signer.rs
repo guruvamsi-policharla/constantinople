@@ -1,6 +1,6 @@
 //! Ring-pattern transaction signing and batch sizing.
 
-use crate::{accounts::SpamAccount, config::PrivateProofMode};
+use crate::accounts::SpamAccount;
 use commonware_cryptography::{Sha256, ed25519};
 use commonware_parallel::Strategy;
 use commonware_privacy::payments::{Backend, Commitment, Opening};
@@ -161,12 +161,6 @@ pub struct PrivateBatchState<'a> {
     pub cursor: &'a mut usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PrivateBatchSpec {
-    pub count: usize,
-    pub proof_mode: PrivateProofMode,
-}
-
 #[derive(Debug, Clone)]
 struct PrivateEffect {
     digest: String,
@@ -224,10 +218,9 @@ pub fn sign_private_batch<St: Strategy>(
     accounts: &[SpamAccount],
     value: NonZeroU64,
     state: PrivateBatchState<'_>,
-    spec: PrivateBatchSpec,
+    count: usize,
     rng: &mut impl RngCore,
 ) -> PrivateBatch {
-    let count = spec.count;
     assert_eq!(
         accounts.len(),
         state.nonces.len(),
@@ -280,7 +273,7 @@ pub fn sign_private_batch<St: Strategy>(
         }
 
         let realized = strategy.map_collect_vec(plans, |plan| {
-            realize_private_tx(accounts, value.get(), spec.proof_mode, plan)
+            realize_private_tx(accounts, value.get(), plan)
         });
         for realized in realized {
             apply_private_effect(
@@ -359,7 +352,6 @@ fn plan_private_payload(
 fn realize_private_tx(
     accounts: &[SpamAccount],
     value: u64,
-    proof_mode: PrivateProofMode,
     plan: PlannedPrivateTx,
 ) -> RealizedPrivateTx {
     let mut rng = StdRng::seed_from_u64(plan.seed);
@@ -387,7 +379,6 @@ fn realize_private_tx(
             input_commitment,
             input_opening,
         } => {
-            let _ = proof_mode;
             let (amount, opening, proof) = PrivateBackend::transfer(
                 PrivateBackend::params(),
                 &input_commitment,
@@ -461,7 +452,7 @@ fn apply_private_effect(
         } => {
             states[sender_index].current.withdraw(amount, opening);
             states[*recipient_index].pending.deposit(amount, opening);
-            states[sender_index].phase = next_transfer_phase(
+            states[sender_index].phase = private_phase_for(
                 states[sender_index].current.value(),
                 states[sender_index].pending.value(),
                 states[sender_index].public_balance,
@@ -489,15 +480,6 @@ fn next_fund_value(state: &PrivateSpamState, value: u64) -> Option<u64> {
         return Some(public_balance.min(value));
     }
     (public_balance >= needed).then_some(needed)
-}
-
-const fn next_transfer_phase(
-    current: u64,
-    pending: u64,
-    public_balance: u64,
-    value: u64,
-) -> PrivatePhase {
-    private_phase_for(current, pending, public_balance, value)
 }
 
 const fn private_phase_for(
@@ -643,10 +625,7 @@ mod tests {
                 states: &mut states,
                 cursor: &mut cursor,
             },
-            PrivateBatchSpec {
-                count: 12,
-                proof_mode: PrivateProofMode::Real,
-            },
+            12,
             &mut rng,
         );
 
@@ -682,39 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn private_batch_can_use_simulated_transfer_proofs() {
-        let accounts = generate_accounts(3, 1000);
-        let value = NonZeroU64::new(1).unwrap();
-        let mut nonces = vec![0; accounts.len()];
-        let mut states = vec![PrivateSpamState::default(); accounts.len()];
-        let mut cursor = 0;
-        let mut rng = StdRng::seed_from_u64(23);
-
-        let batch = sign_private_batch(
-            &Sequential,
-            &accounts,
-            value,
-            PrivateBatchState {
-                nonces: &mut nonces,
-                states: &mut states,
-                cursor: &mut cursor,
-            },
-            PrivateBatchSpec {
-                count: 9,
-                proof_mode: PrivateProofMode::Simulated,
-            },
-            &mut rng,
-        );
-
-        assert!(
-            batch
-                .txs
-                .iter()
-                .any(|tx| matches!(tx.value().payload, Payload::PrivateTransfer { .. }))
-        );
-    }
-
-    #[test]
     fn private_outcome_replay_advances_only_included_transactions() {
         let accounts = generate_accounts(3, 1000);
         let value = NonZeroU64::new(1).unwrap();
@@ -731,10 +677,7 @@ mod tests {
                 states: &mut candidate_states,
                 cursor: &mut candidate_cursor,
             },
-            PrivateBatchSpec {
-                count: accounts.len(),
-                proof_mode: PrivateProofMode::Real,
-            },
+            accounts.len(),
             &mut rng,
         );
         let included = HashSet::from([batch.txs[0].message_digest().to_string()]);
@@ -779,10 +722,7 @@ mod tests {
                 states: &mut states,
                 cursor: &mut cursor,
             },
-            PrivateBatchSpec {
-                count: 12,
-                proof_mode: PrivateProofMode::Real,
-            },
+            12,
             &mut rng,
         );
 
@@ -836,10 +776,7 @@ mod tests {
                 states: &mut states,
                 cursor: &mut cursor,
             },
-            PrivateBatchSpec {
-                count: 1,
-                proof_mode: PrivateProofMode::Real,
-            },
+            1,
             &mut rng,
         );
 
@@ -878,10 +815,7 @@ mod tests {
                 states: &mut states,
                 cursor: &mut cursor,
             },
-            PrivateBatchSpec {
-                count: accounts.len(),
-                proof_mode: PrivateProofMode::Real,
-            },
+            accounts.len(),
             &mut rng,
         );
         let body = batch.txs.as_slice().encode();

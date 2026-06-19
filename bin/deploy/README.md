@@ -93,11 +93,6 @@ the chain backend. Each account funds most of its starting balance, keeps a
 small public reserve for recovery, explicitly rolls funded or incoming private
 balance over, then submits private transfers until its current private balance
 is exhausted.
-Add `--spammer-private-proof-mode simulated` for local/private testnets that
-should use backend simulator hooks when the selected backend supports them.
-With the current mock-only backend this uses the same mock transfer path as
-`real`.
-
 You can also run the spammer manually against an existing local cluster:
 
 ```sh

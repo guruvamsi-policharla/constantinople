@@ -27,7 +27,7 @@ fn executor(c: &mut Criterion) {
                 let (state, transactions) = build_fixture(transaction_count);
                 let transfers = transactions
                     .iter()
-                    .map(executor::prepare_transfer)
+                    .map(executor::prepare_operation)
                     .collect::<Option<Vec<_>>>()
                     .expect("bench transactions should prepare");
                 bencher.iter(|| {

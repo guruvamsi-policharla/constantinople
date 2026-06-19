@@ -282,7 +282,6 @@ fn remote_spammer_config(
         accounts_jitter: args.spammer_accounts_jitter,
         workload: args.spammer_workload,
         private_groups: args.spammer_private_groups,
-        private_proof_mode: args.spammer_private_proof_mode,
     }
 }
 
@@ -519,7 +518,6 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
-            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,

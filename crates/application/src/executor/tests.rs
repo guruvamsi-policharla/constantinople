@@ -1,4 +1,4 @@
-use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
+use super::{ProposalOutput, State, execute, execute_unique, prepare_operation, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
     Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, MockCommitment, MockPrivatePaymentBackend,
@@ -231,7 +231,7 @@ fn unique_loaded_execution_matches_overlay_execution() {
     ];
     let transfers = transactions
         .iter()
-        .map(prepare_transfer)
+        .map(prepare_operation)
         .collect::<Option<Vec<_>>>()
         .expect("test transactions should prepare");
     let loaded = transfers
@@ -576,7 +576,7 @@ fn execute_prepared(
 ) -> Option<super::Changeset<TestBackend>> {
     let transfers = transactions
         .iter()
-        .map(prepare_transfer)
+        .map(prepare_operation)
         .collect::<Option<Vec<_>>>()?;
     execute(accounts, &transfers)
 }

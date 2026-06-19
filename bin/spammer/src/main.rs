@@ -18,13 +18,13 @@ use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
-use config::{PrivateProofMode, Workload};
+use config::Workload;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
 use rand::{SeedableRng as _, rngs::StdRng};
 use signer::{
-    PrivateBatchSpec, PrivateBatchState, PrivateSpamState, Tx, apply_private_finalized_batch,
-    sign_batch, sign_private_batch,
+    PrivateBatchState, PrivateSpamState, Tx, apply_private_finalized_batch, sign_batch,
+    sign_private_batch,
 };
 use std::{
     collections::HashSet,
@@ -52,7 +52,6 @@ fn main() {
         accounts_jitter,
         workload,
         private_groups,
-        private_proof_mode,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
@@ -77,7 +76,6 @@ fn main() {
             cfg.accounts_jitter,
             cfg.workload,
             cfg.private_groups,
-            cfg.private_proof_mode,
         )
     } else {
         (
@@ -95,7 +93,6 @@ fn main() {
             cli.accounts_jitter,
             cli.workload,
             cli.private_groups,
-            cli.private_proof_mode,
         )
     };
     assert!(
@@ -149,7 +146,6 @@ fn main() {
             worker_threads,
             workload,
             private_groups,
-            private_proof_mode,
         };
         run_relayer_mode(config, strategy).await;
     });
@@ -167,7 +163,6 @@ struct RelayerModeConfig {
     worker_threads: usize,
     workload: Workload,
     private_groups: usize,
-    private_proof_mode: PrivateProofMode,
 }
 
 async fn run_relayer_mode(
@@ -186,7 +181,6 @@ async fn run_relayer_mode(
         worker_threads,
         workload,
         private_groups,
-        private_proof_mode,
     } = config;
 
     info!(
@@ -197,7 +191,6 @@ async fn run_relayer_mode(
         accounts_jitter,
         worker_threads,
         workload = ?workload,
-        private_proof_mode = ?private_proof_mode,
         private_groups,
         %relayer_url,
         presigned_batches,
@@ -232,7 +225,6 @@ async fn run_relayer_mode(
                     seed_offset,
                     relayer_submitters,
                     private_groups,
-                    proof_mode: private_proof_mode,
                 };
                 spawn_outcome_aware_private_groups(submitter, index, private_config, strategy);
             }
@@ -317,7 +309,6 @@ struct PrivateGroupConfig {
     seed_offset: u64,
     relayer_submitters: usize,
     private_groups: usize,
-    proof_mode: PrivateProofMode,
 }
 
 fn spawn_outcome_aware_private_groups(
@@ -342,7 +333,6 @@ fn spawn_outcome_aware_private_groups(
             config.value,
             group_index,
             account_offset,
-            config.proof_mode,
             strategy.clone(),
         ));
     }
@@ -354,7 +344,6 @@ async fn submit_outcome_aware_private_group<St>(
     value: NonZeroU64,
     group_index: usize,
     proof_seed: u64,
-    private_proof_mode: PrivateProofMode,
     strategy: St,
 ) where
     St: commonware_parallel::Strategy + Send + 'static,
@@ -386,10 +375,7 @@ async fn submit_outcome_aware_private_group<St>(
                         states: &mut candidate_states,
                         cursor: &mut candidate_cursor,
                     },
-                    PrivateBatchSpec {
-                        count: accounts_for_signer.len(),
-                        proof_mode: private_proof_mode,
-                    },
+                    accounts_for_signer.len(),
                     &mut proof_rng,
                 );
                 (

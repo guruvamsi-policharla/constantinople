@@ -1339,13 +1339,6 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.5.0"
-dependencies = [
- "commonware-macros-impl 2026.5.0",
-]
-
-[[package]]
-name = "commonware-macros"
-version = "2026.5.0"
 source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "commonware-macros-impl 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
@@ -1353,8 +1346,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonware-macros"
+version = "2026.5.0"
+source = "git+https://github.com/commonwarexyz/monorepo.git?rev=ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6#ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6"
+dependencies = [
+ "commonware-macros-impl 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6)",
+]
+
+[[package]]
 name = "commonware-macros-impl"
 version = "2026.5.0"
+source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1366,7 +1368,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
+source = "git+https://github.com/commonwarexyz/monorepo.git?rev=ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6#ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1430,8 +1432,9 @@ dependencies = [
 [[package]]
 name = "commonware-privacy"
 version = "2026.5.0"
+source = "git+https://github.com/commonwarexyz/monorepo.git?rev=ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6#ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6"
 dependencies = [
- "commonware-macros 2026.5.0",
+ "commonware-macros 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=ff7387c8361b7b6b8d1d3c7f115e5f3e598502f6)",
  "rand_core 0.6.4",
 ]
 

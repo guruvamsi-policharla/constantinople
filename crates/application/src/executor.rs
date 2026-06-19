@@ -224,17 +224,6 @@ where
     propose_prepared(state, prepare_proposal(transactions))
 }
 
-/// Backward-compatible public name.
-pub fn prepare_transfer<H, B>(
-    transaction: &SignedTransaction<H, B>,
-) -> Option<PreparedOperation<H, B>>
-where
-    H: Hasher,
-    B: PrivatePaymentBackend,
-{
-    prepare_operation(transaction)
-}
-
 /// Prepares one transaction for account execution.
 pub fn prepare_operation<H, B>(
     transaction: &SignedTransaction<H, B>,
@@ -444,9 +433,11 @@ where
             }
             sender.balance -= *value;
             sender.private.deposit(commitment);
-            private_verifications
-                .funds
-                .push((*value, commitment.clone(), proof.clone()));
+            if !verify_private {
+                private_verifications
+                    .funds
+                    .push((*value, commitment.clone(), proof.clone()));
+            }
             state.set(operation.sender.clone(), sender);
             true
         }
@@ -464,9 +455,11 @@ where
             }
             sender.private.withdraw(amount);
             recipient_account.private.deposit(amount);
-            private_verifications
-                .transfers
-                .push((current, amount.clone(), proof.clone()));
+            if !verify_private {
+                private_verifications
+                    .transfers
+                    .push((current, amount.clone(), proof.clone()));
+            }
             state.set(operation.sender.clone(), sender);
             state.set(recipient.clone(), recipient_account);
             true
@@ -481,9 +474,11 @@ where
             };
             sender.balance = next_balance;
             sender.private.burn();
-            private_verifications
-                .burns
-                .push((current, *value, proof.clone()));
+            if !verify_private {
+                private_verifications
+                    .burns
+                    .push((current, *value, proof.clone()));
+            }
             state.set(operation.sender.clone(), sender);
             true
         }

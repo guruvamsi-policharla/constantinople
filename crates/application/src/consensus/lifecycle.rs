@@ -213,7 +213,7 @@ where
                 .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
         let body = materialized
             .iter()
-            .map(executor::prepare_transfer)
+            .map(executor::prepare_operation)
             .collect::<Option<Vec<_>>>()
             .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 

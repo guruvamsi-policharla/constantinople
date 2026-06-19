@@ -76,7 +76,7 @@ where
         .await
         .expect("proposal state loading must succeed");
 
-    let output = info_span!("application.execute.transfers")
+    let output = info_span!("application.execute.operations")
         .in_scope(|| executor::propose_prepared(&state, input));
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = operation_digests(&output.operations);
@@ -113,7 +113,7 @@ where
 {
     let operations = info_span!("application.execute.prepare").in_scope(|| {
         body.iter()
-            .map(|transaction| executor::prepare_transfer(transaction.get()?))
+            .map(|transaction| executor::prepare_operation(transaction.get()?))
             .collect::<Option<Vec<_>>>()
             .ok_or(MALFORMED_TRANSACTION)
     })?;
