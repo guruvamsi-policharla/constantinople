@@ -15,7 +15,6 @@ workspace = true
 # Workspace
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
-private-payments.workspace = true
 
 # Commonware
 commonware-glue.workspace = true
@@ -26,6 +25,7 @@ commonware-storage.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-privacy.workspace = true
 
 # Other
 rand.workspace = true

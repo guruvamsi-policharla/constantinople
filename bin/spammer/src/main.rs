@@ -19,9 +19,8 @@ use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use config::{PrivateProofMode, Workload};
-use constantinople_primitives::{ChainPrivatePaymentBackend, DEFAULT_ACCOUNT_BALANCE};
+use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
-use private_payments::Backend as _;
 use rand::{SeedableRng as _, rngs::StdRng};
 use signer::{
     PrivateBatchSpec, PrivateBatchState, PrivateSpamState, Tx, apply_private_finalized_batch,
@@ -114,12 +113,6 @@ fn main() {
     assert!(
         value <= DEFAULT_ACCOUNT_BALANCE,
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
-    );
-    assert!(
-        workload != Workload::Private
-            || private_proof_mode != PrivateProofMode::Simulated
-            || ChainPrivatePaymentBackend::SUPPORTS_SIMULATED_TRANSFER,
-        "--private-proof-mode simulated requires building the spammer with --features private-payment-simulator"
     );
     let value = NonZeroU64::new(value).expect("checked above");
 

@@ -348,14 +348,7 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
-        let spammer_cargo = match args.spammer_private_proof_mode {
-            crate::SpammerPrivateProofMode::Real => {
-                "cargo run --release --bin constantinople-spammer"
-            }
-            crate::SpammerPrivateProofMode::Simulated => {
-                "cargo run --release -p constantinople-spammer --features private-payment-simulator --bin constantinople-spammer"
-            }
-        };
+        let spammer_cargo = "cargo run --release --bin constantinople-spammer";
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
@@ -617,8 +610,7 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert!(commands[3].contains("-p constantinople-spammer"));
-        assert!(commands[3].contains("--features private-payment-simulator"));
+        assert!(commands[3].contains("cargo run --release --bin constantinople-spammer"));
         assert!(commands[3].contains("--private-proof-mode simulated"));
     }
 

@@ -16,7 +16,6 @@ workspace = true
 # Workspace
 constantinople-primitives.workspace = true
 constantinople-mempool.workspace = true
-private-payments.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
@@ -26,6 +25,7 @@ commonware-formatting.workspace = true
 commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 commonware-utils.workspace = true
+commonware-privacy.workspace = true
 
 # Other
 clap = { workspace = true, features = ["derive", "std"] }
@@ -37,9 +37,6 @@ tracing.workspace = true
 serde_yaml.workspace = true
 reqwest.workspace = true
 rand.workspace = true
-
-[features]
-private-payment-simulator = ["constantinople-primitives/private-payment-simulator"]
 
 [[bin]]
 name = "constantinople-spammer"

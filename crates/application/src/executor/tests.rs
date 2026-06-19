@@ -527,7 +527,7 @@ fn private_burn_resets_current_and_credits_public_balance() {
     let transactions = vec![signer.sign_payload(
         Payload::PrivateBurn {
             value: NonZeroU64::new(4).unwrap(),
-            proof: MockCommitment::new(4, 7),
+            proof: MockCommitment::new(4, 0),
         },
         0,
     )];

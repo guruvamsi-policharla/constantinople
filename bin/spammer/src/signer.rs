@@ -3,13 +3,13 @@
 use crate::{accounts::SpamAccount, config::PrivateProofMode};
 use commonware_cryptography::{Sha256, ed25519};
 use commonware_parallel::Strategy;
+use commonware_privacy::payments::{Backend, Commitment, Opening};
 use constantinople_primitives::{
     AccountKey, ChainPrivatePaymentBackend, DEFAULT_ACCOUNT_BALANCE, Payload,
     PrivatePaymentBackend, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
     TransactionPublicKey,
 };
 use core::num::NonZeroU64;
-use private_payments::{Backend, Commitment, Opening};
 use rand::{RngCore, SeedableRng as _, rngs::StdRng};
 use std::collections::HashSet;
 
@@ -122,18 +122,18 @@ impl PrivateClientBalance {
         }
     }
 
-    fn value(&self) -> u64 {
+    const fn value(&self) -> u64 {
         self.opening.value()
     }
 
     fn deposit(&mut self, commitment: &PrivateCommitment, opening: &PrivateOpening) {
-        self.commitment = self.commitment.clone() + commitment;
-        self.opening = self.opening.clone() + opening;
+        self.commitment = self.commitment + commitment;
+        self.opening = self.opening + opening;
     }
 
     fn withdraw(&mut self, commitment: &PrivateCommitment, opening: &PrivateOpening) {
-        self.commitment = self.commitment.clone() - commitment;
-        self.opening = self.opening.clone() - opening;
+        self.commitment = self.commitment - commitment;
+        self.opening = self.opening - opening;
     }
 
     fn reset(&mut self) {
@@ -349,8 +349,8 @@ fn plan_private_payload(
                 "private spammer current balance too low"
             );
             Some(PlannedPrivatePayload::Transfer {
-                input_commitment: state.current.commitment.clone(),
-                input_opening: state.current.opening.clone(),
+                input_commitment: state.current.commitment,
+                input_opening: state.current.opening,
             })
         }
     }
@@ -370,7 +370,7 @@ fn realize_private_tx(
             (
                 Payload::PrivateFund {
                     value: NonZeroU64::new(fund_value).expect("fund value is non-zero"),
-                    commitment: commitment.clone(),
+                    commitment,
                     proof,
                 },
                 PrivateEffectPayload::Fund {
@@ -387,26 +387,18 @@ fn realize_private_tx(
             input_commitment,
             input_opening,
         } => {
-            let (amount, opening, proof) = match proof_mode {
-                PrivateProofMode::Real => PrivateBackend::transfer(
-                    PrivateBackend::params(),
-                    &input_commitment,
-                    &input_opening,
-                    value,
-                    &mut rng,
-                ),
-                PrivateProofMode::Simulated => PrivateBackend::simulate_transfer(
-                    PrivateBackend::params(),
-                    &input_commitment,
-                    &input_opening,
-                    value,
-                    &mut rng,
-                ),
-            };
+            let _ = proof_mode;
+            let (amount, opening, proof) = PrivateBackend::transfer(
+                PrivateBackend::params(),
+                &input_commitment,
+                &input_opening,
+                value,
+                &mut rng,
+            );
             (
                 Payload::PrivateTransfer {
                     to: account_key(&accounts[plan.recipient_index].public_key),
-                    amount: amount.clone(),
+                    amount,
                     proof,
                 },
                 PrivateEffectPayload::Transfer {
@@ -689,7 +681,6 @@ mod tests {
         assert_eq!(states[2].pending.value(), 2);
     }
 
-    #[cfg(feature = "private-payment-simulator")]
     #[test]
     fn private_batch_can_use_simulated_transfer_proofs() {
         let accounts = generate_accounts(3, 1000);

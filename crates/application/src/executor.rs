@@ -8,7 +8,6 @@ use constantinople_primitives::{
     SignedTransaction, TransactionPublicKey,
 };
 use hashbrown::HashMap;
-use private_payments::Transaction as PrivateTransaction;
 use rand_core::OsRng;
 use tracing::info_span;
 
@@ -17,6 +16,60 @@ pub type State<B = ChainPrivatePaymentBackend> = HashMap<AccountKey, Account<B>>
 
 /// Deterministic account writes produced by execution.
 pub type Changeset<B = ChainPrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
+
+type FundVerification<B> = (
+    u64,
+    <B as commonware_privacy::payments::Backend>::Commitment,
+    <B as commonware_privacy::payments::Backend>::FundProof,
+);
+type TransferVerification<B> = (
+    <B as commonware_privacy::payments::Backend>::Commitment,
+    <B as commonware_privacy::payments::Backend>::Commitment,
+    <B as commonware_privacy::payments::Backend>::TransferProof,
+);
+type BurnVerification<B> = (
+    <B as commonware_privacy::payments::Backend>::Commitment,
+    u64,
+    <B as commonware_privacy::payments::Backend>::BurnProof,
+);
+
+#[derive(Debug)]
+struct PrivateVerifications<B: PrivatePaymentBackend> {
+    funds: Vec<FundVerification<B>>,
+    transfers: Vec<TransferVerification<B>>,
+    burns: Vec<BurnVerification<B>>,
+}
+
+impl<B> PrivateVerifications<B>
+where
+    B: PrivatePaymentBackend,
+{
+    const fn new() -> Self {
+        Self {
+            funds: Vec::new(),
+            transfers: Vec::new(),
+            burns: Vec::new(),
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.funds.is_empty() && self.transfers.is_empty() && self.burns.is_empty()
+    }
+
+    const fn len(&self) -> usize {
+        self.funds.len() + self.transfers.len() + self.burns.len()
+    }
+
+    fn verify(&self) -> bool {
+        B::batch_verify(
+            B::params(),
+            &self.funds,
+            &self.transfers,
+            &self.burns,
+            &mut OsRng,
+        )
+    }
+}
 
 /// Prepared transaction operation.
 #[derive(Debug, Clone)]
@@ -242,29 +295,24 @@ where
     .entered();
 
     let mut overlay = Overlay::new(state, operations.len());
-    let mut private_txs = Vec::new();
-    let mut sender_currents = Vec::new();
+    let mut private_verifications = PrivateVerifications::new();
 
     for operation in operations {
-        if !apply_operation::<H, B>(
-            &mut overlay,
-            operation,
-            false,
-            &mut private_txs,
-            &mut sender_currents,
-        ) {
+        if !apply_operation::<H, B>(&mut overlay, operation, false, &mut private_verifications) {
             return None;
         }
     }
 
-    if !private_txs.is_empty() {
+    if !private_verifications.is_empty() {
         let verified = info_span!(
             "application.executor.private_batch_verify",
             backend = B::NAME,
-            private_txs = private_txs.len(),
-            sender_currents = sender_currents.len()
+            private_txs = private_verifications.len(),
+            private_funds = private_verifications.funds.len(),
+            private_transfers = private_verifications.transfers.len(),
+            private_burns = private_verifications.burns.len()
         )
-        .in_scope(|| B::batch_verify(B::params(), &private_txs, &sender_currents, &mut OsRng));
+        .in_scope(|| private_verifications.verify());
         if !verified {
             return None;
         }
@@ -341,23 +389,15 @@ where
     H: Hasher,
     B: PrivatePaymentBackend,
 {
-    let mut private_txs = Vec::new();
-    let mut sender_currents = Vec::new();
-    apply_operation(
-        state,
-        operation,
-        verify_private,
-        &mut private_txs,
-        &mut sender_currents,
-    )
+    let mut private_verifications = PrivateVerifications::new();
+    apply_operation(state, operation, verify_private, &mut private_verifications)
 }
 
 fn apply_operation<H, B>(
     state: &mut Overlay<'_, B>,
     operation: &PreparedOperation<H, B>,
     verify_private: bool,
-    private_txs: &mut Vec<PrivateTransaction<B>>,
-    sender_currents: &mut Vec<B::Commitment>,
+    private_verifications: &mut PrivateVerifications<B>,
 ) -> bool
 where
     H: Hasher,
@@ -399,18 +439,14 @@ where
             if sender.balance < *value {
                 return false;
             }
-            let tx = PrivateTransaction::Fund {
-                sender: 0,
-                value: *value,
-                fund_commitment: commitment.clone(),
-                proof: proof.clone(),
-            };
-            if verify_private && !verify_single::<B>(&tx, &[]) {
+            if verify_private && !verify_fund::<B>(*value, commitment, proof) {
                 return false;
             }
             sender.balance -= *value;
             sender.private.deposit(commitment);
-            private_txs.push(tx);
+            private_verifications
+                .funds
+                .push((*value, commitment.clone(), proof.clone()));
             state.set(operation.sender.clone(), sender);
             true
         }
@@ -423,31 +459,21 @@ where
                 return false;
             };
             let current = sender.private.current.clone();
-            let tx = PrivateTransaction::Transfer {
-                sender: 0,
-                recipient: 1,
-                amount_commitment: amount.clone(),
-                proof: proof.clone(),
-            };
-            if verify_private && !verify_single::<B>(&tx, core::slice::from_ref(&current)) {
+            if verify_private && !verify_transfer::<B>(&current, amount, proof) {
                 return false;
             }
             sender.private.withdraw(amount);
             recipient_account.private.deposit(amount);
-            private_txs.push(tx);
-            sender_currents.push(current);
+            private_verifications
+                .transfers
+                .push((current, amount.clone(), proof.clone()));
             state.set(operation.sender.clone(), sender);
             state.set(recipient.clone(), recipient_account);
             true
         }
         PreparedPayload::PrivateBurn { value, proof } => {
             let current = sender.private.current.clone();
-            let tx = PrivateTransaction::Burn {
-                sender: 0,
-                value: *value,
-                proof: proof.clone(),
-            };
-            if verify_private && !verify_single::<B>(&tx, core::slice::from_ref(&current)) {
+            if verify_private && !verify_burn::<B>(&current, *value, proof) {
                 return false;
             }
             let Some(next_balance) = sender.balance.checked_add(*value) else {
@@ -455,8 +481,9 @@ where
             };
             sender.balance = next_balance;
             sender.private.burn();
-            private_txs.push(tx);
-            sender_currents.push(current);
+            private_verifications
+                .burns
+                .push((current, *value, proof.clone()));
             state.set(operation.sender.clone(), sender);
             true
         }
@@ -468,11 +495,47 @@ where
     }
 }
 
-fn verify_single<B>(tx: &PrivateTransaction<B>, currents: &[B::Commitment]) -> bool
+fn verify_fund<B>(value: u64, commitment: &B::Commitment, proof: &B::FundProof) -> bool
 where
     B: PrivatePaymentBackend,
 {
-    B::batch_verify(B::params(), core::slice::from_ref(tx), currents, &mut OsRng)
+    B::batch_verify(
+        B::params(),
+        &[(value, commitment.clone(), proof.clone())],
+        &[],
+        &[],
+        &mut OsRng,
+    )
+}
+
+fn verify_transfer<B>(
+    current: &B::Commitment,
+    amount: &B::Commitment,
+    proof: &B::TransferProof,
+) -> bool
+where
+    B: PrivatePaymentBackend,
+{
+    B::batch_verify(
+        B::params(),
+        &[],
+        &[(current.clone(), amount.clone(), proof.clone())],
+        &[],
+        &mut OsRng,
+    )
+}
+
+fn verify_burn<B>(current: &B::Commitment, value: u64, proof: &B::BurnProof) -> bool
+where
+    B: PrivatePaymentBackend,
+{
+    B::batch_verify(
+        B::params(),
+        &[],
+        &[],
+        &[(current.clone(), value, proof.clone())],
+        &mut OsRng,
+    )
 }
 
 #[cfg(test)]

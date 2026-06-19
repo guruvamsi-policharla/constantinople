@@ -41,9 +41,6 @@ redundant-clone = "warn"
 constantinople-engine = { path = "crates/engine" }
 constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
-private-payments = { path = "../private-payments/crates/payments" }
-private-payments-mock = { path = "../private-payments/crates/mock", features = ["commonware-codec"] }
-zkpari = { path = "../private-payments/crates/zkpari", features = ["commonware-codec"] }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
@@ -65,6 +62,7 @@ commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", r
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
+commonware-privacy = { path = "../monorepo/privacy", default-features = false }
 
 # Exoware
 exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
@@ -78,7 +76,6 @@ datafusion = "52"
 # Other
 axum = "0.8"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
-ark-bn254 = { version = "^0.6.0", default-features = false, features = ["curve"] }
 clap = { version = "4", default-features = false }
 rand = { version = "0.8.5", default-features = false }
 bytes = { version = "1.11.1", default-features = false }

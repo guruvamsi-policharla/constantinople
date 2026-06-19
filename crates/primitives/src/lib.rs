@@ -7,7 +7,7 @@ pub use sealed::{Sealable, Sealed};
 mod privacy;
 pub use privacy::{
     ChainPrivatePaymentBackend, MockCommitment, MockOpening, MockPrivatePaymentBackend, MockProof,
-    PrivateAccount, PrivatePaymentBackend, ZkPariPrivatePaymentBackend,
+    PrivateAccount, PrivatePaymentBackend,
 };
 
 mod signed;
