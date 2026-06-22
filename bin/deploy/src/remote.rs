@@ -7,10 +7,9 @@ use crate::{
     QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
+    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -165,8 +164,11 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            network_buffer_pool_max_bytes: args.network_buffer_pool_max_bytes,
+            max_shard_bytes: args.max_shard_bytes,
+            mempool_drop_grace_blocks: args.mempool_drop_grace_blocks,
             traces: remote.traces,
             otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
@@ -219,15 +221,18 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            network_buffer_pool_max_bytes: args.network_buffer_pool_max_bytes,
+            max_shard_bytes: args.max_shard_bytes,
+            mempool_drop_grace_blocks: args.mempool_drop_grace_blocks,
             traces: remote.traces,
             otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| remote_indexer_config(remote.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
-                .then(|| remote_relayer_config(remote, material)),
+                .then(|| remote_relayer_config(args, remote, material)),
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -250,7 +255,11 @@ fn remote_indexer_config(port: u16) -> IndexerConfig {
     }
 }
 
-fn remote_relayer_config(remote: &RemoteArgs, material: &ClusterMaterial) -> RelayerConfig {
+fn remote_relayer_config(
+    args: &GenerateArgs,
+    remote: &RemoteArgs,
+    material: &ClusterMaterial,
+) -> RelayerConfig {
     let leaders = material
         .primary_hex()
         .into_iter()
@@ -260,7 +269,10 @@ fn remote_relayer_config(remote: &RemoteArgs, material: &ClusterMaterial) -> Rel
         })
         .collect();
 
-    RelayerConfig { leaders }
+    RelayerConfig {
+        max_retry_views: args.relayer_max_retry_views,
+        leaders,
+    }
 }
 
 fn remote_spammer_config(
@@ -282,6 +294,7 @@ fn remote_spammer_config(
         accounts_jitter: args.spammer_accounts_jitter,
         workload: args.spammer_workload,
         private_groups: args.spammer_private_groups,
+        private_proof_mode: args.spammer_private_proof_mode,
     }
 }
 
@@ -491,8 +504,9 @@ mod tests {
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, generate_local_cluster_material,
-        total_secondaries, validate_generate_args,
+        default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
+        default_network_buffer_pool_max_bytes, generate_local_cluster_material, total_secondaries,
+        validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -503,10 +517,16 @@ mod tests {
             validators: 3,
             indexer: false,
             relayer: false,
+            relayer_max_retry_views: crate::DEFAULT_RELAYER_MAX_RETRY_VIEWS,
             output_dir: PathBuf::from("artifacts"),
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
+            network_buffer_pool_max_bytes: default_network_buffer_pool_max_bytes(),
+            max_shard_bytes: default_max_shard_bytes(),
+            mempool_drop_grace_blocks: None,
             startup: StartupModeConfig::MarshalSync,
             spammer: false,
             spammer_accounts: 10,
@@ -518,6 +538,7 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
+            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -578,6 +599,9 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                network_buffer_pool_max_bytes: default_network_buffer_pool_max_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
+                mempool_drop_grace_blocks: None,
                 traces: 0.0,
                 otel_endpoint: None,
                 bootstrappers: Vec::new(),

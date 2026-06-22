@@ -41,3 +41,9 @@ rand.workspace = true
 [[bin]]
 name = "constantinople-spammer"
 path = "src/main.rs"
+
+[features]
+privacy-backend-simulator = [
+	"constantinople-primitives/privacy-backend-simulator",
+	"commonware-privacy/simulator",
+]

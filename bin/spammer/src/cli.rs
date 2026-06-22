@@ -1,6 +1,6 @@
 //! CLI definition.
 
-use crate::config::Workload;
+use crate::config::{PrivateProofMode, Workload};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Parser)]
@@ -66,6 +66,10 @@ pub struct Cli {
     /// Only used for private workload. `--accounts` is the size of each group.
     #[arg(long, default_value_t = crate::config::DEFAULT_PRIVATE_GROUPS)]
     pub private_groups: usize,
+
+    /// Proof mode for private transfers.
+    #[arg(long, value_enum, default_value_t = PrivateProofMode::Real)]
+    pub private_proof_mode: PrivateProofMode,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
@@ -81,7 +85,7 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use crate::config::Workload;
+    use crate::config::{PrivateProofMode, Workload};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -104,6 +108,7 @@ mod tests {
         assert!(cli.hosts.is_none());
         assert_eq!(cli.workload, Workload::Public);
         assert_eq!(cli.private_groups, crate::config::DEFAULT_PRIVATE_GROUPS);
+        assert_eq!(cli.private_proof_mode, PrivateProofMode::Real);
         assert_eq!(cli.worker_threads, crate::config::DEFAULT_WORKER_THREADS);
     }
 
@@ -203,6 +208,20 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.private_groups, 4);
+    }
+
+    #[test]
+    fn parses_private_proof_mode() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--private-proof-mode",
+            "simulated",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.private_proof_mode, PrivateProofMode::Simulated);
     }
 
     #[test]

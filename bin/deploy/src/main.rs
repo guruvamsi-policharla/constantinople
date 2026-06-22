@@ -59,6 +59,7 @@ const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_WORKER_THREADS: usize = 2;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 const DEFAULT_SPAMMER_PRIVATE_GROUPS: usize = 1;
+const DEFAULT_RELAYER_MAX_RETRY_VIEWS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,11 +77,28 @@ pub(crate) enum SpammerWorkload {
     Private,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerPrivateProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
 impl SpammerWorkload {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Public => "public",
             Self::Private => "private",
+        }
+    }
+}
+
+impl SpammerPrivateProofMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
         }
     }
 }
@@ -115,6 +133,9 @@ pub(crate) struct GenerateArgs {
     /// Include a transaction relayer secondary.
     #[arg(long, default_value_t = false)]
     relayer: bool,
+    /// View advances the relayer waits before returning a best-effort outcome.
+    #[arg(long, default_value_t = DEFAULT_RELAYER_MAX_RETRY_VIEWS)]
+    relayer_max_retry_views: u64,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "info")]
@@ -123,6 +144,21 @@ pub(crate) struct GenerateArgs {
     worker_threads: usize,
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Maximum bytes a validator proposes in one block.
+    #[arg(long, default_value_t = default_max_propose_bytes())]
+    max_propose_bytes: usize,
+    /// Maximum bytes a validator keeps in its mempool.
+    #[arg(long, default_value_t = default_max_pool_bytes())]
+    max_pool_bytes: usize,
+    /// Maximum single network buffer allocation for received P2P messages.
+    #[arg(long, default_value_t = default_network_buffer_pool_max_bytes())]
+    network_buffer_pool_max_bytes: usize,
+    /// Maximum accepted marshal coding shard payload size.
+    #[arg(long, default_value_t = default_max_shard_bytes())]
+    max_shard_bytes: usize,
+    /// Finalized-block window before a proposed mempool batch is reported as dropped.
+    #[arg(long)]
+    mempool_drop_grace_blocks: Option<u64>,
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
 
@@ -162,6 +198,9 @@ pub(crate) struct GenerateArgs {
     /// the size of each group.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRIVATE_GROUPS)]
     spammer_private_groups: usize,
+    /// Private transfer proof generation mode.
+    #[arg(long, value_enum, default_value_t = SpammerPrivateProofMode::Real)]
+    spammer_private_proof_mode: SpammerPrivateProofMode,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -290,11 +329,15 @@ pub(crate) struct SpammerConfig {
     /// Independent private global-ring groups per relayer submitter.
     #[serde(default = "default_spammer_private_groups")]
     pub private_groups: usize,
+    /// Private transfer proof generation mode.
+    #[serde(default)]
+    pub private_proof_mode: SpammerPrivateProofMode,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerConfig {
+    pub max_retry_views: u64,
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
@@ -356,6 +399,10 @@ pub(crate) struct ValidatorConfig {
     metrics_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
+    network_buffer_pool_max_bytes: usize,
+    max_shard_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mempool_drop_grace_blocks: Option<u64>,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
@@ -667,6 +714,14 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+pub(crate) const fn default_network_buffer_pool_max_bytes() -> usize {
+    default_max_propose_bytes()
+}
+
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    default_max_propose_bytes()
+}
+
 pub(crate) fn generate_deployer_tag() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -679,9 +734,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerWorkload,
-        generate_local_cluster_material, simplex_verification_material_from_config,
-        write_simplex_verification_material,
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerPrivateProofMode,
+        SpammerWorkload, generate_local_cluster_material,
+        simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::Parser;
     use commonware_codec::Encode;
@@ -918,6 +973,119 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_private_groups, 4);
+    }
+
+    #[test]
+    fn parses_relayer_max_retry_views() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--relayer-max-retry-views",
+            "64",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.relayer_max_retry_views, 64);
+    }
+
+    #[test]
+    fn parses_mempool_drop_grace_blocks() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--mempool-drop-grace-blocks",
+            "512",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.mempool_drop_grace_blocks, Some(512));
+    }
+
+    #[test]
+    fn parses_network_buffer_pool_max_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--network-buffer-pool-max-bytes",
+            "8388608",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.network_buffer_pool_max_bytes, 8_388_608);
+    }
+
+    #[test]
+    fn parses_max_shard_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-shard-bytes",
+            "8388608",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_shard_bytes, 8_388_608);
+    }
+
+    #[test]
+    fn parses_spammer_private_proof_mode() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-private-proof-mode",
+            "simulated",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(
+            generate.spammer_private_proof_mode,
+            SpammerPrivateProofMode::Simulated
+        );
     }
 
     #[test]

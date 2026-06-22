@@ -5,9 +5,18 @@ mod sealed;
 pub use sealed::{Sealable, Sealed};
 
 mod privacy;
+#[cfg(feature = "privacy-backend-mock")]
+pub use commonware_privacy::mocks::{
+    MockBackend as MockPrivatePaymentBackend, MockCommitment, MockOpening, MockProof,
+};
+#[cfg(feature = "privacy-backend-simulator")]
+pub use privacy::PrivatePaymentSimulatorBackend;
+#[cfg(feature = "privacy-backend-zkpari")]
+pub use privacy::ZkPariBn254Backend;
 pub use privacy::{
-    ChainPrivatePaymentBackend, MockCommitment, MockOpening, MockPrivatePaymentBackend, MockProof,
-    PrivateAccount, PrivatePaymentBackend,
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend,
+    PrivatePaymentExecutionBackend, StatePrivatePaymentBackend, to_state_burn_proof,
+    to_state_commitment, to_state_fund_proof, to_state_transfer_proof,
 };
 
 mod signed;
@@ -17,7 +26,10 @@ pub use signed::{
 };
 
 mod account;
-pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce};
+pub use account::{
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, StateAccount,
+    from_state_account, to_state_account,
+};
 
 mod auth;
 pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};

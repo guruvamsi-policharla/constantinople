@@ -34,6 +34,7 @@ impl Stats {
 }
 
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const SUBMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Submits batches through a relayer and records each batch outcome.
 #[derive(Clone)]
@@ -157,6 +158,7 @@ impl RelayerSubmitter {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     error = %error,
+                    error_debug = ?error,
                     backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
                     "relayer submit error, advancing"
                 );
@@ -183,7 +185,11 @@ impl RelayerSubmitter {
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
-        let response = request.body(body).send().await?;
+        let response = request
+            .timeout(SUBMIT_REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await?;
 
         match response.status().as_u16() {
             200 => {

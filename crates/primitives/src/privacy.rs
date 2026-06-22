@@ -1,17 +1,55 @@
 //! Chain-facing private payment backend adapter.
 //!
 //! Constantinople uses the `commonware-privacy` payments API, while this module
-//! owns the chain-specific wire/state requirements and the local mock backend
-//! used by the current executable chain configuration.
+//! owns the chain-specific wire/state requirements and compile-time backend
+//! selection for the executable chain configuration.
 
 use bytes::{Buf, BufMut};
 use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
-use commonware_privacy::payments::{Backend, Commitment, Opening};
-use rand_core::CryptoRngCore;
+use commonware_privacy::payments::{Backend, Commitment};
 use std::sync::OnceLock;
 
+#[cfg(feature = "privacy-backend-zkpari")]
+pub type ZkPariBn254Backend =
+    commonware_privacy::zkpari::payments::codec::UncompressedCheckedBn254Backend;
+
+/// Backend used for local state-database account encoding.
+///
+/// The zkpari state path uses uncompressed, unchecked points because these bytes
+/// are read from authenticated local state rather than directly from clients.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub type StatePrivatePaymentBackend =
+    commonware_privacy::zkpari::payments::codec::UncompressedUncheckedBn254Backend;
+
 /// Backend used by Constantinople's executable chain types.
-pub type ChainPrivatePaymentBackend = MockPrivatePaymentBackend;
+///
+/// The default build uses the monorepo mock backend. Enable
+/// `privacy-backend-zkpari` on `constantinople-primitives` to use the ZK-Pari
+/// BN254 backend instead.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub type ChainPrivatePaymentBackend = ZkPariBn254Backend;
+
+/// Backend used by Constantinople's executable chain types.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub type ChainPrivatePaymentBackend = commonware_privacy::mocks::MockBackend;
+
+/// Backend used for local state-database account encoding.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub type StatePrivatePaymentBackend = commonware_privacy::mocks::MockBackend;
+
+#[cfg(not(any(feature = "privacy-backend-mock", feature = "privacy-backend-zkpari")))]
+compile_error!(
+    "enable one private payment backend: privacy-backend-mock or privacy-backend-zkpari"
+);
+
+#[cfg(feature = "privacy-backend-zkpari")]
+const ZKPARI_BN254_SETUP_SEED: [u8; 32] = *b"constantinople-zkpari-bn254-0001";
 
 /// Backend requirements imposed by Constantinople's wire/state codecs.
 pub trait PrivatePaymentBackend:
@@ -64,6 +102,40 @@ pub trait PrivatePaymentBackend:
 
     /// Verifier/prover parameters used by chain execution.
     fn params() -> &'static Self::Params;
+}
+
+/// Conversion from a decoded transaction backend into the backend used by
+/// internal execution/state.
+pub trait PrivatePaymentExecutionBackend: PrivatePaymentBackend {
+    /// Backend used after transaction decoding has performed any needed checks.
+    type ExecutionBackend: PrivatePaymentBackend;
+
+    /// Convert a transaction commitment into the execution representation.
+    fn to_execution_commitment(
+        commitment: Self::Commitment,
+    ) -> <Self::ExecutionBackend as Backend>::Commitment;
+
+    /// Convert a transaction fund proof into the execution representation.
+    fn to_execution_fund_proof(
+        proof: Self::FundProof,
+    ) -> <Self::ExecutionBackend as Backend>::FundProof;
+
+    /// Convert a transaction transfer proof into the execution representation.
+    fn to_execution_transfer_proof(
+        proof: Self::TransferProof,
+    ) -> <Self::ExecutionBackend as Backend>::TransferProof;
+
+    /// Convert a transaction burn proof into the execution representation.
+    fn to_execution_burn_proof(
+        proof: Self::BurnProof,
+    ) -> <Self::ExecutionBackend as Backend>::BurnProof;
+}
+
+/// Simulator trapdoor access for trusted benchmarking and load generation.
+#[cfg(feature = "privacy-backend-simulator")]
+pub trait PrivatePaymentSimulatorBackend: PrivatePaymentBackend {
+    /// Toxic-waste trapdoor matching [`PrivatePaymentBackend::params`].
+    fn simulator_trapdoor() -> &'static Self::Trapdoor;
 }
 
 /// Stored private commitment state for one Constantinople account.
@@ -313,253 +385,8 @@ where
     }
 }
 
-/// Non-cryptographic backend for tests and local load generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MockPrivatePaymentBackend;
-
-/// Mock commitment `(value, blinding)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MockCommitment {
-    value: u64,
-    blind: u64,
-}
-
-impl MockCommitment {
-    /// Construct a mock commitment.
-    pub const fn new(value: u64, blind: u64) -> Self {
-        Self { value, blind }
-    }
-
-    /// Committed value component.
-    pub const fn value(&self) -> u64 {
-        self.value
-    }
-
-    /// Mock blinding component.
-    pub const fn blind(&self) -> u64 {
-        self.blind
-    }
-}
-
-impl core::ops::Add<&Self> for MockCommitment {
-    type Output = Self;
-
-    fn add(self, rhs: &Self) -> Self::Output {
-        Self {
-            value: self.value.wrapping_add(rhs.value),
-            blind: self.blind.wrapping_add(rhs.blind),
-        }
-    }
-}
-
-impl core::ops::Sub<&Self> for MockCommitment {
-    type Output = Self;
-
-    fn sub(self, rhs: &Self) -> Self::Output {
-        Self {
-            value: self.value.wrapping_sub(rhs.value),
-            blind: self.blind.wrapping_sub(rhs.blind),
-        }
-    }
-}
-
-impl Commitment for MockCommitment {
-    fn zero() -> Self {
-        Self { value: 0, blind: 0 }
-    }
-}
-
-impl FixedSize for MockCommitment {
-    const SIZE: usize = u64::SIZE + u64::SIZE;
-}
-
-impl Write for MockCommitment {
-    fn write(&self, buf: &mut impl BufMut) {
-        self.value.write(buf);
-        self.blind.write(buf);
-    }
-}
-
-impl Read for MockCommitment {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self::new(u64::read(buf)?, u64::read(buf)?))
-    }
-}
-
-/// Mock opening `(value, blinding)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MockOpening {
-    value: u64,
-    blind: u64,
-}
-
-impl MockOpening {
-    /// Construct a mock opening.
-    pub const fn new(value: u64, blind: u64) -> Self {
-        Self { value, blind }
-    }
-
-    /// Opened value.
-    pub const fn value(&self) -> u64 {
-        self.value
-    }
-
-    /// Mock blinding component.
-    pub const fn blind(&self) -> u64 {
-        self.blind
-    }
-}
-
-impl core::ops::Add<&Self> for MockOpening {
-    type Output = Self;
-
-    fn add(self, rhs: &Self) -> Self::Output {
-        Self {
-            value: self.value.wrapping_add(rhs.value),
-            blind: self.blind.wrapping_add(rhs.blind),
-        }
-    }
-}
-
-impl core::ops::Sub<&Self> for MockOpening {
-    type Output = Self;
-
-    fn sub(self, rhs: &Self) -> Self::Output {
-        Self {
-            value: self.value.wrapping_sub(rhs.value),
-            blind: self.blind.wrapping_sub(rhs.blind),
-        }
-    }
-}
-
-impl Opening for MockOpening {
-    fn zero() -> Self {
-        Self { value: 0, blind: 0 }
-    }
-
-    fn value(&self) -> u64 {
-        self.value
-    }
-}
-
-impl FixedSize for MockOpening {
-    const SIZE: usize = u64::SIZE + u64::SIZE;
-}
-
-impl Write for MockOpening {
-    fn write(&self, buf: &mut impl BufMut) {
-        self.value.write(buf);
-        self.blind.write(buf);
-    }
-}
-
-impl Read for MockOpening {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self::new(u64::read(buf)?, u64::read(buf)?))
-    }
-}
-
-/// Empty mock proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MockProof;
-
-impl FixedSize for MockProof {
-    const SIZE: usize = 0;
-}
-
-impl Write for MockProof {
-    fn write(&self, _buf: &mut impl BufMut) {}
-}
-
-impl Read for MockProof {
-    type Cfg = ();
-
-    fn read_cfg(_buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self)
-    }
-}
-
-impl Backend for MockPrivatePaymentBackend {
-    type Params = ();
-    type Commitment = MockCommitment;
-    type Opening = MockOpening;
-    type FundProof = MockProof;
-    type TransferProof = MockProof;
-    type BurnProof = MockCommitment;
-    type SetupInput = ();
-    type SetupError = core::convert::Infallible;
-
-    fn setup(_input: &Self::SetupInput) -> Result<Self::Params, Self::SetupError> {
-        Ok(())
-    }
-
-    fn commit_public(_params: &Self::Params, value: u64) -> (Self::Commitment, Self::Opening) {
-        (MockCommitment::new(value, 0), MockOpening::new(value, 0))
-    }
-
-    fn fund(
-        _params: &Self::Params,
-        value: u64,
-        _rng: &mut impl CryptoRngCore,
-    ) -> (Self::Commitment, Self::Opening, Self::FundProof) {
-        (
-            MockCommitment::new(value, 0),
-            MockOpening::new(value, 0),
-            MockProof,
-        )
-    }
-
-    fn transfer(
-        _params: &Self::Params,
-        _input_commitment: &Self::Commitment,
-        _input_opening: &Self::Opening,
-        amount: u64,
-        rng: &mut impl CryptoRngCore,
-    ) -> (Self::Commitment, Self::Opening, Self::TransferProof) {
-        let blind = rng.next_u64();
-        (
-            MockCommitment::new(amount, blind),
-            MockOpening::new(amount, blind),
-            MockProof,
-        )
-    }
-
-    fn burn(
-        _params: &Self::Params,
-        commitment: &Self::Commitment,
-        opening: &Self::Opening,
-        amount: u64,
-        _rng: &mut impl CryptoRngCore,
-    ) -> Self::BurnProof {
-        assert!(amount <= opening.value());
-        assert!(amount <= commitment.value());
-        MockCommitment::new(amount, 0)
-    }
-
-    fn batch_verify(
-        _params: &Self::Params,
-        funds: &[(u64, Self::Commitment, Self::FundProof)],
-        transfers: &[(Self::Commitment, Self::Commitment, Self::TransferProof)],
-        burns: &[(Self::Commitment, u64, Self::BurnProof)],
-        _rng: &mut impl CryptoRngCore,
-    ) -> bool {
-        funds
-            .iter()
-            .all(|(value, commitment, _)| *commitment == MockCommitment::new(*value, 0))
-            && transfers
-                .iter()
-                .all(|(current, amount, _)| current.value >= amount.value)
-            && burns.iter().all(|(current, value, proof)| {
-                current.value >= *value && *proof == MockCommitment::new(*value, 0)
-            })
-    }
-}
-
-impl PrivatePaymentBackend for MockPrivatePaymentBackend {
+#[cfg(feature = "privacy-backend-mock")]
+impl PrivatePaymentBackend for commonware_privacy::mocks::MockBackend {
     const NAME: &'static str = "mock";
 
     fn params() -> &'static Self::Params {
@@ -568,12 +395,212 @@ impl PrivatePaymentBackend for MockPrivatePaymentBackend {
     }
 }
 
+#[cfg(all(
+    feature = "privacy-backend-mock",
+    feature = "privacy-backend-simulator"
+))]
+impl PrivatePaymentSimulatorBackend for commonware_privacy::mocks::MockBackend {
+    fn simulator_trapdoor() -> &'static Self::Trapdoor {
+        static TRAPDOOR: OnceLock<()> = OnceLock::new();
+        TRAPDOOR.get_or_init(|| ())
+    }
+}
+
+#[cfg(feature = "privacy-backend-mock")]
+impl PrivatePaymentExecutionBackend for commonware_privacy::mocks::MockBackend {
+    type ExecutionBackend = Self;
+
+    fn to_execution_commitment(commitment: Self::Commitment) -> Self::Commitment {
+        commitment
+    }
+
+    fn to_execution_fund_proof(proof: Self::FundProof) -> Self::FundProof {
+        proof
+    }
+
+    fn to_execution_transfer_proof(proof: Self::TransferProof) -> Self::TransferProof {
+        proof
+    }
+
+    fn to_execution_burn_proof(proof: Self::BurnProof) -> Self::BurnProof {
+        proof
+    }
+}
+
+#[cfg(feature = "privacy-backend-zkpari")]
+impl PrivatePaymentBackend for ZkPariBn254Backend {
+    const NAME: &'static str = "zkpari-bn254";
+
+    fn params() -> &'static Self::Params {
+        static PARAMS: OnceLock<<ZkPariBn254Backend as Backend>::Params> = OnceLock::new();
+        PARAMS.get_or_init(|| {
+            Self::setup(&ZKPARI_BN254_SETUP_SEED).expect("zkpari setup is infallible")
+        })
+    }
+}
+
+#[cfg(all(
+    feature = "privacy-backend-zkpari",
+    feature = "privacy-backend-simulator"
+))]
+impl PrivatePaymentSimulatorBackend for ZkPariBn254Backend {
+    fn simulator_trapdoor() -> &'static Self::Trapdoor {
+        use rand::{SeedableRng as _, rngs::StdRng};
+
+        static TRAPDOOR: OnceLock<<ZkPariBn254Backend as Backend>::Trapdoor> = OnceLock::new();
+        TRAPDOOR.get_or_init(|| {
+            let mut rng = StdRng::from_seed(ZKPARI_BN254_SETUP_SEED);
+            let (_range_pk, _range_vk, trapdoor) = commonware_privacy::zkpari::ZkPari::<
+                ark_bn254::Bn254,
+            >::keygen_with_trapdoor(&mut rng);
+            trapdoor
+        })
+    }
+}
+
+#[cfg(feature = "privacy-backend-zkpari")]
+impl PrivatePaymentExecutionBackend for ZkPariBn254Backend {
+    type ExecutionBackend = StatePrivatePaymentBackend;
+
+    fn to_execution_commitment(
+        commitment: Self::Commitment,
+    ) -> <Self::ExecutionBackend as Backend>::Commitment {
+        to_state_commitment(commitment)
+    }
+
+    fn to_execution_fund_proof(
+        proof: Self::FundProof,
+    ) -> <Self::ExecutionBackend as Backend>::FundProof {
+        to_state_fund_proof(proof)
+    }
+
+    fn to_execution_transfer_proof(
+        proof: Self::TransferProof,
+    ) -> <Self::ExecutionBackend as Backend>::TransferProof {
+        to_state_transfer_proof(proof)
+    }
+
+    fn to_execution_burn_proof(
+        proof: Self::BurnProof,
+    ) -> <Self::ExecutionBackend as Backend>::BurnProof {
+        to_state_burn_proof(proof)
+    }
+}
+
+#[cfg(feature = "privacy-backend-zkpari")]
+impl PrivatePaymentBackend for StatePrivatePaymentBackend {
+    const NAME: &'static str = "zkpari-bn254-state";
+
+    fn params() -> &'static Self::Params {
+        static PARAMS: OnceLock<<StatePrivatePaymentBackend as Backend>::Params> = OnceLock::new();
+        PARAMS.get_or_init(|| {
+            Self::setup(&ZKPARI_BN254_SETUP_SEED).expect("zkpari setup is infallible")
+        })
+    }
+}
+
+/// Convert a transaction-checked commitment into the internal state form.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub const fn to_state_commitment(
+    commitment: <ChainPrivatePaymentBackend as Backend>::Commitment,
+) -> <StatePrivatePaymentBackend as Backend>::Commitment {
+    commitment
+}
+
+/// Convert a transaction-checked fund proof into the internal state form.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub const fn to_state_fund_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::FundProof,
+) -> <StatePrivatePaymentBackend as Backend>::FundProof {
+    proof
+}
+
+/// Convert a transaction-checked transfer proof into the internal state form.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub const fn to_state_transfer_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::TransferProof,
+) -> <StatePrivatePaymentBackend as Backend>::TransferProof {
+    proof
+}
+
+/// Convert a transaction-checked burn proof into the internal state form.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub const fn to_state_burn_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::BurnProof,
+) -> <StatePrivatePaymentBackend as Backend>::BurnProof {
+    proof
+}
+
+/// Convert a transaction-checked commitment into the internal state form.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_commitment(
+    commitment: <ChainPrivatePaymentBackend as Backend>::Commitment,
+) -> <StatePrivatePaymentBackend as Backend>::Commitment {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    let commitment: UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> = commitment;
+    UncompressedUnchecked(commitment.0)
+}
+
+/// Convert a transaction-checked fund proof into the internal state form.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_fund_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::FundProof,
+) -> <StatePrivatePaymentBackend as Backend>::FundProof {
+    proof
+}
+
+/// Convert a transaction-checked transfer proof into the internal state form.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_transfer_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::TransferProof,
+) -> <StatePrivatePaymentBackend as Backend>::TransferProof {
+    use commonware_privacy::zkpari::payments::{
+        TransferProof,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    let proof: UncompressedChecked<TransferProof<ark_bn254::Bn254>> = proof;
+    UncompressedUnchecked(proof.0)
+}
+
+/// Convert a transaction-checked burn proof into the internal state form.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_burn_proof(
+    proof: <ChainPrivatePaymentBackend as Backend>::BurnProof,
+) -> <StatePrivatePaymentBackend as Backend>::BurnProof {
+    use commonware_privacy::zkpari::{
+        payments::codec::{UncompressedChecked, UncompressedUnchecked},
+        range::RangeProof,
+    };
+
+    let proof: UncompressedChecked<RangeProof<ark_bn254::Bn254>> = proof;
+    UncompressedUnchecked(proof.0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MockCommitment, MockPrivatePaymentBackend as Backend};
     use crate::{Account, Payload};
     use commonware_codec::{DecodeExt as _, Encode as _};
-    use commonware_privacy::payments::Backend as _;
+    use commonware_privacy::{
+        mocks::{MockBackend as Backend, MockCommitment, MockProof},
+        payments::Backend as _,
+    };
     use core::num::NonZeroU64;
     use rand::{SeedableRng as _, rngs::StdRng};
 
@@ -605,7 +632,7 @@ mod tests {
         let mut rng = StdRng::from_seed([7u8; 32]);
         assert!(!Backend::batch_verify(
             &(),
-            &[(10, MockCommitment::new(11, 0), super::MockProof)],
+            &[(10, MockCommitment::new(11, 0), MockProof)],
             &[],
             &[],
             &mut rng,

@@ -1,6 +1,6 @@
 //! Ring-pattern transaction signing and batch sizing.
 
-use crate::accounts::SpamAccount;
+use crate::{accounts::SpamAccount, config::PrivateProofMode};
 use commonware_cryptography::{Sha256, ed25519};
 use commonware_parallel::Strategy;
 use commonware_privacy::payments::{Backend, Commitment, Opening};
@@ -10,7 +10,7 @@ use constantinople_primitives::{
     TransactionPublicKey,
 };
 use core::num::NonZeroU64;
-use rand::{RngCore, SeedableRng as _, rngs::StdRng};
+use rand::{CryptoRng, RngCore, SeedableRng as _, rngs::StdRng};
 use std::collections::HashSet;
 
 /// Concrete signed transaction type.
@@ -122,18 +122,18 @@ impl PrivateClientBalance {
         }
     }
 
-    const fn value(&self) -> u64 {
+    fn value(&self) -> u64 {
         self.opening.value()
     }
 
     fn deposit(&mut self, commitment: &PrivateCommitment, opening: &PrivateOpening) {
-        self.commitment = self.commitment + commitment;
-        self.opening = self.opening + opening;
+        self.commitment = self.commitment.clone() + commitment;
+        self.opening = self.opening.clone() + opening;
     }
 
     fn withdraw(&mut self, commitment: &PrivateCommitment, opening: &PrivateOpening) {
-        self.commitment = self.commitment - commitment;
-        self.opening = self.opening - opening;
+        self.commitment = self.commitment.clone() - commitment;
+        self.opening = self.opening.clone() - opening;
     }
 
     fn reset(&mut self) {
@@ -213,6 +213,7 @@ enum PrivateEffectPayload {
 
 /// Signs a batch of private transactions while preserving per-account nonce
 /// order and private state validity.
+#[cfg(test)]
 pub fn sign_private_batch<St: Strategy>(
     strategy: &St,
     accounts: &[SpamAccount],
@@ -220,6 +221,28 @@ pub fn sign_private_batch<St: Strategy>(
     state: PrivateBatchState<'_>,
     count: usize,
     rng: &mut impl RngCore,
+) -> PrivateBatch {
+    sign_private_batch_with_mode(
+        strategy,
+        accounts,
+        value,
+        state,
+        count,
+        rng,
+        PrivateProofMode::Real,
+    )
+}
+
+/// Signs a batch of private transactions with the selected proof generation
+/// mode.
+pub fn sign_private_batch_with_mode<St: Strategy>(
+    strategy: &St,
+    accounts: &[SpamAccount],
+    value: NonZeroU64,
+    state: PrivateBatchState<'_>,
+    count: usize,
+    rng: &mut impl RngCore,
+    proof_mode: PrivateProofMode,
 ) -> PrivateBatch {
     assert_eq!(
         accounts.len(),
@@ -273,7 +296,7 @@ pub fn sign_private_batch<St: Strategy>(
         }
 
         let realized = strategy.map_collect_vec(plans, |plan| {
-            realize_private_tx(accounts, value.get(), plan)
+            realize_private_tx(accounts, value.get(), plan, proof_mode)
         });
         for realized in realized {
             apply_private_effect(
@@ -342,8 +365,8 @@ fn plan_private_payload(
                 "private spammer current balance too low"
             );
             Some(PlannedPrivatePayload::Transfer {
-                input_commitment: state.current.commitment,
-                input_opening: state.current.opening,
+                input_commitment: state.current.commitment.clone(),
+                input_opening: state.current.opening.clone(),
             })
         }
     }
@@ -353,6 +376,7 @@ fn realize_private_tx(
     accounts: &[SpamAccount],
     value: u64,
     plan: PlannedPrivateTx,
+    proof_mode: PrivateProofMode,
 ) -> RealizedPrivateTx {
     let mut rng = StdRng::seed_from_u64(plan.seed);
     let (payload, effect_payload) = match plan.payload {
@@ -362,7 +386,7 @@ fn realize_private_tx(
             (
                 Payload::PrivateFund {
                     value: NonZeroU64::new(fund_value).expect("fund value is non-zero"),
-                    commitment,
+                    commitment: commitment.clone(),
                     proof,
                 },
                 PrivateEffectPayload::Fund {
@@ -379,17 +403,17 @@ fn realize_private_tx(
             input_commitment,
             input_opening,
         } => {
-            let (amount, opening, proof) = PrivateBackend::transfer(
-                PrivateBackend::params(),
+            let (amount, opening, proof) = transfer_payload(
                 &input_commitment,
                 &input_opening,
                 value,
+                proof_mode,
                 &mut rng,
             );
             (
                 Payload::PrivateTransfer {
                     to: account_key(&accounts[plan.recipient_index].public_key),
-                    amount,
+                    amount: amount.clone(),
                     proof,
                 },
                 PrivateEffectPayload::Transfer {
@@ -410,6 +434,68 @@ fn realize_private_tx(
         },
         tx,
     }
+}
+
+fn transfer_payload(
+    input_commitment: &PrivateCommitment,
+    input_opening: &PrivateOpening,
+    value: u64,
+    proof_mode: PrivateProofMode,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> (
+    PrivateCommitment,
+    PrivateOpening,
+    <PrivateBackend as Backend>::TransferProof,
+) {
+    match proof_mode {
+        PrivateProofMode::Real => PrivateBackend::transfer(
+            PrivateBackend::params(),
+            input_commitment,
+            input_opening,
+            value,
+            rng,
+        ),
+        PrivateProofMode::Simulated => simulated_transfer_payload(input_commitment, value, rng),
+    }
+}
+
+#[cfg(feature = "privacy-backend-simulator")]
+fn simulated_transfer_payload(
+    input_commitment: &PrivateCommitment,
+    value: u64,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> (
+    PrivateCommitment,
+    PrivateOpening,
+    <PrivateBackend as Backend>::TransferProof,
+) {
+    use constantinople_primitives::PrivatePaymentSimulatorBackend as _;
+
+    let (amount, opening, _proof) = PrivateBackend::fund(PrivateBackend::params(), value, rng);
+    let proof = PrivateBackend::simulated_transfer_proof(
+        PrivateBackend::params(),
+        PrivateBackend::simulator_trapdoor(),
+        input_commitment,
+        &amount,
+        rng,
+    );
+    (amount, opening, proof)
+}
+
+#[cfg(not(feature = "privacy-backend-simulator"))]
+fn simulated_transfer_payload(
+    _input_commitment: &PrivateCommitment,
+    _value: u64,
+    _rng: &mut impl RngCore,
+) -> (
+    PrivateCommitment,
+    PrivateOpening,
+    <PrivateBackend as Backend>::TransferProof,
+) {
+    panic!(
+        "private proof mode 'simulated' requires building constantinople-spammer with \
+         --features constantinople-spammer/privacy-backend-simulator"
+    )
 }
 
 fn apply_private_effect(

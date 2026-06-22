@@ -84,7 +84,6 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
@@ -107,18 +106,21 @@ fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
 fn buffer_pool_configs(
     worker_threads: usize,
     max_blocking_threads: usize,
+    network_buffer_pool_max_bytes: usize,
 ) -> (BufferPoolConfig, BufferPoolConfig) {
     let storage_parallelism = worker_threads
         .checked_add(max_blocking_threads)
         .expect("storage buffer pool parallelism overflowed");
     let network_parallelism =
         NonZeroUsize::new(worker_threads).expect("network buffer pool parallelism is zero");
+    let network_buffer_pool_max_size = NonZeroUsize::new(network_buffer_pool_max_bytes)
+        .expect("network buffer pool max bytes is zero");
     let storage_parallelism =
         NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
 
     let network_cfg = BufferPoolConfig::for_network()
         .with_parallelism(network_parallelism)
-        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
+        .with_max_size(network_buffer_pool_max_size)
         .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
@@ -683,6 +685,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
+        network_buffer_pool_max_bytes,
+        max_shard_bytes,
+        mempool_drop_grace_blocks,
         otel,
         json_logs,
         deployer_managed,
@@ -697,8 +702,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
-    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) =
-        buffer_pool_configs(worker_threads, runtime_cfg.max_blocking_threads());
+    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) = buffer_pool_configs(
+        worker_threads,
+        runtime_cfg.max_blocking_threads(),
+        network_buffer_pool_max_bytes,
+    );
     let runtime_cfg = runtime_cfg
         .with_network_buffer_pool_config(network_buffer_pool_cfg)
         .with_storage_buffer_pool_config(storage_buffer_pool_cfg);
@@ -756,8 +764,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
 
-        let mempool_drop_grace_blocks =
-            default_mempool_drop_grace_blocks(decoded.primary_participants.len());
+        let mempool_drop_grace_blocks = mempool_drop_grace_blocks.unwrap_or_else(|| {
+            default_mempool_drop_grace_blocks(decoded.primary_participants.len())
+        });
         let primary: Set<ed25519::PublicKey> = decoded
             .primary_participants
             .into_iter()
@@ -914,6 +923,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
+                maximum_shard_size: max_shard_bytes,
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle

@@ -176,6 +176,7 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
+    pub maximum_shard_size: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -485,7 +486,7 @@ where
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
                 shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
+                    maximum_shard_size: config.maximum_shard_size,
                 },
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.hash_strategy.clone(),

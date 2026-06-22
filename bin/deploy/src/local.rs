@@ -3,9 +3,9 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -110,8 +110,11 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            network_buffer_pool_max_bytes: args.network_buffer_pool_max_bytes,
+            max_shard_bytes: args.max_shard_bytes,
+            mempool_drop_grace_blocks: args.mempool_drop_grace_blocks,
             traces: local.traces,
             otel_endpoint: local_otel_endpoint(local),
             bootstrappers: bootstrappers.clone(),
@@ -184,15 +187,18 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            network_buffer_pool_max_bytes: args.network_buffer_pool_max_bytes,
+            max_shard_bytes: args.max_shard_bytes,
+            mempool_drop_grace_blocks: args.mempool_drop_grace_blocks,
             traces: local.traces,
             otel_endpoint: local_otel_endpoint(local),
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| local_indexer_config(local.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
-                .then(|| local_relayer_config(local, material)),
+                .then(|| local_relayer_config(args, local, material)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -209,7 +215,11 @@ fn build_secondaries(
     secondaries
 }
 
-fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> RelayerConfig {
+fn local_relayer_config(
+    args: &GenerateArgs,
+    local: &LocalArgs,
+    material: &ClusterMaterial,
+) -> RelayerConfig {
     let leaders = material
         .primary_hex()
         .into_iter()
@@ -226,7 +236,10 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
         })
         .collect();
 
-    RelayerConfig { leaders }
+    RelayerConfig {
+        max_retry_views: args.relayer_max_retry_views,
+        leaders,
+    }
 }
 
 /// Build the full indexer wiring written into the owning secondary's YAML.
@@ -283,11 +296,18 @@ fn local_run_commands(
     simplex_verification_material: &str,
 ) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
+    let validator_cargo = if args.spammer_private_proof_mode
+        == crate::SpammerPrivateProofMode::Simulated
+    {
+        "cargo run --release --bin constantinople --features constantinople-primitives/privacy-backend-zkpari"
+    } else {
+        "cargo run --release --bin constantinople"
+    };
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
-                "cargo run --release --bin constantinople -- --config {} --peers {}",
+                "{validator_cargo} -- --config {} --peers {}",
                 path.display(),
                 peers_path.display()
             )
@@ -298,7 +318,7 @@ fn local_run_commands(
     for index in 0..total_secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
-            "cargo run --release --bin constantinople -- --config {} --peers {}",
+            "{validator_cargo} -- --config {} --peers {}",
             path.display(),
             peers_path.display()
         ));
@@ -348,7 +368,13 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
-        let spammer_cargo = "cargo run --release --bin constantinople-spammer";
+        let spammer_cargo = if args.spammer_private_proof_mode
+            == crate::SpammerPrivateProofMode::Simulated
+        {
+            "cargo run --release --bin constantinople-spammer --features constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator"
+        } else {
+            "cargo run --release --bin constantinople-spammer"
+        };
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
@@ -364,7 +390,8 @@ fn local_run_commands(
              --accounts-jitter {} \
              --presigned-batches {} \
              --workload {} \
-             --private-groups {}",
+             --private-groups {} \
+             --private-proof-mode {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -374,6 +401,7 @@ fn local_run_commands(
             args.spammer_presigned_batches,
             args.spammer_workload.as_str(),
             args.spammer_private_groups,
+            args.spammer_private_proof_mode.as_str(),
         ));
     }
 
@@ -391,7 +419,8 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig,
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
+        default_max_propose_bytes, default_max_shard_bytes, default_network_buffer_pool_max_bytes,
         generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
@@ -403,10 +432,16 @@ mod tests {
             validators: 2,
             indexer: false,
             relayer: false,
+            relayer_max_retry_views: crate::DEFAULT_RELAYER_MAX_RETRY_VIEWS,
             output_dir: PathBuf::from("/tmp/configs"),
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
+            network_buffer_pool_max_bytes: default_network_buffer_pool_max_bytes(),
+            max_shard_bytes: default_max_shard_bytes(),
+            mempool_drop_grace_blocks: None,
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,
@@ -418,6 +453,7 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
+            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
             target: GenerateTarget::Local(test_local_args()),
         }
     }

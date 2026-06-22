@@ -12,7 +12,7 @@ use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
 use constantinople_indexer::publisher::qmdb::{state_qmdb_client, transactions_qmdb_client};
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_primitives::{AccountKey, StateAccount};
 use exoware_qmdb::{
     KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
     unordered_operation_log_connect_stack,
@@ -28,7 +28,7 @@ use std::{
 };
 use tracing::info;
 
-type ChainAccount = Account;
+type ChainAccount = StateAccount;
 type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateClient =
     UnorderedClient<mmr::Family, Sha256, AccountKey, AccountValue, FixedEncoding<AccountValue>>;

@@ -14,7 +14,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
+use constantinople_primitives::{AccountKey, Header, SealedBlock, SignedTransaction, StateAccount};
 use hashbrown::HashSet;
 use tracing::{Instrument as _, info_span};
 
@@ -42,7 +42,7 @@ where
 }
 
 enum LoadedState {
-    Unique(Vec<(AccountKey, Account)>),
+    Unique(Vec<(AccountKey, StateAccount)>),
     Shared(State),
 }
 
@@ -63,6 +63,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     parent: &SealedBlock<C, P, H>,
     input: executor::ProposalInput<H>,
     candidate_operations: &[PreparedOperation<H>],
+    proof_strategy: &impl Strategy,
 ) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -77,7 +78,7 @@ where
         .expect("proposal state loading must succeed");
 
     let output = info_span!("application.execute.operations")
-        .in_scope(|| executor::propose_prepared(&state, input));
+        .in_scope(|| executor::propose_prepared_with_strategy(&state, input, proof_strategy));
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = operation_digests(&output.operations);
         let state_batch = apply_changeset(state_batch, &output.changeset);
@@ -103,6 +104,7 @@ pub(super) async fn execute_body<E, C, P, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     body: PreparedBody<H>,
+    proof_strategy: &impl Strategy,
 ) -> Result<BlockExecution<E, H, S>>
 where
     E: Storage + Clock + Metrics,
@@ -124,7 +126,7 @@ where
         .expect("block state loading must succeed");
 
     let changeset = info_span!("application.execute.operations")
-        .in_scope(|| execute_loaded(&state, &operations))
+        .in_scope(|| execute_loaded(&state, &operations, proof_strategy))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = operation_digests(&operations);
@@ -148,6 +150,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
     operations: &[PreparedOperation<H>],
+    proof_strategy: &impl Strategy,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
@@ -159,7 +162,7 @@ where
         .await
         .expect("state loading must succeed for certified apply");
     let changeset = info_span!("application.execute.operations")
-        .in_scope(|| execute_loaded(&state, operations))
+        .in_scope(|| execute_loaded(&state, operations, proof_strategy))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = operation_digests(operations);
@@ -290,13 +293,18 @@ where
 fn execute_loaded<H>(
     state: &LoadedState,
     operations: &[PreparedOperation<H>],
+    proof_strategy: &impl Strategy,
 ) -> Option<executor::Changeset>
 where
     H: Hasher,
 {
     match state {
-        LoadedState::Unique(accounts) => executor::execute_unique(operations, accounts),
-        LoadedState::Shared(accounts) => executor::execute(accounts, operations),
+        LoadedState::Unique(accounts) => {
+            executor::execute_unique_with_strategy(operations, accounts, proof_strategy)
+        }
+        LoadedState::Shared(accounts) => {
+            executor::execute_with_strategy(accounts, operations, proof_strategy)
+        }
     }
 }
 

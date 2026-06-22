@@ -23,6 +23,7 @@ commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 commonware-privacy.workspace = true
 
 # Other
+ark-bn254 = { workspace = true, optional = true }
 bytes.workspace = true
 p256.workspace = true
 rand.workspace = true
@@ -44,6 +45,7 @@ rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"] }
 
 [features]
+default = ["privacy-backend-mock"]
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",
@@ -51,4 +53,16 @@ arbitrary = [
 	"commonware-math/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
+]
+privacy-backend-mock = [
+	"commonware-privacy/codec",
+	"commonware-privacy/mocks",
+]
+privacy-backend-zkpari = [
+	"commonware-privacy/codec",
+	"commonware-privacy/zkpari",
+	"dep:ark-bn254",
+]
+privacy-backend-simulator = [
+	"commonware-privacy/simulator",
 ]

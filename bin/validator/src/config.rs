@@ -36,6 +36,14 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+pub(crate) const fn default_network_buffer_pool_max_bytes() -> usize {
+    default_max_propose_bytes()
+}
+
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    default_max_propose_bytes()
+}
+
 pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
 }
@@ -96,6 +104,17 @@ pub struct ValidatorConfig {
     pub max_propose_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
+    /// Maximum single network buffer allocation. This must be at least as
+    /// large as the biggest encoded P2P message a validator may receive.
+    #[serde(default = "default_network_buffer_pool_max_bytes")]
+    pub network_buffer_pool_max_bytes: usize,
+    /// Maximum accepted marshal coding shard payload size.
+    #[serde(default = "default_max_shard_bytes")]
+    pub max_shard_bytes: usize,
+    /// Optional finalized-block window before a proposed mempool batch is
+    /// reported as dropped. Defaults to twice the primary validator count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mempool_drop_grace_blocks: Option<u64>,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
@@ -175,6 +194,9 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub max_propose_bytes: usize,
     pub max_pool_bytes: usize,
+    pub network_buffer_pool_max_bytes: usize,
+    pub max_shard_bytes: usize,
+    pub mempool_drop_grace_blocks: Option<u64>,
     pub otel: Option<(String, f64)>,
     pub json_logs: bool,
     pub deployer_managed: bool,
@@ -256,6 +278,19 @@ fn decode_with_network(
     otel: Option<(String, f64)>,
     json_logs: bool,
 ) -> LoadedConfig {
+    if config.max_shard_bytes < config.max_propose_bytes {
+        panic!(
+            "max_shard_bytes ({}) must be at least max_propose_bytes ({})",
+            config.max_shard_bytes, config.max_propose_bytes
+        );
+    }
+    if config.network_buffer_pool_max_bytes < config.max_shard_bytes {
+        panic!(
+            "network_buffer_pool_max_bytes ({}) must be at least max_shard_bytes ({})",
+            config.network_buffer_pool_max_bytes, config.max_shard_bytes
+        );
+    }
+
     let signer = decode_private_key(&config.private_key);
     let public_key = signer.public_key();
     let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
@@ -299,6 +334,9 @@ fn decode_with_network(
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
         max_pool_bytes: config.max_pool_bytes,
+        network_buffer_pool_max_bytes: config.network_buffer_pool_max_bytes,
+        max_shard_bytes: config.max_shard_bytes,
+        mempool_drop_grace_blocks: config.mempool_drop_grace_blocks,
         otel,
         json_logs,
         deployer_managed: json_logs,
@@ -468,8 +506,9 @@ fn local_otel(config: &ValidatorConfig) -> Option<(String, f64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_upload_buffer,
+        IndexerConfig, LoadedConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
+        decode_with_network, default_max_pool_bytes, default_max_propose_bytes,
+        default_max_shard_bytes, default_network_buffer_pool_max_bytes, default_upload_buffer,
         load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
@@ -590,6 +629,9 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                network_buffer_pool_max_bytes: default_network_buffer_pool_max_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
+                mempool_drop_grace_blocks: None,
                 traces: 0.0,
                 otel_endpoint: None,
                 bootstrappers,
@@ -624,6 +666,9 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                network_buffer_pool_max_bytes: default_network_buffer_pool_max_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
+                mempool_drop_grace_blocks: None,
                 traces: 0.0,
                 otel_endpoint: None,
                 bootstrappers,
@@ -641,6 +686,18 @@ mod tests {
         }
     }
 
+    fn decode_primary_config(cluster: &Cluster, config: ValidatorConfig) -> LoadedConfig {
+        decode_with_network(
+            config,
+            "127.0.0.1:9000".parse().unwrap(),
+            cluster.primary_keys.clone(),
+            cluster.secondary_keys.clone(),
+            Vec::new(),
+            None,
+            false,
+        )
+    }
+
     #[test]
     fn local_config_resolves_bootstrapper_peers() {
         let cluster = Cluster::new(2, 0);
@@ -656,6 +713,9 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.network_buffer_pool_max_bytes = 8_388_608;
+        config.max_shard_bytes = 4_194_304;
+        config.mempool_drop_grace_blocks = Some(512);
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -687,6 +747,9 @@ mod tests {
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
+        assert_eq!(loaded.network_buffer_pool_max_bytes, 8_388_608);
+        assert_eq!(loaded.max_shard_bytes, 4_194_304);
+        assert_eq!(loaded.mempool_drop_grace_blocks, Some(512));
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,
@@ -707,6 +770,30 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "max_shard_bytes")]
+    fn rejects_shard_limit_below_propose_limit() {
+        let cluster = Cluster::new(4, 0);
+        let mut config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        config.max_propose_bytes = 2 * 1024 * 1024;
+        config.max_shard_bytes = 1024 * 1024;
+        config.network_buffer_pool_max_bytes = 2 * 1024 * 1024;
+
+        let _ = decode_primary_config(&cluster, config);
+    }
+
+    #[test]
+    #[should_panic(expected = "network_buffer_pool_max_bytes")]
+    fn rejects_network_buffer_limit_below_shard_limit() {
+        let cluster = Cluster::new(4, 0);
+        let mut config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        config.max_propose_bytes = 1024 * 1024;
+        config.max_shard_bytes = 2 * 1024 * 1024;
+        config.network_buffer_pool_max_bytes = 1024 * 1024;
+
+        let _ = decode_primary_config(&cluster, config);
+    }
+
+    #[test]
     fn deployer_config_resolves_bootstrapper_hosts() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
@@ -723,6 +810,9 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.network_buffer_pool_max_bytes = 8_388_608;
+        config.max_shard_bytes = 4_194_304;
+        config.mempool_drop_grace_blocks = Some(512);
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -755,6 +845,9 @@ hosts:
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
+        assert_eq!(loaded.network_buffer_pool_max_bytes, 8_388_608);
+        assert_eq!(loaded.max_shard_bytes, 4_194_304);
+        assert_eq!(loaded.mempool_drop_grace_blocks, Some(512));
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,

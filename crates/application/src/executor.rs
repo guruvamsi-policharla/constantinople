@@ -3,19 +3,21 @@
 use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
+use commonware_parallel::{Sequential, Strategy};
 use constantinople_primitives::{
     Account, AccountKey, ChainPrivatePaymentBackend, Payload, PrivatePaymentBackend,
-    SignedTransaction, TransactionPublicKey,
+    PrivatePaymentExecutionBackend, SignedTransaction, StatePrivatePaymentBackend,
+    TransactionPublicKey,
 };
 use hashbrown::HashMap;
 use rand_core::OsRng;
 use tracing::info_span;
 
 /// Fully loaded account state for one execution batch.
-pub type State<B = ChainPrivatePaymentBackend> = HashMap<AccountKey, Account<B>>;
+pub type State<B = StatePrivatePaymentBackend> = HashMap<AccountKey, Account<B>>;
 
 /// Deterministic account writes produced by execution.
-pub type Changeset<B = ChainPrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
+pub type Changeset<B = StatePrivatePaymentBackend> = Vec<(AccountKey, Account<B>)>;
 
 type FundVerification<B> = (
     u64,
@@ -60,8 +62,9 @@ where
         self.funds.len() + self.transfers.len() + self.burns.len()
     }
 
-    fn verify(&self) -> bool {
-        B::batch_verify(
+    fn verify_with_strategy(&self, strategy: &impl Strategy) -> bool {
+        B::batch_verify_with_strategy(
+            strategy,
             B::params(),
             &self.funds,
             &self.transfers,
@@ -73,7 +76,7 @@ where
 
 /// Prepared transaction operation.
 #[derive(Debug, Clone)]
-pub struct PreparedOperation<H, B = ChainPrivatePaymentBackend>
+pub struct PreparedOperation<H, B = StatePrivatePaymentBackend>
 where
     H: Hasher,
     B: PrivatePaymentBackend,
@@ -90,7 +93,7 @@ where
 
 /// Prepared payload with decoded account keys.
 #[derive(Debug, Clone)]
-pub enum PreparedPayload<B: PrivatePaymentBackend = ChainPrivatePaymentBackend> {
+pub enum PreparedPayload<B: PrivatePaymentBackend = StatePrivatePaymentBackend> {
     /// Public transfer.
     PublicTransfer { recipient: AccountKey, value: u64 },
     /// Private fund.
@@ -112,24 +115,23 @@ pub enum PreparedPayload<B: PrivatePaymentBackend = ChainPrivatePaymentBackend> 
 }
 
 /// Transaction paired with its prepared execution data.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct PreparedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     /// Original signed transaction.
     pub transaction: SignedTransaction<H, B>,
     /// Prepared operation data.
-    pub operation: PreparedOperation<H, B>,
+    pub operation: PreparedOperation<H, B::ExecutionBackend>,
 }
 
 /// Proposal-side transaction preparation.
-#[derive(Debug)]
 pub(crate) struct ProposalInput<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     /// Transactions with decodable execution metadata.
     pub candidates: Vec<PreparedTransaction<H, B>>,
@@ -138,19 +140,18 @@ where
 }
 
 /// The result of proposal-side filtering and execution.
-#[derive(Debug)]
 pub struct ProposalOutput<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     /// Transactions included in the proposed block.
     pub valid: Vec<SignedTransaction<H, B>>,
     /// Transactions excluded from the proposed block.
     pub invalid: Vec<SignedTransaction<H, B>>,
     /// Persistent account writes produced by included transactions.
-    pub changeset: Changeset<B>,
-    pub(crate) operations: Vec<PreparedOperation<H, B>>,
+    pub changeset: Changeset<B::ExecutionBackend>,
+    pub(crate) operations: Vec<PreparedOperation<H, B::ExecutionBackend>>,
 }
 
 /// Prepares transactions for proposal-side execution.
@@ -159,7 +160,7 @@ pub(crate) fn prepare_proposal<H, B>(
 ) -> ProposalInput<H, B>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     let mut candidates = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
@@ -183,20 +184,102 @@ where
 
 /// Executes proposal candidates and filters statically invalid operations.
 pub(crate) fn propose_prepared<H, B>(
-    state: &State<B>,
+    state: &State<B::ExecutionBackend>,
     input: ProposalInput<H, B>,
 ) -> ProposalOutput<H, B>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
-    let mut overlay = Overlay::new(state, input.candidates.len());
-    let mut valid = Vec::with_capacity(input.candidates.len());
-    let mut operations = Vec::with_capacity(input.candidates.len());
-    let mut invalid = input.invalid;
+    propose_prepared_with_strategy(state, input, &Sequential)
+}
 
-    for candidate in input.candidates {
-        if apply_one::<H, B>(&mut overlay, &candidate.operation, true) {
+/// Executes proposal candidates and filters statically invalid operations using
+/// a caller-provided proof verification strategy.
+pub(crate) fn propose_prepared_with_strategy<H, B, St>(
+    state: &State<B::ExecutionBackend>,
+    input: ProposalInput<H, B>,
+    strategy: &St,
+) -> ProposalOutput<H, B>
+where
+    H: Hasher,
+    B: PrivatePaymentExecutionBackend,
+    St: Strategy,
+{
+    let ProposalInput {
+        candidates,
+        invalid,
+    } = input;
+    let mut overlay = Overlay::new(state, candidates.len());
+    let mut valid_candidates = Vec::with_capacity(candidates.len());
+    let mut operations = Vec::with_capacity(candidates.len());
+    let mut private_verifications = PrivateVerifications::new();
+
+    for candidate in &candidates {
+        if apply_operation::<H, B::ExecutionBackend>(
+            &mut overlay,
+            &candidate.operation,
+            false,
+            &mut private_verifications,
+        ) {
+            operations.push(candidate.operation.clone());
+            valid_candidates.push(true);
+        } else {
+            valid_candidates.push(false);
+        }
+    }
+
+    if !private_verifications.is_empty() {
+        let verified = info_span!(
+            "application.executor.private_batch_verify",
+            phase = "propose",
+            backend = B::ExecutionBackend::NAME,
+            private_txs = private_verifications.len(),
+            private_funds = private_verifications.funds.len(),
+            private_transfers = private_verifications.transfers.len(),
+            private_burns = private_verifications.burns.len(),
+            proof_parallelism = strategy.parallelism_hint()
+        )
+        .in_scope(|| private_verifications.verify_with_strategy(strategy));
+        if !verified {
+            return propose_prepared_individual(state, candidates, invalid);
+        }
+    }
+
+    let mut valid = Vec::with_capacity(operations.len());
+    let mut invalid = invalid;
+    invalid.reserve(candidates.len().saturating_sub(operations.len()));
+    for (candidate, is_valid) in candidates.into_iter().zip(valid_candidates) {
+        if is_valid {
+            valid.push(candidate.transaction);
+        } else {
+            invalid.push(candidate.transaction);
+        }
+    }
+
+    ProposalOutput {
+        valid,
+        invalid,
+        changeset: overlay.into_changeset(),
+        operations,
+    }
+}
+
+fn propose_prepared_individual<H, B>(
+    state: &State<B::ExecutionBackend>,
+    candidates: Vec<PreparedTransaction<H, B>>,
+    mut invalid: Vec<SignedTransaction<H, B>>,
+) -> ProposalOutput<H, B>
+where
+    H: Hasher,
+    B: PrivatePaymentExecutionBackend,
+{
+    let mut overlay = Overlay::new(state, candidates.len());
+    let mut valid = Vec::with_capacity(candidates.len());
+    let mut operations = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        if apply_one::<H, B::ExecutionBackend>(&mut overlay, &candidate.operation, true) {
             operations.push(candidate.operation);
             valid.push(candidate.transaction);
         } else {
@@ -214,12 +297,12 @@ where
 
 /// Prepares and executes proposal transactions.
 pub fn propose<H, B>(
-    state: &State<B>,
+    state: &State<B::ExecutionBackend>,
     transactions: Vec<SignedTransaction<H, B>>,
 ) -> ProposalOutput<H, B>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     propose_prepared(state, prepare_proposal(transactions))
 }
@@ -227,10 +310,10 @@ where
 /// Prepares one transaction for account execution.
 pub fn prepare_operation<H, B>(
     transaction: &SignedTransaction<H, B>,
-) -> Option<PreparedOperation<H, B>>
+) -> Option<PreparedOperation<H, B::ExecutionBackend>>
 where
     H: Hasher,
-    B: PrivatePaymentBackend,
+    B: PrivatePaymentExecutionBackend,
 {
     let tx = transaction.value();
     let payload = match &tx.payload {
@@ -244,17 +327,17 @@ where
             proof,
         } => PreparedPayload::PrivateFund {
             value: value.get(),
-            commitment: commitment.clone(),
-            proof: proof.clone(),
+            commitment: B::to_execution_commitment(commitment.clone()),
+            proof: B::to_execution_fund_proof(proof.clone()),
         },
         Payload::PrivateTransfer { to, amount, proof } => PreparedPayload::PrivateTransfer {
             recipient: to.clone(),
-            amount: amount.clone(),
-            proof: proof.clone(),
+            amount: B::to_execution_commitment(amount.clone()),
+            proof: B::to_execution_transfer_proof(proof.clone()),
         },
         Payload::PrivateBurn { value, proof } => PreparedPayload::PrivateBurn {
             value: value.get(),
-            proof: proof.clone(),
+            proof: B::to_execution_burn_proof(proof.clone()),
         },
         Payload::PrivateRollover => PreparedPayload::PrivateRollover,
     };
@@ -276,10 +359,26 @@ where
     H: Hasher,
     B: PrivatePaymentBackend,
 {
+    execute_with_strategy(state, operations, &Sequential)
+}
+
+/// Executes already prepared operations using a caller-provided proof
+/// verification strategy.
+pub fn execute_with_strategy<H, B, St>(
+    state: &State<B>,
+    operations: &[PreparedOperation<H, B>],
+    strategy: &St,
+) -> Option<Changeset<B>>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+    St: Strategy,
+{
     let _span = info_span!(
         "application.executor.execute",
         txs = operations.len(),
-        backend = B::NAME
+        backend = B::NAME,
+        proof_parallelism = strategy.parallelism_hint()
     )
     .entered();
 
@@ -299,9 +398,10 @@ where
             private_txs = private_verifications.len(),
             private_funds = private_verifications.funds.len(),
             private_transfers = private_verifications.transfers.len(),
-            private_burns = private_verifications.burns.len()
+            private_burns = private_verifications.burns.len(),
+            proof_parallelism = strategy.parallelism_hint()
         )
-        .in_scope(|| private_verifications.verify());
+        .in_scope(|| private_verifications.verify_with_strategy(strategy));
         if !verified {
             return None;
         }
@@ -310,6 +410,7 @@ where
     Some(overlay.into_changeset())
 }
 
+#[cfg(test)]
 pub(crate) fn execute_unique<H, B>(
     operations: &[PreparedOperation<H, B>],
     accounts: &[(AccountKey, Account<B>)],
@@ -318,11 +419,24 @@ where
     H: Hasher,
     B: PrivatePaymentBackend,
 {
+    execute_unique_with_strategy(operations, accounts, &Sequential)
+}
+
+pub(crate) fn execute_unique_with_strategy<H, B, St>(
+    operations: &[PreparedOperation<H, B>],
+    accounts: &[(AccountKey, Account<B>)],
+    strategy: &St,
+) -> Option<Changeset<B>>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+    St: Strategy,
+{
     let mut state = State::with_capacity(accounts.len());
     for (account_key, account) in accounts {
         state.insert(account_key.clone(), account.clone());
     }
-    execute(&state, operations)
+    execute_with_strategy(&state, operations, strategy)
 }
 
 fn account_key_from_sender(

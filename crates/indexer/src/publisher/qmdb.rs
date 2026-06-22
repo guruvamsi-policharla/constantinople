@@ -25,7 +25,7 @@ use commonware_storage::{
 use commonware_utils::sequence::FixedBytes;
 use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use constantinople_primitives::{AccountKey, BlockCfg, StateAccount};
 use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
@@ -56,7 +56,7 @@ pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
 type QmdbFamily = mmr::Family;
-type ChainAccount = Account;
+type ChainAccount = StateAccount;
 type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
 type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<ChainAccount>>;
@@ -1435,7 +1435,7 @@ async fn load_state_ops<E, H, S>(
         QmdbFamily,
         E,
         AccountKey,
-        Account,
+        StateAccount,
         H,
         commonware_storage::translator::EightCap,
         S,
@@ -1474,7 +1474,7 @@ fn encode_account_operation(operation: LocalStateOperation) -> StateOperation {
     }
 }
 
-fn encode_account(account: Account) -> AccountValue {
+fn encode_account(account: StateAccount) -> AccountValue {
     let bytes = account.encode();
     let mut out = [0u8; ChainAccount::SIZE];
     out.copy_from_slice(&bytes);
@@ -1629,8 +1629,8 @@ mod tests {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use constantinople_primitives::{
-        Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
-        TransactionPublicKey,
+        Block, Header, Nonce, Sealable, SignedTransaction, StateAccount, TRANSACTION_NAMESPACE,
+        Transaction, TransactionPublicKey,
     };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
@@ -1713,7 +1713,7 @@ mod tests {
             let state_ops = [
                 StateOperation::Update(UnorderedUpdate(
                     key,
-                    encode_account(Account {
+                    encode_account(StateAccount {
                         balance: u64::from(seed),
                         nonce: Nonce::default(),
                         private: Default::default(),
@@ -2056,7 +2056,7 @@ mod tests {
                 vec![
                     (
                         account_key(1),
-                        Account {
+                        StateAccount {
                             balance: 10,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2064,7 +2064,7 @@ mod tests {
                     ),
                     (
                         account_key(2),
-                        Account {
+                        StateAccount {
                             balance: 20,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2091,7 +2091,7 @@ mod tests {
                 vec![
                     (
                         account_key(1),
-                        Account {
+                        StateAccount {
                             balance: 9,
                             nonce: Nonce::new(1, 0),
                             private: Default::default(),
@@ -2099,7 +2099,7 @@ mod tests {
                     ),
                     (
                         account_key(3),
-                        Account {
+                        StateAccount {
                             balance: 30,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2207,7 +2207,7 @@ mod tests {
         databases: &Databases<E, Sha256, EightCap, Sequential>,
         parent: Option<&EngineBlock<Sha256, ed25519::PublicKey>>,
         height: u64,
-        state_updates: Vec<(AccountKey, Account)>,
+        state_updates: Vec<(AccountKey, StateAccount)>,
         transactions: Vec<SignedTransaction<Sha256>>,
     ) -> EngineBlock<Sha256, ed25519::PublicKey>
     where
@@ -2456,7 +2456,7 @@ mod tests {
         vec![
             StateOperation::Update(UnorderedUpdate(
                 key,
-                encode_account(Account {
+                encode_account(StateAccount {
                     balance: u64::from(seed),
                     nonce: Nonce::default(),
                     private: Default::default(),
@@ -2495,7 +2495,7 @@ mod tests {
         let state_delta = vec![
             StateOperation::Update(UnorderedUpdate(
                 account_key,
-                encode_account(Account {
+                encode_account(StateAccount {
                     balance: 1,
                     nonce: Nonce::default(),
                     private: Default::default(),

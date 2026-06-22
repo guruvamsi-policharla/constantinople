@@ -1,7 +1,8 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
-    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, TransactionPublicKey,
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, StatePrivatePaymentBackend,
+    TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -213,6 +214,75 @@ where
     pub nonce: Nonce,
     /// Private-payment commitment state.
     pub private: PrivateAccount<B>,
+}
+
+/// Account representation used by local state-database storage.
+pub type StateAccount = Account<StatePrivatePaymentBackend>;
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn to_state_account(account: Account) -> StateAccount {
+    account
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn from_state_account(account: StateAccount) -> Account {
+    account
+}
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_account(account: Account) -> StateAccount {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedUnchecked(commitment.0)
+    }
+
+    StateAccount {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn from_state_account(account: StateAccount) -> Account {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedChecked(commitment.0)
+    }
+
+    Account {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
 }
 
 impl<B> Default for Account<B>

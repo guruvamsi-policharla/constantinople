@@ -81,6 +81,7 @@ where
             parent,
             input,
             &candidate_operations,
+            &self.hash_strategy,
         )
         .await;
 
@@ -160,7 +161,13 @@ where
             self.transaction_namespace,
             Arc::clone(&body),
         );
-        let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
+        let execution = execute_body(
+            state_batch,
+            transaction_batch,
+            parent,
+            Arc::clone(&body),
+            &self.hash_strategy,
+        );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let execution = match futures::try_join!(signatures, execution, wait) {
@@ -223,6 +230,7 @@ where
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &body,
+            &self.hash_strategy,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))

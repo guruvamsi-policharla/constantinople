@@ -317,6 +317,7 @@ impl EngineDefinition for TestEngineDefinition {
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
+                    maximum_shard_size: 1024 * 1024,
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
