@@ -1,8 +1,29 @@
 //! Consensus-facing application integration.
 //!
-//! The wrapper is intentionally thin. It prepares block bodies, delegates
-//! account transitions to the executor, updates QMDB batches, and checks the
-//! commitments consensus votes on.
+//! This module is the boundary between consensus and the application state
+//! transition. Consensus supplies candidate or certified block bodies; the
+//! application prepares those bodies into account transfers, executes them
+//! against QMDB-backed state, appends transaction-history entries, and returns
+//! the commitments consensus proposes, verifies, or applies.
+//!
+//! Account execution is based on block-start state. A sender spends only the
+//! balance it had at the start of the block, and credits created by the same
+//! block cannot fund later debits in that block. The executor therefore builds
+//! deterministic account effects first, then applies those effects to loaded
+//! accounts all or nothing.
+//!
+//! The executor builds one account-touch plan for each block. Transfers whose
+//! non-self sender/recipient accounts are unique in the block stay on a discrete
+//! lane and can write their sender and recipient accounts directly. Transfers
+//! that touch contended accounts go through the general account-owned lane: each
+//! affected account is loaded once, receives its accumulated nonce/debit/credit
+//! effect, and writes once. If any lane fails a nonce check, balance check, or
+//! checked credit addition, the whole block body is invalid and no partial state
+//! is applied.
+//!
+//! State writes are folded into the unordered state QMDB, whose commitment
+//! depends on the final key/value set. Transaction history is append-only, so
+//! transaction digests are still appended in block order.
 
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -25,9 +46,10 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateDatabase, StateSyncTarget, TransactionDatabase, TransactionHistoryDb,
-    TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, StateBatch, StateDatabase, StateSyncTarget, StateWrites, TransactionDatabase,
+    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
 };
+pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -43,7 +65,6 @@ type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
 const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
-const MATERIALIZE_TASK_CLOSED: &str = "transaction materialization task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 

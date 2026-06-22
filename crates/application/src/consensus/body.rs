@@ -1,15 +1,11 @@
 //! Block body preparation and signature verification.
 
-use super::{
-    INVALID_SIGNATURE, MALFORMED_TRANSACTION, MATERIALIZE_TASK_CLOSED, Result,
-    SIGNATURE_TASK_CLOSED,
-};
+use super::{INVALID_SIGNATURE, Result, SIGNATURE_TASK_CLOSED};
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
 use constantinople_primitives::{
-    LazySignedTransaction, PublicKeyCache, SignedTransaction, materialize_transaction_chunks,
-    preload_transaction_chunks, verify_transaction_batch,
+    LazySignedTransaction, PublicKeyCache, preload_transaction_slice, verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
@@ -33,18 +29,17 @@ where
     let transaction_count = body.len();
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
-            let result = preload_transaction_chunks(body.as_ref().clone(), &strategy)
-                .filter(|transactions| {
-                    verify_transaction_batch::<H, _>(
-                        namespace,
-                        &mut runtime,
-                        &public_key_cache,
-                        transactions,
-                        &strategy,
-                    )
-                })
-                .map(|_| ())
-                .ok_or(INVALID_SIGNATURE);
+            let transactions = body.as_ref().as_slice();
+            let result = (preload_transaction_slice(transactions, &strategy)
+                && verify_transaction_batch::<H, _>(
+                    namespace,
+                    &mut runtime,
+                    &public_key_cache,
+                    transactions,
+                    &strategy,
+                ))
+            .then_some(())
+            .ok_or(INVALID_SIGNATURE);
             let _ = result_tx.send(result);
         }
         .instrument(info_span!(
@@ -54,33 +49,6 @@ where
     });
 
     result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
-}
-
-pub(super) async fn materialize_body<E, H, St>(
-    runtime: E,
-    strategy: St,
-    transactions: Vec<LazySignedTransaction<H>>,
-) -> Result<Vec<SignedTransaction<H>>>
-where
-    E: Spawner,
-    H: Hasher,
-    St: Strategy,
-{
-    let (result_tx, result_rx) = futures::channel::oneshot::channel();
-    let transaction_count = transactions.len();
-    let _handle = runtime.shared(true).spawn(move |_| {
-        async move {
-            let result = materialize_transaction_chunks(&strategy, transactions)
-                .ok_or(MALFORMED_TRANSACTION);
-            let _ = result_tx.send(result);
-        }
-        .instrument(info_span!(
-            "application.apply.materialize_body",
-            txs = transaction_count.traced()
-        ))
-    });
-
-    result_rx.await.map_err(|_| MATERIALIZE_TASK_CLOSED)?
 }
 
 #[tracing::instrument(name = "application.verify.wait", level = "info", skip_all)]

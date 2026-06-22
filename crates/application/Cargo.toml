@@ -34,7 +34,7 @@ futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
 rand_core.workspace = true
 prometheus-client.workspace = true
-hashbrown = { workspace = true, features = ["default-hasher"] }
+ahash.workspace = true
 
 [dev-dependencies]
 # Workspace
@@ -52,4 +52,8 @@ criterion.workspace = true
 
 [[bench]]
 name = "executor"
+harness = false
+
+[[bench]]
+name = "compute"
 harness = false

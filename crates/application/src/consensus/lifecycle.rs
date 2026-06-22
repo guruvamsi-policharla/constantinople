@@ -1,12 +1,13 @@
 //! Propose, verify, and apply entry points.
 
 use super::{
-    Application, MALFORMED_TRANSACTION,
-    body::{materialize_body, verify_signatures, wait_for_timestamp},
-    execution::{apply_prepared_body, commitments_match, execute_body, execute_proposal},
+    Application,
+    body::{verify_signatures, wait_for_timestamp},
+    execution::{
+        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
+    },
     reject_verify, time,
 };
-use crate::executor;
 use commonware_consensus::simplex::types::Context;
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
@@ -64,24 +65,13 @@ where
             .instrument(info_span!("application.propose.input"))
             .await;
 
-        let (input, candidate_transfers) =
-            info_span!("application.propose.prepare").in_scope(|| {
-                let input = executor::prepare_proposal(body);
-                let candidate_transfers = input
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.transfer.clone())
-                    .collect::<Vec<_>>();
-                (input, candidate_transfers)
-            });
-
         let (state_batch, transaction_batch) = batches;
         let execution = execute_proposal(
+            self.strategy.clone(),
             state_batch,
             transaction_batch,
             parent,
-            input,
-            &candidate_transfers,
+            body,
         )
         .await;
 
@@ -161,7 +151,13 @@ where
             Arc::clone(&body),
             self.strategy.clone(),
         );
-        let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
+        let execution = execute_body(
+            self.strategy.clone(),
+            state_batch,
+            transaction_batch,
+            parent,
+            Arc::clone(&body),
+        );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let execution = match futures::try_join!(signatures, execution, wait) {
@@ -198,7 +194,7 @@ where
     )]
     pub async fn apply_certified(
         &mut self,
-        (runtime, _): (E, Context<C, P>),
+        (_, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
@@ -208,21 +204,18 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let materialized = materialize_body(runtime, self.strategy.clone(), block.body.clone())
-            .await
+        let (body, digests) = info_span!("application.apply.prepare")
+            .in_scope(|| prepare_lazy(&self.strategy, block.body.as_slice()))
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
-        let body = materialized
-            .iter()
-            .map(executor::prepare_transfer)
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body(
+            self.strategy.clone(),
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &body,
+            &digests,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))

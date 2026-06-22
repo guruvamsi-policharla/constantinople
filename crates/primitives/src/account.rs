@@ -4,8 +4,8 @@ use crate::{
     TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
-use bytes::{Buf, BufMut, Bytes};
-use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use bytes::{Buf, BufMut};
+use commonware_codec::{Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
@@ -18,22 +18,35 @@ pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 
+// Account keys keep the legacy Ed25519 public-key width. Secp256r1 accounts
+// are hashed into this same fixed-width state key.
+const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
+
 /// Fixed-width account identifier derived from a transaction public key.
 ///
 /// Unlike [`commonware_cryptography::PublicKey`] implementations, decoding an
 /// [`AccountKey`] does not validate or decompress the curve point. This keeps
 /// state-database replay, indexing, and lookup on cheap byte comparisons while
 /// preserving the legacy Ed25519 account format.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
+#[fixed_array(infallible)]
 pub struct AccountKey {
-    bytes: Bytes,
+    bytes: [u8; ACCOUNT_KEY_SIZE],
 }
 
 impl AccountKey {
     /// Creates an account key from a decoded public key.
     pub fn from_public_key(public_key: &TransactionPublicKey) -> Self {
-        Self::from_public_key_bytes(public_key.as_ref())
-            .expect("decoded transaction public key bytes must derive an account key")
+        match public_key {
+            TransactionPublicKey::Ed25519 { encoded } => {
+                Self::try_from(&encoded[1..1 + Self::SIZE])
+                    .expect("ed25519 account-key slice has account-key length")
+            }
+            TransactionPublicKey::Secp256r1 { encoded } => {
+                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
+                    .expect("sha256 digest has account-key length")
+            }
+        }
     }
 
     /// Creates an account key from encoded transaction public-key bytes.
@@ -43,33 +56,27 @@ impl AccountKey {
         }
 
         match bytes[0] {
-            ED25519_SCHEME => Some(Self {
-                bytes: Bytes::copy_from_slice(&bytes[1..1 + Self::SIZE]),
-            }),
-            SECP256R1_SCHEME => Some(Self {
-                bytes: Bytes::copy_from_slice(sha256::Sha256::hash(bytes).as_ref()),
-            }),
+            ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
+            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
             _ => None,
         }
     }
 
-    /// Creates an account key from canonical account-key bytes.
-    pub fn from_bytes(bytes: Bytes) -> Option<Self> {
-        if bytes.len() != Self::SIZE {
-            return None;
-        }
-
-        Some(Self { bytes })
+    /// First eight account-key bytes as a little-endian routing prefix.
+    #[inline]
+    pub fn prefix(&self) -> u64 {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&self.bytes[..8]);
+        u64::from_le_bytes(prefix)
     }
 }
 
 impl FixedSize for AccountKey {
-    const SIZE: usize = ed25519::PublicKey::SIZE;
+    const SIZE: usize = ACCOUNT_KEY_SIZE;
 }
 
 impl Write for AccountKey {
     fn write(&self, buf: &mut impl BufMut) {
-        debug_assert_eq!(self.bytes.len(), Self::SIZE);
         buf.put_slice(&self.bytes);
     }
 }
@@ -82,9 +89,9 @@ impl Read for AccountKey {
             return Err(CodecError::EndOfBuffer);
         }
 
-        Ok(Self {
-            bytes: buf.copy_to_bytes(Self::SIZE),
-        })
+        let mut bytes = [0u8; ACCOUNT_KEY_SIZE];
+        buf.copy_to_slice(&mut bytes);
+        Ok(Self { bytes })
     }
 }
 
