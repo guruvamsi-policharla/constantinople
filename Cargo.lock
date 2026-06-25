@@ -164,6 +164,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark-bn254"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bc66f96ebe2a17a499475b4f94791d379817592ef494171586967ffdc6f95db"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "ark-r1cs-std",
+ "ark-std",
+]
+
+[[package]]
 name = "ark-ec"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,13 +1146,12 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "arbitrary",
  "bytes",
  "cfg-if",
  "commonware-codec-macros",
- "commonware-conformance",
+ "commonware-conformance 2026.5.0",
  "commonware-macros",
  "paste",
  "rand 0.8.6",
@@ -1151,7 +1162,6 @@ dependencies = [
 [[package]]
 name = "commonware-codec-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1184,15 +1194,37 @@ dependencies = [
 [[package]]
 name = "commonware-conformance"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
- "commonware-conformance-macros",
- "commonware-formatting",
+ "commonware-conformance-macros 2026.5.0",
+ "commonware-formatting 2026.5.0",
  "commonware-macros",
  "futures",
  "serde",
  "sha2",
  "toml",
+]
+
+[[package]]
+name = "commonware-conformance"
+version = "2026.5.0"
+source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
+dependencies = [
+ "commonware-conformance-macros 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
+ "commonware-macros",
+ "futures",
+ "serde",
+ "sha2",
+ "toml",
+]
+
+[[package]]
+name = "commonware-conformance-macros"
+version = "2026.5.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1218,7 +1250,7 @@ dependencies = [
  "commonware-codec",
  "commonware-coding",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "commonware-math",
  "commonware-p2p",
@@ -1257,7 +1289,7 @@ dependencies = [
  "cfg-if",
  "chacha20poly1305",
  "commonware-codec",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "commonware-math",
  "commonware-parallel",
@@ -1287,6 +1319,14 @@ dependencies = [
  "cfg-if",
  "commonware-macros",
  "serde",
+]
+
+[[package]]
+name = "commonware-formatting"
+version = "2026.5.0"
+dependencies = [
+ "commonware-macros",
+ "const-hex",
 ]
 
 [[package]]
@@ -1329,7 +1369,7 @@ version = "2026.5.0"
 source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "arbitrary",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
@@ -1339,7 +1379,6 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -1348,7 +1387,6 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1402,11 +1440,28 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a#dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a"
 dependencies = [
  "cfg-if",
  "commonware-macros",
  "rayon",
+]
+
+[[package]]
+name = "commonware-privacy"
+version = "2026.5.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-poly",
+ "ark-serialize",
+ "ark-std",
+ "bytes",
+ "commonware-codec",
+ "commonware-macros",
+ "commonware-parallel",
+ "merlin",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1441,9 +1496,9 @@ dependencies = [
  "bytes",
  "cfg-if",
  "commonware-codec",
- "commonware-conformance",
+ "commonware-conformance 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "commonware-parallel",
  "commonware-runtime-macros",
@@ -1493,7 +1548,7 @@ dependencies = [
  "cfg-if",
  "commonware-codec",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "commonware-parallel",
  "commonware-runtime",
@@ -1514,7 +1569,7 @@ dependencies = [
  "chacha20poly1305",
  "commonware-codec",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "commonware-runtime",
  "commonware-utils",
@@ -1536,7 +1591,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "commonware-codec",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-macros",
  "futures",
  "getrandom 0.2.17",
@@ -1714,7 +1769,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-deployer",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-math",
  "commonware-utils",
  "rand_core 0.6.4",
@@ -1811,7 +1866,7 @@ dependencies = [
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-math",
  "commonware-parallel",
  "commonware-runtime",
@@ -1836,13 +1891,15 @@ name = "constantinople-primitives"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "ark-bn254",
  "bytes",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-math",
  "commonware-parallel",
+ "commonware-privacy",
  "commonware-utils",
  "derive_more",
  "p256",
@@ -1860,7 +1917,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-deployer",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-parallel",
  "commonware-runtime",
  "commonware-utils",
@@ -1886,7 +1943,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-deployer",
- "commonware-formatting",
+ "commonware-formatting 2026.5.0 (git+https://github.com/commonwarexyz/monorepo.git?rev=dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a)",
  "commonware-glue",
  "commonware-macros",
  "commonware-p2p",
@@ -3926,6 +3983,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4150,6 +4216,18 @@ name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
+
+[[package]]
+name = "merlin"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58c38e2799fc0978b65dfff8023ec7843e2330bb462f19198840b34b6582397d"
+dependencies = [
+ "byteorder",
+ "keccak",
+ "rand_core 0.6.4",
+ "zeroize",
+]
 
 [[package]]
 name = "mime"

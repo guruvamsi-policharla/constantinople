@@ -4,6 +4,21 @@
 mod sealed;
 pub use sealed::{Sealable, Sealed};
 
+mod privacy;
+#[cfg(feature = "privacy-backend-mock")]
+pub use commonware_privacy::mocks::{
+    MockBackend as MockPrivatePaymentBackend, MockCommitment, MockOpening, MockProof,
+};
+#[cfg(feature = "privacy-backend-simulator")]
+pub use privacy::PrivatePaymentSimulatorBackend;
+#[cfg(feature = "privacy-backend-zkpari")]
+pub use privacy::ZkPariBn254Backend;
+pub use privacy::{
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend,
+    PrivatePaymentExecutionBackend, StatePrivatePaymentBackend, to_state_burn_proof,
+    to_state_commitment, to_state_fund_proof, to_state_transfer_proof,
+};
+
 mod signed;
 pub use signed::{
     LazySignedTransaction, Signable, Signed, materialize_transaction_chunks,
