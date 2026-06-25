@@ -62,6 +62,7 @@ commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", r
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
+commonware-privacy = { path = "../monorepo/privacy", default-features = false }
 
 # Exoware
 exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
@@ -74,6 +75,7 @@ datafusion = "52"
 
 # Other
 axum = "0.8"
+ark-bn254 = { version = "0.6.0", default-features = false }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }
 rand = { version = "0.8.5", default-features = false }
@@ -96,6 +98,13 @@ serde_yaml = "0.9"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+
+[patch."https://github.com/commonwarexyz/monorepo.git"]
+commonware-codec = { path = "../monorepo/codec" }
+commonware-codec-macros = { path = "../monorepo/codec/macros" }
+commonware-macros = { path = "../monorepo/macros" }
+commonware-macros-impl = { path = "../monorepo/macros/impl" }
+commonware-parallel = { path = "../monorepo/parallel" }
 
 [profile.samply]
 inherits = "release"
