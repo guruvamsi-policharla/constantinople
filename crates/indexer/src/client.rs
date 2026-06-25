@@ -8,14 +8,14 @@
 
 use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
 use bytes::Bytes;
-use commonware_codec::{FixedSize as _, Read};
+use commonware_codec::{DecodeExt as _, Read};
 use commonware_consensus::{
     Heightable,
     types::{Height, View, coding::Commitment},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
+use constantinople_primitives::{BlockCfg, SignedTransaction};
 use datafusion::{
     arrow::array::{Array, StringArray},
     prelude::SessionContext,
@@ -400,20 +400,11 @@ fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Resu
 where
     H: Hasher,
 {
-    let body_len = Transaction::<H::Digest>::SIZE;
-    if bytes.len() < body_len {
-        return Err(ReadError::SqlRow(format!(
-            "tx_meta.body_hex signed transaction is {} bytes, shorter than {body_len}-byte transaction body",
-            bytes.len()
-        )));
-    }
-
-    let mut hasher = H::new();
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher.finalize();
-    if actual.as_ref() != digest.as_ref() {
+    let signed = SignedTransaction::<H>::decode(&mut &bytes[..])
+        .map_err(|err| ReadError::SqlRow(format!("malformed tx_meta.body_hex: {err}")))?;
+    if signed.message_digest().as_ref() != digest.as_ref() {
         return Err(ReadError::SqlRow(
-            "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
+            "tx_meta.body_hex transaction digest does not match tx_digest".to_string(),
         ));
     }
     Ok(())
@@ -422,12 +413,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{sha256, sha256::Sha256};
+    use commonware_codec::Encode as _;
+    use commonware_cryptography::{Signer, ed25519, sha256::Sha256};
+    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
+    use core::num::NonZeroU64;
 
     #[test]
     fn verifies_signed_transaction_bytes_against_digest() {
-        let mut bytes = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
-        let digest = digest_transaction_body(&bytes);
+        let signed = signed_transaction();
+        let digest = *signed.message_digest();
+        let mut bytes = signed.encode().to_vec();
 
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
 
@@ -439,18 +434,24 @@ mod tests {
 
     #[test]
     fn rejects_signed_transaction_bytes_without_full_body() {
-        let bytes = vec![0u8; Transaction::<sha256::Digest>::SIZE - 1];
-        let digest = digest_transaction_body(&bytes);
+        let signed = signed_transaction();
+        let digest = *signed.message_digest();
+        let bytes = vec![0u8; 3];
 
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect_err("truncated body should be rejected");
-        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("shorter")));
+        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("malformed")));
     }
 
-    fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
-        let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes[..body_len]);
-        hasher.finalize()
+    fn signed_transaction() -> SignedTransaction<Sha256> {
+        let key = ed25519::PrivateKey::from_seed(1);
+        let public_key = TransactionPublicKey::ed25519(key.public_key());
+        Transaction::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("non-zero"),
+            0,
+        )
+        .seal_and_sign(&key, TRANSACTION_NAMESPACE, &mut Sha256::default())
     }
 }

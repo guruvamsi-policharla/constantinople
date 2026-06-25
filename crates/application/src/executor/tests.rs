@@ -1,8 +1,8 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, StateAccount, Transaction,
-    TransactionPublicKey, VerifiedTransaction,
+    AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Payload, StateAccount,
+    Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 
@@ -77,7 +77,10 @@ fn proposal_tracks_pending_nonce_and_balance() {
     assert_eq!(proposal.invalid.len(), 1);
     assert_eq!(proposal.valid[0].value().nonce, 0);
     assert_eq!(proposal.valid[1].value().nonce, 1);
-    assert_eq!(proposal.invalid[0].value().value.get(), 7);
+    let Payload::PublicTransfer { value, .. } = &proposal.invalid[0].value().payload else {
+        panic!("expected public transfer");
+    };
+    assert_eq!(value.get(), 7);
 }
 
 #[test]

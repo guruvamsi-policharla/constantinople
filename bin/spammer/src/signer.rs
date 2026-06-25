@@ -135,7 +135,7 @@ mod tests {
             .map(constantinople_primitives::LazySignedTransaction::new)
             .collect();
         assert!(
-            verify_transaction_batch::<Sha256, _>(
+            verify_transaction_batch::<Sha256, _, _>(
                 &Sequential,
                 TRANSACTION_NAMESPACE,
                 &mut rng,
