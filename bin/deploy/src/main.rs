@@ -86,6 +86,40 @@ struct SimplexVerificationMaterialArgs {
     config: PathBuf,
 }
 
+/// Transaction mix the generated spammer runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum SpammerWorkload {
+    #[default]
+    Public,
+    Private,
+}
+
+impl SpammerWorkload {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// Proof mode for the generated spammer's private transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum SpammerProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
+impl SpammerProofMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct GenerateArgs {
     #[arg(long)]
@@ -131,6 +165,15 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Transaction mix the spammer generates.
+    #[arg(long, value_enum, default_value_t = SpammerWorkload::Public)]
+    spammer_workload: SpammerWorkload,
+    /// Proof mode for the spammer's private transfers.
+    #[arg(long, value_enum, default_value_t = SpammerProofMode::Real)]
+    spammer_private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch (private workload only).
+    #[arg(long, default_value_t = 64)]
+    spammer_private_batch: usize,
 
     #[command(subcommand)]
     target: GenerateTarget,
