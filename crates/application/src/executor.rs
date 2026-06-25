@@ -3,14 +3,16 @@
 use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{
+    AccountKey, SignedTransaction, StateAccount, TransactionPublicKey,
+};
 use hashbrown::HashMap;
 
 /// Fully loaded account state for one execution batch.
-pub type State = HashMap<AccountKey, Account>;
+pub type State = HashMap<AccountKey, StateAccount>;
 
 /// Deterministic account writes produced by execution.
-pub type Changeset = Vec<(AccountKey, Account)>;
+pub type Changeset = Vec<(AccountKey, StateAccount)>;
 
 /// Transfer data used by the executor.
 #[derive(Debug, Clone)]
@@ -162,7 +164,7 @@ where
 
 pub(crate) fn execute_unique<H>(
     transfers: &[PreparedTransfer<H>],
-    accounts: &[Account],
+    accounts: &[StateAccount],
 ) -> Option<Changeset>
 where
     H: Hasher,
@@ -173,12 +175,12 @@ where
     let mut changeset = Vec::with_capacity(transfers.len().saturating_mul(2));
 
     for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
-        let mut sender = accounts[0];
+        let mut sender = accounts[0].clone();
         if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
             return None;
         }
 
-        let mut recipient = accounts[1];
+        let mut recipient = accounts[1].clone();
         let recipient_balance = recipient.balance.checked_add(transfer.value)?;
 
         sender.balance -= transfer.value;
@@ -202,7 +204,7 @@ fn account_key_from_sender(
 #[derive(Debug)]
 struct Overlay<'a> {
     base: &'a State,
-    writes: HashMap<AccountKey, Account>,
+    writes: HashMap<AccountKey, StateAccount>,
 }
 
 impl<'a> Overlay<'a> {
@@ -214,14 +216,14 @@ impl<'a> Overlay<'a> {
         }
     }
 
-    fn get(&self, account_key: &AccountKey) -> Option<Account> {
+    fn get(&self, account_key: &AccountKey) -> Option<StateAccount> {
         self.writes
             .get(account_key)
             .or_else(|| self.base.get(account_key))
-            .copied()
+            .cloned()
     }
 
-    fn set(&mut self, account_key: AccountKey, account: Account) {
+    fn set(&mut self, account_key: AccountKey, account: StateAccount) {
         self.writes.insert(account_key, account);
     }
 

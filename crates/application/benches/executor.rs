@@ -2,7 +2,7 @@ use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use constantinople_application::executor::{self, State};
 use constantinople_primitives::{
-    Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
+    AccountKey, Nonce, StateAccount, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -55,14 +55,15 @@ fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
         let recipient_public_key = TransactionPublicKey::ed25519(recipient.clone());
         accounts.insert(
             AccountKey::from_public_key(&sender_public_key),
-            Account {
+            StateAccount {
                 balance: 1,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
         accounts.insert(
             AccountKey::from_public_key(&recipient_public_key),
-            Account::default(),
+            StateAccount::default(),
         );
         transactions.push(signer.sign(recipient, 1, 0));
     }

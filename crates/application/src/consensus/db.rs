@@ -21,12 +21,12 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::sync::TracedAsyncRwLock;
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_primitives::{AccountKey, StateAccount};
 use std::sync::Arc;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, StateAccount, H, T, S>>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -47,10 +47,13 @@ pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase
 pub(super) type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    FixedJournal<
+        E,
+        AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>>,
+    >,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>,
     S,
 >;
 
@@ -80,7 +83,7 @@ where
     changeset
         .iter()
         .fold(batch, |batch, (account_key, account)| {
-            batch.write(account_key.clone(), Some(*account))
+            batch.write(account_key.clone(), Some(account.clone()))
         })
 }
 

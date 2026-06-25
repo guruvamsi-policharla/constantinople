@@ -26,7 +26,10 @@ pub use signed::{
 };
 
 mod account;
-pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce};
+pub use account::{
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, StateAccount,
+    from_state_account, to_state_account,
+};
 
 mod auth;
 pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};

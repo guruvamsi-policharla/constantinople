@@ -14,7 +14,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
+use constantinople_primitives::{AccountKey, Header, SealedBlock, SignedTransaction, StateAccount};
 use hashbrown::HashSet;
 use tracing::{Instrument as _, info_span};
 
@@ -42,7 +42,7 @@ where
 }
 
 enum LoadedState {
-    Unique(Vec<Account>),
+    Unique(Vec<StateAccount>),
     Shared(State),
 }
 
