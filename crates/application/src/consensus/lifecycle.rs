@@ -63,15 +63,15 @@ where
             .instrument(info_span!("application.propose.input"))
             .await;
 
-        let (input, candidate_transfers) =
+        let (input, candidate_operations) =
             info_span!("application.propose.prepare").in_scope(|| {
                 let input = executor::prepare_proposal(body);
-                let candidate_transfers = input
+                let candidate_operations = input
                     .candidates
                     .iter()
-                    .map(|candidate| candidate.transfer.clone())
+                    .map(|candidate| candidate.operation.clone())
                     .collect::<Vec<_>>();
-                (input, candidate_transfers)
+                (input, candidate_operations)
             });
 
         let (state_batch, transaction_batch) = batches;
@@ -80,7 +80,8 @@ where
             transaction_batch,
             parent,
             input,
-            &candidate_transfers,
+            &candidate_operations,
+            &self.hash_strategy,
         )
         .await;
 
@@ -160,7 +161,13 @@ where
             self.transaction_namespace,
             Arc::clone(&body),
         );
-        let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
+        let execution = execute_body(
+            state_batch,
+            transaction_batch,
+            parent,
+            Arc::clone(&body),
+            &self.hash_strategy,
+        );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let execution = match futures::try_join!(signatures, execution, wait) {
@@ -213,7 +220,7 @@ where
                 .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
         let body = materialized
             .iter()
-            .map(executor::prepare_transfer)
+            .map(executor::prepare_operation)
             .collect::<Option<Vec<_>>>()
             .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 
@@ -223,6 +230,7 @@ where
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &body,
+            &self.hash_strategy,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
