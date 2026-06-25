@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use commonware_codec::{FixedSize as _, Write as _};
 use commonware_cryptography::Hasher;
 use constantinople_primitives::{
-    AccountKey, SignedTransaction, StateAccount, TransactionPublicKey,
+    AccountKey, Payload, SignedTransaction, StateAccount, TransactionPublicKey,
 };
 use hashbrown::HashMap;
 
@@ -137,10 +137,15 @@ where
     H: Hasher,
 {
     let transfer = transaction.value();
+    // Only public transfers are executable until private-payment execution
+    // lands; private payloads decode but are rejected as malformed here.
+    let Payload::PublicTransfer { to, value } = &transfer.payload else {
+        return None;
+    };
     Some(PreparedTransfer {
         sender: account_key_from_sender(transfer.sender_lazy())?,
-        recipient: transfer.to.clone(),
-        value: transfer.value.get(),
+        recipient: to.clone(),
+        value: value.get(),
         nonce: transfer.nonce,
         digest: *transaction.message_digest(),
     })

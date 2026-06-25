@@ -32,8 +32,8 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 
-/// Minimum bytes needed to encode a `u64` varint.
-const MIN_U64_VARINT_BYTES: usize = 1;
+/// Minimum bytes needed to encode a payload variant tag.
+const MIN_PAYLOAD_TAG_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, SigSt, HashSt>
@@ -101,11 +101,7 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
-    TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
-        + MIN_U64_VARINT_BYTES
-        + TransactionSignature::MIN_SIZE
+    TransactionPublicKey::SIZE + MIN_PAYLOAD_TAG_BYTES + u64::SIZE + TransactionSignature::MIN_SIZE
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {
@@ -252,7 +248,7 @@ where
         .map(LazySignedTransaction::new)
         .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<H, _, _>(
+        verify_transaction_chunks::<H, _, _, _>(
             &signature_strategy,
             &hash_strategy,
             namespace,

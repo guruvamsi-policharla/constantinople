@@ -36,7 +36,7 @@ where
         async move {
             let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
                 .filter(|transactions| {
-                    verify_transaction_batch::<H, _>(
+                    verify_transaction_batch::<H, _, _>(
                         &signature_strategy,
                         namespace,
                         &mut runtime,
