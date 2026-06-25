@@ -67,6 +67,18 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
+Add `--spammer-workload private` to instead generate private payments (each
+account cycles fund -> rollover -> transfer). Use `--spammer-private-proof-mode
+simulated` to produce transfer proofs with the simulator trapdoor — this builds
+the spammer with the `privacy-backend-simulator` feature automatically:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --relayer --output-dir ./local \
+  --spammer --spammer-workload private \
+  local --base-port 3000 --base-http-port 8080
+```
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see

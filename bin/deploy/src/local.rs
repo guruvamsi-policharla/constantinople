@@ -364,8 +364,16 @@ fn local_run_commands(
             .base_metrics_port
             .checked_add(args.validators as u16 + total_secondaries as u16)
             .expect("spammer metrics port overflow");
+
+        // The simulated proof mode needs the spammer's simulator feature.
+        let spammer_bin = if args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated {
+            "cargo run --release --bin constantinople-spammer \
+             --features constantinople-spammer/privacy-backend-simulator"
+        } else {
+            "cargo run --release --bin constantinople-spammer"
+        };
         commands.push(format!(
-            "cargo run --release --bin constantinople-spammer -- \
+            "{spammer_bin} -- \
              {network_source} \
              --accounts {} \
              --value {} \
@@ -373,13 +381,19 @@ fn local_run_commands(
              --rayon-threads {} \
              --accounts-jitter {} \
              --presigned-batches {} \
-             --metrics-port {metrics_port}",
+             --metrics-port {metrics_port} \
+             --workload {} \
+             --private-proof-mode {} \
+             --private-batch {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
+            args.spammer_workload.as_str(),
+            args.spammer_private_proof_mode.as_str(),
+            args.spammer_private_batch,
         ));
     }
 
@@ -427,6 +441,9 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_workload: crate::SpammerWorkload::Public,
+            spammer_private_proof_mode: crate::SpammerProofMode::Real,
+            spammer_private_batch: 64,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -561,6 +578,28 @@ mod tests {
         );
 
         assert!(commands[3].contains("--presigned-batches 32"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_private_workload_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_private_proof_mode = crate::SpammerProofMode::Simulated;
+        args.spammer_private_batch = 32;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--workload private"));
+        assert!(commands[3].contains("--private-proof-mode simulated"));
+        assert!(commands[3].contains("--private-batch 32"));
+        // Simulated mode must build the spammer with the simulator feature.
+        assert!(commands[3].contains("constantinople-spammer/privacy-backend-simulator"));
     }
 
     #[test]

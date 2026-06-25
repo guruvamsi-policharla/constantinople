@@ -522,6 +522,9 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_workload: crate::SpammerWorkload::Public,
+            spammer_private_proof_mode: crate::SpammerProofMode::Real,
+            spammer_private_batch: 64,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
