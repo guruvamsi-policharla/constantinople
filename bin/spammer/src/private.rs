@@ -356,9 +356,15 @@ mod tests {
         let value = 1;
 
         // 1. Fund the whole public balance into pending.
-        let (tx, effect) =
-            plan_and_sign(source, &sink, &state, value, PrivateProofMode::Real, &mut rng)
-                .expect("fund");
+        let (tx, effect) = plan_and_sign(
+            source,
+            &sink,
+            &state,
+            value,
+            PrivateProofMode::Real,
+            &mut rng,
+        )
+        .expect("fund");
         assert!(matches!(tx.value().payload, Payload::PrivateFund { .. }));
         assert_eq!(tx.value().nonce, 0);
         apply_effect(&mut state, &effect);
@@ -368,9 +374,15 @@ mod tests {
         assert_eq!(state.nonce, 1);
 
         // 2. Roll pending into current.
-        let (tx, effect) =
-            plan_and_sign(source, &sink, &state, value, PrivateProofMode::Real, &mut rng)
-                .expect("rollover");
+        let (tx, effect) = plan_and_sign(
+            source,
+            &sink,
+            &state,
+            value,
+            PrivateProofMode::Real,
+            &mut rng,
+        )
+        .expect("rollover");
         assert!(matches!(tx.value().payload, Payload::PrivateRollover));
         apply_effect(&mut state, &effect);
         assert_eq!(state.current.value(), DEFAULT_ACCOUNT_BALANCE);
@@ -378,16 +390,27 @@ mod tests {
 
         // 3. Transfer `value` until current is drained, then the source is exhausted.
         let mut transfers = 0;
-        while let Some((tx, effect)) =
-            plan_and_sign(source, &sink, &state, value, PrivateProofMode::Real, &mut rng)
-        {
-            assert!(matches!(tx.value().payload, Payload::PrivateTransfer { .. }));
+        while let Some((tx, effect)) = plan_and_sign(
+            source,
+            &sink,
+            &state,
+            value,
+            PrivateProofMode::Real,
+            &mut rng,
+        ) {
+            assert!(matches!(
+                tx.value().payload,
+                Payload::PrivateTransfer { .. }
+            ));
             apply_effect(&mut state, &effect);
             transfers += 1;
         }
         assert_eq!(transfers, DEFAULT_ACCOUNT_BALANCE);
         assert_eq!(state.current.value(), 0);
-        assert!(state.phase(value).is_none(), "exhausted source has no phase");
+        assert!(
+            state.phase(value).is_none(),
+            "exhausted source has no phase"
+        );
     }
 
     #[test]
