@@ -595,10 +595,12 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
+    // Sender public key + payload tag + nonce + signature. Mirrors the mempool's
+    // bound for the Payload transaction format; the smallest payload (rollover)
+    // is just the 1-byte tag, so this must not assume a recipient/value.
     constantinople_primitives::TransactionPublicKey::SIZE
-        + constantinople_primitives::TransactionPublicKey::SIZE
         + 1
-        + 1
+        + 8
         + constantinople_primitives::TransactionSignature::MIN_SIZE
 }
 
@@ -669,6 +671,16 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn transaction_count_bound_accepts_minimal_private_payloads() {
+        // The smallest payload (rollover) is just a 1-byte tag, so the bound
+        // must not assume a recipient/value or it under-counts and rejects
+        // valid private batches at decode.
+        let txs = 16;
+        let body_len = MIN_BATCH_LENGTH_PREFIX_BYTES + txs * min_signed_transaction_bytes();
+        assert_eq!(max_transaction_count(body_len), Some(txs));
+    }
 
     fn leader(key: &str) -> Leader {
         Leader {
