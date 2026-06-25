@@ -1,7 +1,7 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
+    AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, StateAccount, Transaction,
     TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
@@ -36,10 +36,11 @@ impl TestSigner {
     }
 }
 
-fn account(balance: u64, nonce: u64) -> Account {
-    Account {
+fn account(balance: u64, nonce: u64) -> StateAccount {
+    StateAccount {
         balance,
         nonce: Nonce::new(nonce, 0),
+        private: Default::default(),
     }
 }
 
@@ -48,13 +49,13 @@ fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
 }
 
 fn changeset_account(
-    changeset: &[(AccountKey, Account)],
+    changeset: &[(AccountKey, StateAccount)],
     public_key: ed25519::PublicKey,
-) -> Option<Account> {
+) -> Option<StateAccount> {
     let account_key = account_key(&public_key);
     changeset
         .iter()
-        .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
+        .find_map(|(candidate, account)| (candidate == &account_key).then(|| account.clone()))
 }
 
 #[test]
@@ -63,7 +64,7 @@ fn proposal_tracks_pending_nonce_and_balance() {
     let recipient = TestSigner::from_seed(1);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 4, 0),
@@ -85,7 +86,7 @@ fn proposal_accepts_nonce_inside_run_ahead_window() {
     let recipient = TestSigner::from_seed(3);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 3, 2),
@@ -111,7 +112,7 @@ fn proposal_rejects_duplicate_run_ahead_nonce() {
     let recipient = TestSigner::from_seed(5);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 3, 2),
@@ -133,7 +134,7 @@ fn proposal_accepts_far_ahead_nonce_and_rejects_duplicate() {
     let recipient = TestSigner::from_seed(7);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let nonce = NONCE_BITMAP_CAPACITY + 1;
     let transactions = vec![
@@ -209,7 +210,12 @@ fn unique_loaded_execution_matches_overlay_execution() {
         .expect("test transactions should prepare");
     let loaded = transfers
         .iter()
-        .flat_map(|transfer| [accounts[&transfer.sender], accounts[&transfer.recipient]])
+        .flat_map(|transfer| {
+            [
+                accounts[&transfer.sender].clone(),
+                accounts[&transfer.recipient].clone(),
+            ]
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(

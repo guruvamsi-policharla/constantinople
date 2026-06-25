@@ -6,7 +6,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use constantinople_engine::types::StateSyncDb;
 use constantinople_mempool::webserver::AccountReader;
-use constantinople_primitives::{Account, AccountKey, TransactionPublicKey};
+use constantinople_primitives::{Account, AccountKey, TransactionPublicKey, from_state_account};
 use futures::future::{BoxFuture, FutureExt};
 
 /// Forwards [`AccountReader::get`] to the attached state database.
@@ -43,6 +43,7 @@ where
                 .await
                 .ok()
                 .flatten()
+                .map(from_state_account)
         }
         .boxed()
     }

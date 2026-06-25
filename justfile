@@ -28,7 +28,7 @@ lint: fmt-check docs-check
 
 # Run Rust tests
 test *args='': docs-test
-  cargo nextest run --workspace --all --all-features $@
+  RUST_MIN_STACK=33554432 cargo nextest run --workspace --all --all-features $@
 
 # Test the Rust documentation
 docs-test *args='--all':
