@@ -15,7 +15,7 @@ use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed2
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_engine::types::EngineActivity;
-use constantinople_mempool::webserver::{AccountReader, TxStatus};
+use constantinople_mempool::webserver::AccountReader;
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,25 @@ enum BatchStatus {
         height: u64,
         included: Vec<String>,
         filtered: Vec<String>,
+    },
+    Dropped,
+}
+
+/// Client-facing outcome of a relayed batch.
+///
+/// Partial finalization carries the original-batch indices that landed so the
+/// private spammer can advance exactly the finalized sources' state and retry
+/// the rest with fresh proofs.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RelayedStatus {
+    Finalized {
+        height: u64,
+    },
+    PartiallyFinalized {
+        height: u64,
+        included: Vec<u64>,
+        filtered: u64,
     },
     Dropped,
 }
@@ -359,7 +378,7 @@ async fn submit_with_retries<St: Strategy>(
         .await;
         pending.retain(|index| !included.contains(index));
         if pending.is_empty() {
-            return json_response(TxStatus::Finalized { height });
+            return json_response(RelayedStatus::Finalized { height });
         }
 
         if retry == state.max_retry_views {
@@ -505,19 +524,21 @@ fn best_effort_status(
     included: &HashSet<usize>,
     filtered: &HashSet<usize>,
     height: u64,
-) -> TxStatus {
+) -> RelayedStatus {
     let filtered = filtered.difference(included).count();
     if included.is_empty() && filtered == 0 {
-        return TxStatus::Dropped;
+        return RelayedStatus::Dropped;
     }
-    TxStatus::PartiallyFinalized {
+    let mut included: Vec<u64> = included.iter().map(|index| *index as u64).collect();
+    included.sort_unstable();
+    RelayedStatus::PartiallyFinalized {
         height,
-        included: included.len() as u64,
+        included,
         filtered: filtered as u64,
     }
 }
 
-fn json_response(status: TxStatus) -> (StatusCode, String) {
+fn json_response(status: RelayedStatus) -> (StatusCode, String) {
     (
         StatusCode::OK,
         serde_json::to_string(&status).expect("transaction status serialization cannot fail"),
@@ -902,24 +923,24 @@ mod tests {
         // An index reported both included and filtered counts as included.
         assert_eq!(
             best_effort_status(&included, &observed, 7),
-            TxStatus::PartiallyFinalized {
+            RelayedStatus::PartiallyFinalized {
                 height: 7,
-                included: 1,
+                included: vec![0],
                 filtered: 1
             }
         );
         // Unresolved transactions are not misreported as filtered.
         assert_eq!(
             best_effort_status(&included, &HashSet::new(), 7),
-            TxStatus::PartiallyFinalized {
+            RelayedStatus::PartiallyFinalized {
                 height: 7,
-                included: 1,
+                included: vec![0],
                 filtered: 0
             }
         );
         assert_eq!(
             best_effort_status(&HashSet::new(), &HashSet::new(), 0),
-            TxStatus::Dropped
+            RelayedStatus::Dropped
         );
     }
 
@@ -937,7 +958,7 @@ mod tests {
                     async move {
                         submit_count.fetch_add(1, Ordering::Relaxed);
                         assert_eq!(body, Bytes::from_static(b"not a codec batch"));
-                        json_response(TxStatus::Dropped)
+                        json_response(RelayedStatus::Dropped)
                     }
                 }),
             )
@@ -962,8 +983,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&body).expect("status json"),
-            TxStatus::Dropped,
+            serde_json::from_str::<RelayedStatus>(&body).expect("status json"),
+            RelayedStatus::Dropped,
         );
         assert_eq!(submit_count.load(Ordering::Relaxed), 1);
         assert_eq!(ingest_count.load(Ordering::Relaxed), 0);
@@ -983,7 +1004,7 @@ mod tests {
                     if attempt == 0 {
                         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
                     }
-                    json_response(TxStatus::Dropped)
+                    json_response(RelayedStatus::Dropped)
                 }
             }),
         );
@@ -998,8 +1019,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&body).expect("status json"),
-            TxStatus::Dropped,
+            serde_json::from_str::<RelayedStatus>(&body).expect("status json"),
+            RelayedStatus::Dropped,
         );
         assert_eq!(submit_count.load(Ordering::Relaxed), 2);
     }
@@ -1120,8 +1141,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::Finalized { height: 7 },
+            serde_json::from_str::<RelayedStatus>(&response).expect("status json"),
+            RelayedStatus::Finalized { height: 7 },
         );
 
         // Both leaders accepted in round 0 and are polled (not re-POSTed) in
@@ -1148,8 +1169,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::Finalized { height: 3 },
+            serde_json::from_str::<RelayedStatus>(&response).expect("status json"),
+            RelayedStatus::Finalized { height: 3 },
         );
 
         // The transient round-0 failure is retried in round 1 because the
@@ -1180,10 +1201,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::PartiallyFinalized {
+            serde_json::from_str::<RelayedStatus>(&response).expect("status json"),
+            RelayedStatus::PartiallyFinalized {
                 height: 5,
-                included: 1,
+                included: vec![0],
                 filtered: 1,
             },
         );
@@ -1220,10 +1241,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::PartiallyFinalized {
+            serde_json::from_str::<RelayedStatus>(&response).expect("status json"),
+            RelayedStatus::PartiallyFinalized {
                 height: 5,
-                included: 1,
+                included: vec![0],
                 filtered: 0,
             },
         );
@@ -1263,10 +1284,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::PartiallyFinalized {
+            serde_json::from_str::<RelayedStatus>(&response).expect("status json"),
+            RelayedStatus::PartiallyFinalized {
                 height: 5,
-                included: 1,
+                included: vec![0],
                 filtered: 1,
             },
         );

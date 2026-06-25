@@ -110,10 +110,31 @@ enum RelayerBatchStatus {
     },
     PartiallyFinalized {
         height: u64,
-        included: u64,
+        included: Vec<u64>,
         filtered: u64,
     },
     Dropped,
+}
+
+/// Which transactions in a submitted private batch finalized.
+pub enum SubmitOutcome {
+    /// Every transaction in the batch finalized.
+    AllFinalized,
+    /// Only the transactions at these batch indices finalized.
+    Partial(std::collections::HashSet<u64>),
+    /// Nothing finalized (dropped or submit error) — retry with fresh proofs.
+    None,
+}
+
+impl SubmitOutcome {
+    /// Whether the transaction at `index` in the submitted batch finalized.
+    pub fn finalized(&self, index: u64) -> bool {
+        match self {
+            Self::AllFinalized => true,
+            Self::Partial(included) => included.contains(&index),
+            Self::None => false,
+        }
+    }
 }
 
 impl RelayerSubmitter {
@@ -148,11 +169,13 @@ impl RelayerSubmitter {
                 included,
                 filtered,
             }) => {
-                self.stats.record_finalized(included);
+                self.stats.record_finalized(included.len() as u64);
                 self.stats.record_filtered(filtered);
                 info!(
                     height,
-                    included, filtered, "relayed batch partially finalized, advancing"
+                    included = included.len(),
+                    filtered,
+                    "relayed batch partially finalized, advancing"
                 );
             }
             Ok(RelayerBatchStatus::Dropped) => {
@@ -167,6 +190,50 @@ impl RelayerSubmitter {
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+            }
+        }
+    }
+
+    /// Submits a private batch and reports which transactions finalized.
+    ///
+    /// The relayer response is definitive (the call blocks until the batch is
+    /// finalized, partially finalized, or dropped), so the caller can advance
+    /// only the finalized accounts' state and retry the rest with fresh proofs.
+    pub async fn submit_private(&self, batch: &[Tx]) -> SubmitOutcome {
+        let count = batch.len() as u64;
+        let body = batch.encode();
+        self.stats.record_submitted(count);
+        match self.submit_encoded(body).await {
+            Ok(RelayerBatchStatus::Finalized { height }) => {
+                self.stats.record_finalized(count);
+                debug!(height, count, "private batch finalized");
+                SubmitOutcome::AllFinalized
+            }
+            Ok(RelayerBatchStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) => {
+                self.stats.record_finalized(included.len() as u64);
+                self.stats.record_filtered(filtered);
+                info!(
+                    height,
+                    included = included.len(),
+                    filtered,
+                    "private batch partially finalized"
+                );
+                SubmitOutcome::Partial(included.into_iter().collect())
+            }
+            Ok(RelayerBatchStatus::Dropped) => {
+                self.stats.record_dropped(count);
+                debug!(count, "private batch dropped, retrying");
+                SubmitOutcome::None
+            }
+            Err(error) => {
+                self.stats.record_error();
+                warn!(error = %error, "private submit error, retrying");
+                tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                SubmitOutcome::None
             }
         }
     }

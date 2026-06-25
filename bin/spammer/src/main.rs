@@ -10,12 +10,13 @@
 mod accounts;
 mod cli;
 mod config;
+mod private;
 mod signer;
 mod submitter;
 
 use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, Workload};
 use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
@@ -140,7 +141,22 @@ fn main() {
             relayer_targets: primary_validators,
         };
         let stats = Arc::new(Stats::new(context.child("spammer")));
-        run_relayer_mode(config, strategy, stats).await;
+        match cli.workload {
+            Workload::Public => run_relayer_mode(config, strategy, stats).await,
+            Workload::Private => {
+                private::run_private(
+                    config.relayer_url,
+                    config.accounts_count,
+                    config.value,
+                    config.seed_offset,
+                    cli.private_proof_mode,
+                    cli.private_batch,
+                    config.relayer_targets,
+                    stats,
+                )
+                .await;
+            }
+        }
     });
 }
 
