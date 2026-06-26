@@ -31,6 +31,7 @@ commonware-utils.workspace = true
 ahash.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
+futures = { workspace = true, features = ["std"] }
 mimalloc.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }

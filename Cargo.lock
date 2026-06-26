@@ -1969,6 +1969,7 @@ dependencies = [
  "commonware-utils",
  "constantinople-mempool",
  "constantinople-primitives",
+ "futures",
  "mimalloc",
  "rand 0.10.2",
  "reqwest",
