@@ -31,6 +31,10 @@ use tracing_subscriber::fmt;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const STORAGE_CLASS: &str = "gp3";
+/// Graviton4 instance type for the binary instances. Must stay on Graviton4 to
+/// match the `neoverse-v2` graviton build target in `docker/docker-bake.hcl`; a
+/// Graviton3 (c7g) type hits illegal instructions on startup.
+const DEFAULT_INSTANCE_TYPE: &str = "c8g.4xlarge";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
@@ -92,7 +96,18 @@ struct SimplexVerificationMaterialArgs {
 }
 
 /// Transaction mix the generated spammer runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SpammerWorkload {
     #[default]
     Public,
@@ -109,7 +124,18 @@ impl SpammerWorkload {
 }
 
 /// Proof mode for the generated spammer's private transfers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SpammerProofMode {
     #[default]
     Real,
@@ -256,8 +282,10 @@ pub(crate) struct RemoteArgs {
     /// AWS regions to spread validators across (comma-separated).
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
-    /// EC2 instance type for validators.
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for validators, relayer, indexers, and
+    /// spammer. Defaults to a Graviton4 type to match the `neoverse-v2` graviton
+    /// build; do not use Graviton3 (c7g) — those binaries fault on startup.
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     instance_type: String,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
@@ -280,8 +308,8 @@ pub(crate) struct RemoteArgs {
     /// Provisioned IOPS for the shared chain-indexer io2 volume.
     #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
     chain_indexer_storage_iops: i32,
-    /// EC2 instance type for the monitoring instance.
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for the monitoring host (Grafana/Prometheus).
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     monitoring_instance_type: String,
     /// Monitoring instance EBS volume size in GiB.
     #[arg(long)]
@@ -360,6 +388,26 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Transaction mix to submit.
+    #[serde(default)]
+    pub workload: SpammerWorkload,
+    /// Proof mode for private transfers.
+    #[serde(default)]
+    pub private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch.
+    #[serde(default = "default_spammer_private_batch")]
+    pub private_batch: usize,
+    /// Concurrent private lanes.
+    #[serde(default = "default_spammer_private_lanes")]
+    pub private_lanes: usize,
+}
+
+const fn default_spammer_private_batch() -> usize {
+    64
+}
+
+const fn default_spammer_private_lanes() -> usize {
+    8
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
