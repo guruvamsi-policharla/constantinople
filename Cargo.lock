@@ -1925,6 +1925,7 @@ dependencies = [
  "commonware-utils",
  "constantinople-mempool",
  "constantinople-primitives",
+ "futures",
  "rand 0.8.6",
  "reqwest",
  "serde",

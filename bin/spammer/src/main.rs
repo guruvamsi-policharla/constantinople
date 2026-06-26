@@ -136,6 +136,7 @@ fn main() {
                     config.seed_offset,
                     cli.private_proof_mode,
                     cli.private_batch,
+                    cli.private_lanes,
                     config.relayer_targets,
                 )
                 .await;

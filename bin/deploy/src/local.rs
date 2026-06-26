@@ -364,7 +364,8 @@ fn local_run_commands(
              --presigned-batches {} \
              --workload {} \
              --private-proof-mode {} \
-             --private-batch {}",
+             --private-batch {} \
+             --private-lanes {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -374,6 +375,7 @@ fn local_run_commands(
             args.spammer_workload.as_str(),
             args.spammer_private_proof_mode.as_str(),
             args.spammer_private_batch,
+            args.spammer_private_lanes,
         ));
     }
 
@@ -418,6 +420,7 @@ mod tests {
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_proof_mode: crate::SpammerProofMode::Real,
             spammer_private_batch: 64,
+            spammer_private_lanes: 8,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -560,6 +563,7 @@ mod tests {
         args.spammer_workload = crate::SpammerWorkload::Private;
         args.spammer_private_proof_mode = crate::SpammerProofMode::Simulated;
         args.spammer_private_batch = 32;
+        args.spammer_private_lanes = 12;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -571,6 +575,7 @@ mod tests {
         assert!(commands[3].contains("--workload private"));
         assert!(commands[3].contains("--private-proof-mode simulated"));
         assert!(commands[3].contains("--private-batch 32"));
+        assert!(commands[3].contains("--private-lanes 12"));
         // Simulated mode must build the spammer with the simulator feature.
         assert!(commands[3].contains("constantinople-spammer/privacy-backend-simulator"));
     }

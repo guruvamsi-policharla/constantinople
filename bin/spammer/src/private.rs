@@ -25,6 +25,7 @@ use constantinople_primitives::{
     AccountKey, ChainPrivatePaymentBackend, DEFAULT_ACCOUNT_BALANCE, Payload, PrivatePaymentBackend,
 };
 use core::num::NonZeroU64;
+use futures::future::join_all;
 use rand::{CryptoRng, RngCore, SeedableRng, rngs::StdRng};
 use std::sync::{Arc, atomic::Ordering};
 use tracing::info;
@@ -260,8 +261,13 @@ fn simulated_transfer_payload(
     )
 }
 
-/// Drives the private workload: rotate over source accounts, submit a batch,
-/// advance the finalized sources and retry the rest.
+/// Drives the private workload across `lanes` concurrent lanes.
+///
+/// Each lane owns a disjoint slice of source (and sink) accounts and runs its
+/// own blocking submit loop, so several batches are in flight at once. A single
+/// lane only lands one batch per finalization round-trip (leaving the blocks in
+/// between empty); running enough lanes keeps every block populated.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_private(
     relayer_url: String,
     accounts_count: u32,
@@ -269,32 +275,81 @@ pub async fn run_private(
     seed_offset: u64,
     proof_mode: PrivateProofMode,
     batch_size: usize,
+    lanes: usize,
     relayer_targets: Vec<String>,
 ) {
     assert!(batch_size > 0, "--private-batch must be > 0");
+    let total = accounts_count as usize;
+    let lanes = lanes.clamp(1, total.max(1));
     let stats = Arc::new(Stats::new());
-    let target = relayer_targets.into_iter().next();
-    let submitter = RelayerSubmitter::new(relayer_url, stats.clone(), 0, target);
+    // Sinks live in a disjoint seed range so a lane's transfers never touch
+    // another lane's (or its own) source accounts.
+    let sink_base = seed_offset + u64::from(accounts_count);
 
-    // Sources do the work; sinks (a disjoint seed range) only receive transfers.
-    let sources = generate_accounts(accounts_count, seed_offset);
-    let sinks = generate_accounts(accounts_count, seed_offset + u64::from(accounts_count));
+    info!(
+        accounts = total,
+        lanes,
+        batch = batch_size,
+        ?proof_mode,
+        "starting private workload"
+    );
+
+    let base = total / lanes;
+    let extra = total % lanes;
+    let mut start = 0usize;
+    let mut lane_futures = Vec::with_capacity(lanes);
+    for lane in 0..lanes {
+        let count = base + usize::from(lane < extra);
+        if count == 0 {
+            continue;
+        }
+        // Spread lanes across the provided leader targets (mirrors the public
+        // path); fall back to the relayer's default routing when none are given.
+        let target = (!relayer_targets.is_empty())
+            .then(|| relayer_targets[lane % relayer_targets.len()].clone());
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), lane, target);
+        lane_futures.push(run_lane(
+            submitter,
+            count as u32,
+            seed_offset + start as u64,
+            sink_base + start as u64,
+            value.get(),
+            proof_mode,
+            batch_size,
+            seed_offset.wrapping_add(lane as u64 + 1),
+        ));
+        start += count;
+    }
+
+    join_all(lane_futures).await;
+    info!(
+        finalized = stats.finalized.load(Ordering::Relaxed),
+        "all private lanes complete"
+    );
+}
+
+/// One independent blocking submit loop over a disjoint slice of accounts.
+#[allow(clippy::too_many_arguments)]
+async fn run_lane(
+    submitter: RelayerSubmitter,
+    accounts_count: u32,
+    source_seed: u64,
+    sink_seed: u64,
+    value: u64,
+    proof_mode: PrivateProofMode,
+    batch_size: usize,
+    rng_seed: u64,
+) {
+    let sources = generate_accounts(accounts_count, source_seed);
+    let sinks = generate_accounts(accounts_count, sink_seed);
     let sink_keys: Vec<AccountKey> = sinks.iter().map(|s| account_key(&s.public_key)).collect();
     let mut states: Vec<PrivateSpamState> = (0..sources.len())
         .map(|_| PrivateSpamState::new())
         .collect();
 
-    let mut rng = StdRng::seed_from_u64(seed_offset);
-    let value = value.get();
+    let mut rng = StdRng::seed_from_u64(rng_seed);
     let n = sources.len();
     let mut cursor = 0usize;
-
-    info!(
-        accounts = n,
-        batch = batch_size,
-        ?proof_mode,
-        "starting private workload"
-    );
 
     loop {
         // Fill a batch from distinct sources, skipping exhausted ones.
@@ -319,10 +374,6 @@ pub async fn run_private(
         }
 
         if batch.is_empty() {
-            info!(
-                finalized = stats.finalized.load(Ordering::Relaxed),
-                "all private sources exhausted; workload complete"
-            );
             return;
         }
 
