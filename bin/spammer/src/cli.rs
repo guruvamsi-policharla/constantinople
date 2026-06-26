@@ -93,6 +93,15 @@ pub struct Cli {
     /// `--workload private`).
     #[arg(long, default_value_t = 64)]
     pub private_batch: usize,
+
+    /// Number of concurrent private lanes (only used when `--workload private`).
+    ///
+    /// Each lane drives a disjoint slice of accounts and keeps one batch in
+    /// flight, so more lanes mean more batches finalizing per block. A single
+    /// lane lands one batch per finalization round-trip, leaving intervening
+    /// blocks empty.
+    #[arg(long, default_value_t = 8)]
+    pub private_lanes: usize,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {

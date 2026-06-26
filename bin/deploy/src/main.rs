@@ -204,6 +204,10 @@ pub(crate) struct GenerateArgs {
     /// Private operations per submitted batch (private workload only).
     #[arg(long, default_value_t = 64)]
     spammer_private_batch: usize,
+    /// Concurrent private lanes; more lanes keep more blocks populated
+    /// (private workload only).
+    #[arg(long, default_value_t = 8)]
+    spammer_private_lanes: usize,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]

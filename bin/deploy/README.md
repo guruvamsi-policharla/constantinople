@@ -79,6 +79,12 @@ cargo run --bin constantinople-deploy -- generate \
   local --base-port 3000 --base-http-port 8080
 ```
 
+The private spammer runs `--spammer-private-lanes` (default `8`) concurrent
+lanes, each over a disjoint slice of accounts. A single lane only lands one
+batch per finalization round-trip, leaving the blocks in between empty; more
+lanes keep more batches in flight so every block is populated. Raise it if you
+still see gaps.
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
