@@ -277,11 +277,21 @@ fn local_run_commands(
     simplex_verification_material: &str,
 ) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
+    // The simulated proof mode runs the whole cluster on the zkpari backend, so
+    // validators, the indexer, and the spammer must all be built with it (they
+    // must agree on the proof/state encoding). The spammer additionally uses the
+    // simulator trapdoor to generate transfer proofs cheaply.
+    let zkpari = args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated;
+    let cluster_features = if zkpari {
+        " --features constantinople-primitives/privacy-backend-zkpari"
+    } else {
+        ""
+    };
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
-                "cargo run --release --bin constantinople -- --config {} --peers {}",
+                "cargo run --release --bin constantinople{cluster_features} -- --config {} --peers {}",
                 path.display(),
                 peers_path.display()
             )
@@ -292,7 +302,7 @@ fn local_run_commands(
     for index in 0..total_secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
-            "cargo run --release --bin constantinople -- --config {} --peers {}",
+            "cargo run --release --bin constantinople{cluster_features} -- --config {} --peers {}",
             path.display(),
             peers_path.display()
         ));
@@ -301,7 +311,7 @@ fn local_run_commands(
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             data_dir.display(),
@@ -311,12 +321,12 @@ fn local_run_commands(
         // subscribes to this service (not the raw store) for live block
         // metadata.
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
@@ -346,10 +356,11 @@ fn local_run_commands(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
-        // The simulated proof mode needs the spammer's simulator feature.
-        let spammer_bin = if args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated {
+        // Simulated proof mode builds the spammer on the zkpari backend with the
+        // simulator trapdoor (matching the rest of the cluster).
+        let spammer_bin = if zkpari {
             "cargo run --release --bin constantinople-spammer \
-             --features constantinople-spammer/privacy-backend-simulator"
+             --features constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator"
         } else {
             "cargo run --release --bin constantinople-spammer"
         };
@@ -576,8 +587,27 @@ mod tests {
         assert!(commands[3].contains("--private-proof-mode simulated"));
         assert!(commands[3].contains("--private-batch 32"));
         assert!(commands[3].contains("--private-lanes 12"));
-        // Simulated mode must build the spammer with the simulator feature.
+        // Simulated mode runs the whole cluster on zkpari; the spammer also gets
+        // the simulator trapdoor feature.
+        assert!(commands[0].contains("constantinople-primitives/privacy-backend-zkpari"));
+        assert!(commands[3].contains("constantinople-primitives/privacy-backend-zkpari"));
         assert!(commands[3].contains("constantinople-spammer/privacy-backend-simulator"));
+    }
+
+    #[test]
+    fn real_proof_mode_keeps_mock_cluster() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_private_proof_mode = crate::SpammerProofMode::Real;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+        assert!(commands.iter().all(|c| !c.contains("zkpari")));
     }
 
     #[test]

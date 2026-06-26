@@ -69,8 +69,11 @@ accounts.
 
 Add `--spammer-workload private` to instead generate private payments (each
 account cycles fund -> rollover -> transfer). Use `--spammer-private-proof-mode
-simulated` to produce transfer proofs with the simulator trapdoor — this builds
-the spammer with the `privacy-backend-simulator` feature automatically:
+simulated` to run the whole cluster (validators, indexer, and spammer) on the
+**zkpari** BN254 backend, with the spammer using the simulator trapdoor to
+generate transfer proofs cheaply — the generated commands add the
+`privacy-backend-zkpari`/`privacy-backend-simulator` features automatically. The
+default (`real`) keeps the fast mock backend:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
