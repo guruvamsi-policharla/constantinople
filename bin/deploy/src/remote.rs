@@ -123,6 +123,13 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         ?binaries,
         "build deployment binaries into the output directory before creating the remote deployment"
     );
+    if args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated {
+        info!(
+            validator_and_indexer_features = "constantinople-primitives/privacy-backend-zkpari",
+            spammer_features = "constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator",
+            "simulated proof mode runs the cluster on zkpari: build the validator (and indexer) binaries with the zkpari feature and the spammer with zkpari + simulator"
+        );
+    }
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -277,6 +284,10 @@ fn remote_spammer_config(
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
+        workload: args.spammer_workload,
+        private_proof_mode: args.spammer_private_proof_mode,
+        private_batch: args.spammer_private_batch,
+        private_lanes: args.spammer_private_lanes,
     }
 }
 

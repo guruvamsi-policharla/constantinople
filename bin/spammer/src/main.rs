@@ -44,7 +44,12 @@ fn main() {
         primary_validators,
         rayon_threads,
         accounts_jitter,
+        workload,
+        private_proof_mode,
+        private_batch,
+        private_lanes,
     ) = if let Some(config_path) = &cli.config {
+        // Deployer/remote mode: the workload is driven by the config file.
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
             cfg.primary_validators.len().max(1)
@@ -65,6 +70,10 @@ fn main() {
             },
             cfg.rayon_threads,
             cfg.accounts_jitter,
+            cfg.workload,
+            cfg.private_proof_mode,
+            cfg.private_batch,
+            cfg.private_lanes,
         )
     } else {
         (
@@ -79,6 +88,10 @@ fn main() {
             cli.relayer_targets.clone(),
             cli.rayon_threads,
             cli.accounts_jitter,
+            cli.workload,
+            cli.private_proof_mode,
+            cli.private_batch,
+            cli.private_lanes,
         )
     };
     assert!(
@@ -96,7 +109,8 @@ fn main() {
     );
     let value = NonZeroU64::new(value).expect("checked above");
 
-    let runtime_cfg = commonware_runtime::tokio::Config::default();
+    let runtime_cfg =
+        commonware_runtime::tokio::Config::default().with_worker_threads(rayon_threads);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -126,7 +140,7 @@ fn main() {
             presigned_batches,
             relayer_targets: primary_validators,
         };
-        match cli.workload {
+        match workload {
             Workload::Public => run_relayer_mode(config, strategy).await,
             Workload::Private => {
                 private::run_private(
@@ -134,9 +148,9 @@ fn main() {
                     config.accounts_count,
                     config.value,
                     config.seed_offset,
-                    cli.private_proof_mode,
-                    cli.private_batch,
-                    cli.private_lanes,
+                    private_proof_mode,
+                    private_batch,
+                    private_lanes,
                     config.relayer_targets,
                 )
                 .await;
