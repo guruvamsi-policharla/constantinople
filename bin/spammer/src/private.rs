@@ -297,7 +297,7 @@ pub async fn run_private(
     let base = total / lanes;
     let extra = total % lanes;
     let mut start = 0usize;
-    let mut lane_futures = Vec::with_capacity(lanes);
+    let mut lane_handles = Vec::with_capacity(lanes);
     for lane in 0..lanes {
         let count = base + usize::from(lane < extra);
         if count == 0 {
@@ -308,7 +308,7 @@ pub async fn run_private(
         let target = (!relayer_targets.is_empty())
             .then(|| relayer_targets[lane % relayer_targets.len()].clone());
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), lane, target);
-        lane_futures.push(run_lane(
+        lane_handles.push(tokio::spawn(run_lane(
             submitter,
             count as u32,
             seed_offset + start as u64,
@@ -317,11 +317,13 @@ pub async fn run_private(
             proof_mode,
             batch_size,
             seed_offset.wrapping_add(lane as u64 + 1),
-        ));
+        )));
         start += count;
     }
 
-    join_all(lane_futures).await;
+    for handle in lane_handles {
+        handle.await.expect("private spammer lane task panicked");
+    }
     info!(
         finalized = stats.totals().finalized,
         "all private lanes complete"

@@ -1,26 +1,7 @@
 //! CLI definition.
 
+pub use crate::config::{PrivateProofMode, Workload};
 use std::path::PathBuf;
-
-/// Which transaction mix the spammer generates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum Workload {
-    /// Ring of public transfers (the original behavior).
-    #[default]
-    Public,
-    /// Private payments: each account cycles fund -> rollover -> transfer.
-    Private,
-}
-
-/// How private transfer proofs are produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum PrivateProofMode {
-    /// Real proofs from the configured backend.
-    #[default]
-    Real,
-    /// Simulated proofs via the trapdoor (requires the simulator feature).
-    Simulated,
-}
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "constantinople-spammer")]
