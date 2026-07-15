@@ -28,6 +28,10 @@ use tracing::Level;
 use tracing_subscriber::fmt;
 
 const STORAGE_CLASS: &str = "gp3";
+/// Graviton4 instance type for the binary instances. Must stay on Graviton4 to
+/// match the `neoverse-v2` graviton build target in `docker/docker-bake.hcl`; a
+/// Graviton3 (c7g) type hits illegal instructions on startup.
+const DEFAULT_INSTANCE_TYPE: &str = "c8g.4xlarge";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
@@ -86,6 +90,62 @@ struct SimplexVerificationMaterialArgs {
     config: PathBuf,
 }
 
+/// Transaction mix the generated spammer runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerWorkload {
+    #[default]
+    Public,
+    Private,
+}
+
+impl SpammerWorkload {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// Proof mode for the generated spammer's private transfers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
+impl SpammerProofMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct GenerateArgs {
     #[arg(long)]
@@ -131,6 +191,19 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Transaction mix the spammer generates.
+    #[arg(long, value_enum, default_value_t = SpammerWorkload::Public)]
+    spammer_workload: SpammerWorkload,
+    /// Proof mode for the spammer's private transfers.
+    #[arg(long, value_enum, default_value_t = SpammerProofMode::Real)]
+    spammer_private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch (private workload only).
+    #[arg(long, default_value_t = 64)]
+    spammer_private_batch: usize,
+    /// Concurrent private lanes; more lanes keep more blocks populated
+    /// (private workload only).
+    #[arg(long, default_value_t = 8)]
+    spammer_private_lanes: usize,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -166,7 +239,10 @@ pub(crate) struct LocalArgs {
 pub(crate) struct RemoteArgs {
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for validators, relayer, indexers, and
+    /// spammer. Defaults to a Graviton4 type to match the `neoverse-v2` graviton
+    /// build; do not use Graviton3 (c7g) — those binaries fault on startup.
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     instance_type: String,
     #[arg(long)]
     storage_size: i32,
@@ -179,7 +255,8 @@ pub(crate) struct RemoteArgs {
     /// Provisioned IOPS for the shared chain-indexer io2 volume.
     #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
     chain_indexer_storage_iops: i32,
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for the monitoring host (Grafana/Prometheus).
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     monitoring_instance_type: String,
     #[arg(long)]
     monitoring_storage_size: i32,
@@ -244,6 +321,26 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Transaction mix to submit.
+    #[serde(default)]
+    pub workload: SpammerWorkload,
+    /// Proof mode for private transfers.
+    #[serde(default)]
+    pub private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch.
+    #[serde(default = "default_spammer_private_batch")]
+    pub private_batch: usize,
+    /// Concurrent private lanes.
+    #[serde(default = "default_spammer_private_lanes")]
+    pub private_lanes: usize,
+}
+
+const fn default_spammer_private_batch() -> usize {
+    64
+}
+
+const fn default_spammer_private_lanes() -> usize {
+    8
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.

@@ -38,6 +38,7 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
     PACKAGE_NAME="constantinople-validator" \
     BINARY_NAME="constantinople" \
     OUTPUT_NAME="validator" \
+    FEATURES="" \
     TARGET_TRIPLE="${TARGET_TRIPLE}" \
     TARGET_CARGO_NAME="${TARGET_CARGO_NAME}" \
     TARGET_CC_NAME="${TARGET_CC_NAME}" \
@@ -52,4 +53,4 @@ RUN rustup target add ${TARGET_TRIPLE}
 WORKDIR /constantinople
 
 ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["set -euo pipefail && export CARGO_TARGET_${TARGET_CARGO_NAME}_LINKER=${TARGET_LINKER} && export CARGO_TARGET_${TARGET_CARGO_NAME}_RUSTFLAGS=\"-C target-cpu=${TARGET_CPU}\" && export CC_${TARGET_CC_NAME}=${TARGET_LINKER} && export AR_${TARGET_CC_NAME}=${TARGET_AR} && mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target ${TARGET_TRIPLE} && cp target/${TARGET_TRIPLE}/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && ${TARGET_STRIP} -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]
+CMD ["set -euo pipefail && export CARGO_TARGET_${TARGET_CARGO_NAME}_LINKER=${TARGET_LINKER} && export CARGO_TARGET_${TARGET_CARGO_NAME}_RUSTFLAGS=\"-C target-cpu=${TARGET_CPU}\" && export CC_${TARGET_CC_NAME}=${TARGET_LINKER} && export AR_${TARGET_CC_NAME}=${TARGET_AR} && mkdir -p deploy && FEATURES_FLAG=$([ -n \"${FEATURES}\" ] && echo \"--features ${FEATURES}\" || echo \"\") && echo \"building ${PACKAGE_NAME}:${BINARY_NAME} ${FEATURES_FLAG}\" && cargo build --locked --release ${FEATURES_FLAG} --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target ${TARGET_TRIPLE} && cp target/${TARGET_TRIPLE}/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && ${TARGET_STRIP} -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]

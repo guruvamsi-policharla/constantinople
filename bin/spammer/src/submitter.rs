@@ -58,6 +58,27 @@ enum RelayerBatchStatus {
     Dropped,
 }
 
+/// Which transactions in a submitted private batch finalized.
+pub enum SubmitOutcome {
+    /// Every transaction in the batch finalized.
+    AllFinalized,
+    /// Only these hex-encoded message digests finalized.
+    Partial(std::collections::HashSet<String>),
+    /// Nothing finalized (dropped or submit error) — retry with fresh proofs.
+    None,
+}
+
+impl SubmitOutcome {
+    /// Whether the transaction with the given hex message digest finalized.
+    pub fn finalized(&self, digest: &str) -> bool {
+        match self {
+            Self::AllFinalized => true,
+            Self::Partial(included) => included.contains(digest),
+            Self::None => false,
+        }
+    }
+}
+
 impl RelayerSubmitter {
     pub fn new(
         url: String,
@@ -114,6 +135,53 @@ impl RelayerSubmitter {
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+            }
+        }
+    }
+
+    /// Submits a private batch and reports which transactions finalized.
+    ///
+    /// The relayer response is definitive (the call blocks until the batch is
+    /// finalized, partially finalized, or dropped), so the caller can advance
+    /// only the finalized accounts' state and retry the rest with fresh proofs.
+    pub async fn submit_private(&self, batch: &[Tx]) -> SubmitOutcome {
+        let count = batch.len() as u64;
+        let body = batch.encode();
+        match self.submit_encoded(body).await {
+            Ok(RelayerBatchStatus::Finalized { height }) => {
+                self.stats.finalized.fetch_add(count, Ordering::Relaxed);
+                debug!(height, count, "private batch finalized");
+                SubmitOutcome::AllFinalized
+            }
+            Ok(RelayerBatchStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) => {
+                self.stats
+                    .finalized
+                    .fetch_add(included.len() as u64, Ordering::Relaxed);
+                self.stats
+                    .filtered
+                    .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                info!(
+                    height,
+                    included = included.len(),
+                    filtered = filtered.len(),
+                    "private batch partially finalized"
+                );
+                SubmitOutcome::Partial(included.into_iter().collect())
+            }
+            Ok(RelayerBatchStatus::Dropped) => {
+                self.stats.dropped.fetch_add(count, Ordering::Relaxed);
+                debug!(count, "private batch dropped, retrying");
+                SubmitOutcome::None
+            }
+            Err(error) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %error, "private submit error, retrying");
+                tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                SubmitOutcome::None
             }
         }
     }

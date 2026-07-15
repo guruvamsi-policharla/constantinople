@@ -5,6 +5,7 @@
 # Deployment artifacts
 /local
 /deploy
+/remote
 
 # Dust
 mprocs.log

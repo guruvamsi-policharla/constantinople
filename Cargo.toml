@@ -99,6 +99,13 @@ derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
 
+# The privacy crate lives at monorepo commit e6235b12, which needs newer
+# codec/macros/parallel than the pinned consensus/storage rev (dc1a3df, an
+# ancestor). The heavy crates must stay at dc1a3df to match exoware's pin, so we
+# patch only the four leaf crates up to e6235b12. Cargo forbids patching a git
+# URL with the same URL, so these point at the sibling `../monorepo` checkout
+# (kept at e6235b12). Docker/remote builds mount that checkout — see
+# docker/justfile.
 [patch."https://github.com/commonwarexyz/monorepo.git"]
 commonware-codec = { path = "../monorepo/codec" }
 commonware-codec-macros = { path = "../monorepo/codec/macros" }
