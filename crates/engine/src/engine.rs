@@ -63,7 +63,7 @@ use constantinople_application::consensus::{
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
-use rand_core::CryptoRngCore;
+use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
     time::{Duration, Instant},
@@ -81,7 +81,6 @@ const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
@@ -89,6 +88,7 @@ const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
+const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
@@ -151,7 +151,7 @@ pub enum StartupMode<F> {
 
 pub struct Config<E, C, M, B, V, St, I, H, O>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -176,6 +176,17 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
+    /// Capacity in bytes of the state QMDB page cache.
+    ///
+    /// Must hold the state journal's working set: 512 MiB thrashed once the
+    /// live account set passed ~2M (build/verify doubled on ~200k journal
+    /// cache misses/s/node).
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the page cache for everything else (block and
+    /// certificate archives, transaction history, simplex journal). Separate
+    /// from the state cache so backfill and replay scans cannot evict its
+    /// working set.
+    pub other_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -190,7 +201,7 @@ where
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -237,7 +248,7 @@ where
 
 impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -279,12 +290,14 @@ where
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            NonZero::new(config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("page cache must hold at least one page"),
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            NonZero::new(config.state_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
@@ -405,7 +418,7 @@ where
                 .await
                 .expect("state db must initialize for genesis target");
                 let genesis_state_target =
-                    <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
+                    <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_state_db);
                 let genesis_transaction_db = TransactionDb::<E, H, St>::init(
                     context.child("genesis_transactions"),
                     transaction_db_config.clone(),
@@ -413,8 +426,7 @@ where
                 .await
                 .expect("transaction history db must initialize for genesis target");
                 let genesis_transactions_target =
-                    <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_transaction_db)
-                        .await;
+                    <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_transaction_db);
                 let genesis_block =
                     constantinople_application::consensus::genesis_block_with_parent(
                         &mut H::default(),
@@ -710,7 +722,7 @@ async fn init_finalizations_archive<E, H, P, V>(
     partition_prefix: &str,
 ) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -744,7 +756,7 @@ async fn init_finalized_blocks_archive<E, H, P>(
     block_codec: &BlockCfg,
 ) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
 {
@@ -794,6 +806,7 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
+        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
     }
 }
 
