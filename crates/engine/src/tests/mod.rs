@@ -9,10 +9,12 @@ use crate::{
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
-    HeightMonitorReporter, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestScheme, ValidatorState, state_sync_done, validator_fixture,
+    HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
+    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
 };
 use commonware_consensus::{
+    Heightable,
+    marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
     types::{Epoch, coding::Commitment},
 };
@@ -48,9 +50,9 @@ use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
 use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
-    StateSyncReadyAtHeight,
+    RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
 const NUM_VALIDATORS: u32 = 4;
@@ -86,6 +88,10 @@ struct TestEngineDefinition {
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
+    restart_barrier: Option<RestartBarrier>,
+    prunable_items_per_section: NonZeroU64,
+    retained_marshal_blocks: usize,
 }
 
 impl TestEngineDefinition {
@@ -99,6 +105,10 @@ impl TestEngineDefinition {
             enable_state_sync: false,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
+            genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
+            restart_barrier: None,
+            prunable_items_per_section: NZU64!(4_096),
+            retained_marshal_blocks: 16,
         }
     }
 
@@ -130,6 +140,18 @@ impl TestEngineDefinition {
 
     const fn with_state_sync(mut self) -> Self {
         self.enable_state_sync = true;
+        self
+    }
+
+    fn with_restart_barrier(mut self, barrier: RestartBarrier) -> Self {
+        self.restart_barrier = Some(barrier);
+        self.prunable_items_per_section = NZU64!(1);
+        self
+    }
+
+    const fn with_aggressive_pruning(mut self) -> Self {
+        self.prunable_items_per_section = NZU64!(1);
+        self.retained_marshal_blocks = 0;
         self
     }
 }
@@ -174,11 +196,17 @@ impl EngineDefinition for TestEngineDefinition {
         let signer = self.signers[index].clone();
         let share = self.shares.get(&public_key).cloned().flatten();
         let partition_prefix = format!("validator-{index}");
-        let stateful_partition_prefix = format!("{partition_prefix}_stateful");
         let output = self.output.clone();
         let sync_heights = self.sync_heights.clone();
+        let genesis_commitments = self.genesis_commitments.clone();
+        let prunable_items_per_section = self.prunable_items_per_section;
+        let retained_marshal_blocks = self.retained_marshal_blocks;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
+        let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
+        let is_restart = restart_barrier
+            .as_ref()
+            .is_some_and(RestartBarrier::begin_start);
         let genesis_leader = self.signers[0].public_key();
         let mut manager = oracle.manager();
         let blocker = oracle.control(public_key.clone());
@@ -233,33 +261,19 @@ impl EngineDefinition for TestEngineDefinition {
                 (None, None)
             };
 
-            let (startup, startup_sync_height) = if uses_state_sync
-                && !state_sync_done(&context, &stateful_partition_prefix).await
-            {
-                probe_mailbox
-                    .as_ref()
-                    .expect("state-sync scenario requires probe")
-                    .subscribe()
-                    .await
-                    .map(|finalization| {
-                        let height = finalization.proposal.round.view().get();
-                        sync_heights.lock().insert(public_key.clone(), height);
-                        (StartupMode::StateSync { finalization }, Some(height))
-                    })
-                    .expect("probe actor exited before selecting a state-sync floor")
+            let startup = if uses_state_sync {
+                StartupMode::StateSync
             } else {
-                let prior = sync_heights.lock().get(&public_key).copied();
-                (StartupMode::MarshalSync, prior)
+                StartupMode::MarshalSync
             };
             let startup_mode = match &startup {
                 StartupMode::MarshalSync => "marshal_sync",
-                StartupMode::StateSync { .. } => "state_sync",
+                StartupMode::StateSync => "state_sync",
             };
             info!(
                 validator = %public_key,
                 %startup_mode,
-                startup_sync_height,
-                "initialized validator startup mode",
+                "requested validator startup mode",
             );
 
             let channels = Channels {
@@ -274,7 +288,11 @@ impl EngineDefinition for TestEngineDefinition {
 
             let input =
                 StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
-            let reporter = HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
+            let reporter = HeightMonitorReporter::new(
+                public_key.clone(),
+                monitor,
+                TestReporter::new(restart_barrier.clone()),
+            );
             let engine = Engine::<
                 _,
                 _,
@@ -318,12 +336,13 @@ impl EngineDefinition for TestEngineDefinition {
                     prune_config: Some(PruneConfig {
                         max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
-                        retained_marshal_blocks: 16,
+                        retained_marshal_blocks,
                         retained_qmdb_blocks: 0,
                     }),
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
+                    prunable_items_per_section,
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
@@ -331,7 +350,33 @@ impl EngineDefinition for TestEngineDefinition {
             )
             .await;
 
+            let genesis_commitment = engine.genesis_commitment();
+            if let Some(expected) = genesis_commitments
+                .lock()
+                .insert(public_key.clone(), genesis_commitment)
+            {
+                assert_eq!(genesis_commitment, expected, "genesis changed on restart");
+            }
+
+            let selected_sync_floor = engine.startup_sync_floor();
             let marshal = engine.marshal_mailbox();
+            let restart_marshal = marshal.clone();
+            let engine_handle = engine.start(channels, Some(reporter));
+            let startup_sync_height = if let Some(finalization) = selected_sync_floor {
+                let block = marshal
+                    .subscribe_by_commitment(
+                        finalization.proposal.payload,
+                        CommitmentFallback::Wait,
+                    )
+                    .await
+                    .expect("state-sync floor block must be available");
+                let height = block.height().get();
+                sync_heights.lock().insert(public_key.clone(), height);
+                info!(validator = %public_key, height, "resolved state-sync floor block");
+                Some(height)
+            } else {
+                sync_heights.lock().get(&public_key).copied()
+            };
             if state_sender
                 .send(ValidatorState {
                     marshal,
@@ -343,7 +388,15 @@ impl EngineDefinition for TestEngineDefinition {
                 return;
             }
 
-            let engine_handle = engine.start(channels, Some(reporter));
+            if is_restart {
+                let processed = restart_marshal
+                    .get_processed_height()
+                    .await
+                    .map_or(0, |height| height.get());
+                let barrier = restart_barrier.expect("restart barrier must exist");
+                barrier.observe_processed(processed);
+                barrier.release();
+            }
             let engine_result = if let Some(probe_handle) = probe_handle {
                 let (probe_result, engine_result) = futures::join!(probe_handle, engine_handle);
                 if let Err(error) = probe_result {
@@ -417,6 +470,29 @@ fn run_crash_restart(engine: TestEngineDefinition) {
         ))
         .exit_condition(FinalizedHeightAtLeast::new(50))
         .property(BlockAgreementAtHeight::new(50))
+        .run()
+        .unwrap();
+}
+
+fn run_restart_with_archived_finalizations() {
+    let barrier = RestartBarrier::default();
+    let engine = TestEngineDefinition::new(NUM_VALIDATORS).with_restart_barrier(barrier.clone());
+    let validator = engine.participants()[0].clone();
+
+    PlanBuilder::new(engine)
+        .link(default_link())
+        .seed(0)
+        .crash(Crash::Schedule(
+            Schedule::new()
+                .at(
+                    Duration::from_millis(2_500),
+                    Action::Crash(validator.clone()),
+                )
+                .at(Duration::from_millis(5_000), Action::Restart(validator)),
+        ))
+        .timeout(Duration::from_secs(30))
+        .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
+        .property(RestartPreservesProcessedHeight::new(barrier))
         .run()
         .unwrap();
 }
@@ -694,8 +770,14 @@ fn deterministic_across_seeds() {
 
 #[test_group("slow")]
 #[test_traced("DEBUG")]
-fn crash_and_restart_one_validator() {
-    run_crash_restart(TestEngineDefinition::new(NUM_VALIDATORS));
+fn restart_preserves_genesis_after_pruning() {
+    run_crash_restart(TestEngineDefinition::new(NUM_VALIDATORS).with_aggressive_pruning());
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn restart_replays_finalizations_archived_before_acknowledgement() {
+    run_restart_with_archived_finalizations();
 }
 
 #[test_group("slow")]

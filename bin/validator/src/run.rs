@@ -85,6 +85,7 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
 };
+const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
@@ -866,19 +867,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let startup = match startup {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
-            StartupModeConfig::StateSync => {
-                let finalization = probe_mailbox
-                    .subscribe()
-                    .await
-                    .expect("probe actor exited before selecting a state-sync floor");
-                StartupMode::StateSync { finalization }
-            }
+            StartupModeConfig::StateSync => StartupMode::StateSync,
         };
         let startup_mode = match &startup {
             StartupMode::MarshalSync => "marshal_sync",
-            StartupMode::StateSync { .. } => "state_sync",
+            StartupMode::StateSync => "state_sync",
         };
-        info!(startup_mode, "selected validator startup mode");
+        info!(startup_mode, "requested validator startup mode");
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
         // loaded config and returns `None` for primaries or validators that
@@ -925,6 +920,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
+                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 state_page_cache_bytes,
                 other_page_cache_bytes,
                 probe: Some(probe_mailbox.clone()),
