@@ -11,10 +11,7 @@ use bytes::Bytes;
 use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
-};
-use std::array::TryFromSliceError;
+use constantinople_primitives::{AccountKey, LazySignedTransaction, Payload, TransactionPublicKey};
 use tracing::warn;
 
 /// Encoded block rows split by index surface.
@@ -154,21 +151,16 @@ where
     H: Hasher,
 {
     let signed_bytes = transaction.encoded_signed_transaction();
-    let transaction_size = Transaction::<H::Digest>::SIZE;
-    if signed_bytes.len() < transaction_size {
+    let Some(signed) = transaction.get() else {
         warn!(
             height,
-            block_index,
-            signed_len = signed_bytes.len(),
-            transaction_size,
-            "indexer: skipping transaction with truncated signed payload"
+            block_index, "indexer: skipping malformed transaction"
         );
         return None;
-    }
-
-    let transaction_bytes = &signed_bytes[..transaction_size];
+    };
+    let tx = signed.value();
     let Some(sender) =
-        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
+        AccountKey::from_public_key_bytes(&signed_bytes[..TransactionPublicKey::SIZE])
     else {
         warn!(
             height,
@@ -176,43 +168,25 @@ where
         );
         return None;
     };
-
-    let to_start = TransactionPublicKey::SIZE;
-    let to_end = to_start + AccountKey::SIZE;
-    let value_start = to_end;
-    let value_end = value_start + u64::SIZE;
-    let nonce_start = value_end;
-    let nonce_end = nonce_start + u64::SIZE;
-    let value = read_u64(&transaction_bytes[value_start..value_end])
-        .expect("transaction value slice has fixed width");
-    if value == 0 {
-        warn!(
-            height,
-            block_index, "indexer: skipping transaction with zero value"
-        );
-        return None;
-    }
-
-    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
-        .expect("transaction nonce slice has fixed width");
+    let (to_account, value) = match &tx.payload {
+        Payload::PublicTransfer { to, value } => (*to, value.get()),
+        Payload::PrivateTransfer { to, .. } => (*to, 0),
+        Payload::PrivateFund { .. } | Payload::PrivateBurn { .. } | Payload::PrivateRollover => {
+            (sender, 0)
+        }
+    };
     let mut to = [0u8; AccountKey::SIZE];
-    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
+    to.copy_from_slice(to_account.as_ref());
 
-    let mut hasher = H::new();
-    hasher.update(transaction_bytes);
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest: *signed.message_digest(),
         bytes: signed_bytes,
         sender,
         to,
         value,
-        nonce,
+        nonce: tx.nonce,
     })
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
 #[cfg(test)]

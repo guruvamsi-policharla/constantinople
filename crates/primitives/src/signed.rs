@@ -8,8 +8,8 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
-    TransactionSignature,
+    ChainPrivatePaymentBackend, PrivatePaymentBackend, PublicKeyCache, Sealable, Sealed,
+    SignedTransaction, Transaction, TransactionBatchVerifier, TransactionSignature,
 };
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{
@@ -196,22 +196,25 @@ impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
 #[derive(Clone)]
-pub struct LazySignedTransaction<H>
+pub struct LazySignedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     pending: Option<Bytes>,
-    value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+    value: Arc<OnceLock<Option<SignedTransaction<H, B>>>>,
 }
 
-impl<H> LazySignedTransaction<H>
+impl<H, B> LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    const MAX_ENCODED_SIZE: usize = Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
+    const MAX_ENCODED_SIZE: usize =
+        Transaction::<H::Digest, B>::MAX_SIZE + TransactionSignature::MAX_SIZE;
 
     /// Creates a lazy transaction from an already decoded value.
-    pub fn new(value: SignedTransaction<H>) -> Self {
+    pub fn new(value: SignedTransaction<H, B>) -> Self {
         Self {
             pending: None,
             value: Arc::new(Some(value).into()),
@@ -219,7 +222,7 @@ where
     }
 
     /// Returns the decoded transaction, if decoding succeeds.
-    pub fn get(&self) -> Option<&SignedTransaction<H>> {
+    pub fn get(&self) -> Option<&SignedTransaction<H, B>> {
         self.value
             .get_or_init(|| {
                 let bytes = self
@@ -236,7 +239,7 @@ where
     ///
     /// Moves the cached value out when this handle is its only owner; clones
     /// only when the decoded value is still shared with another handle.
-    pub fn into_value(self) -> Option<SignedTransaction<H>> {
+    pub fn into_value(self) -> Option<SignedTransaction<H, B>> {
         self.get()?;
         match Arc::try_unwrap(self.value) {
             Ok(value) => value.into_inner().flatten(),
@@ -266,15 +269,16 @@ where
     }
 }
 
-impl<H> Read for LazySignedTransaction<H>
+impl<H, B> Read for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
+        if len < Transaction::<H::Digest, B>::MIN_SIZE + TransactionSignature::MIN_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {
@@ -285,9 +289,10 @@ where
     }
 }
 
-impl<H> Write for LazySignedTransaction<H>
+impl<H, B> Write for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     fn write(&self, buf: &mut impl BufMut) {
         if let Some(pending) = &self.pending {
@@ -303,9 +308,10 @@ where
     }
 }
 
-impl<H> EncodeSize for LazySignedTransaction<H>
+impl<H, B> EncodeSize for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     fn encode_size(&self) -> usize {
         if let Some(pending) = &self.pending {
@@ -319,22 +325,29 @@ where
     }
 }
 
-impl<H> PartialEq for LazySignedTransaction<H>
+impl<H, B> PartialEq for LazySignedTransaction<H, B>
 where
     H: Hasher,
-    SignedTransaction<H>: PartialEq,
+    B: PrivatePaymentBackend,
+    SignedTransaction<H, B>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.get() == other.get()
     }
 }
 
-impl<H> Eq for LazySignedTransaction<H> where H: Hasher {}
-
-impl<H> core::fmt::Debug for LazySignedTransaction<H>
+impl<H, B> Eq for LazySignedTransaction<H, B>
 where
     H: Hasher,
-    SignedTransaction<H>: core::fmt::Debug,
+    B: PrivatePaymentBackend,
+{
+}
+
+impl<H, B> core::fmt::Debug for LazySignedTransaction<H, B>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+    SignedTransaction<H, B>: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.get().fmt(f)
@@ -344,12 +357,13 @@ where
 /// Materializes lazily-encoded signed transactions in parallel.
 ///
 /// Returns `None` if any transaction fails to decode.
-pub fn materialize_transaction_chunks<H, St>(
+pub fn materialize_transaction_chunks<H, B, St>(
     strategy: &St,
-    transactions: Vec<LazySignedTransaction<H>>,
-) -> Option<Vec<SignedTransaction<H>>>
+    transactions: Vec<LazySignedTransaction<H, B>>,
+) -> Option<Vec<SignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     strategy
@@ -362,12 +376,13 @@ where
 /// parallel.
 ///
 /// Returns `false` if any transaction fails to decode.
-pub fn preload_transaction_slice<H, St>(
-    transactions: &[LazySignedTransaction<H>],
+pub fn preload_transaction_slice<H, B, St>(
+    transactions: &[LazySignedTransaction<H, B>],
     strategy: &St,
 ) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     strategy.fold(
@@ -382,12 +397,13 @@ where
 ///
 /// Returns the original lazy transactions after warming their cached decoded
 /// values, or `None` if any transaction fails to decode.
-pub fn preload_transaction_chunks<H, St>(
-    transactions: Vec<LazySignedTransaction<H>>,
+pub fn preload_transaction_chunks<H, B, St>(
+    transactions: Vec<LazySignedTransaction<H, B>>,
     strategy: &St,
-) -> Option<Vec<LazySignedTransaction<H>>>
+) -> Option<Vec<LazySignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     preload_transaction_slice(&transactions, strategy).then_some(transactions)
@@ -397,9 +413,10 @@ where
 /// parallel with its caller. Returns `false` if decode fails or the sender is
 /// not present. Decompression is deferred to the batch build, which looks each
 /// sender up in the shared cache exactly once.
-fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
+fn signature_inputs_decode<H, B>(lazy: &LazySignedTransaction<H, B>) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     let Some(transaction) = lazy.get() else {
         return false;
@@ -415,15 +432,16 @@ where
 ///
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
-pub fn verify_transaction_batch<H, St>(
+pub fn verify_transaction_batch<H, B, St>(
     namespace: &[u8],
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
-    transactions: &[LazySignedTransaction<H>],
+    transactions: &[LazySignedTransaction<H, B>],
     signature_strategy: &St,
 ) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     if transactions.is_empty() {
@@ -474,15 +492,16 @@ where
 /// First forces each [`Lazy`] to decode and compute its seal digest, then runs
 /// batch signature verification over the warmed transactions, both on
 /// `strategy`. Returns `None` if any transaction is invalid or undecodable.
-pub fn verify_transaction_chunks<H, St>(
+pub fn verify_transaction_chunks<H, B, St>(
     namespace: &'static [u8],
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
-    transactions: Vec<LazySignedTransaction<H>>,
+    transactions: Vec<LazySignedTransaction<H, B>>,
     strategy: &St,
-) -> Option<Vec<SignedTransaction<H>>>
+) -> Option<Vec<SignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     if transactions.is_empty() {
@@ -491,7 +510,7 @@ where
 
     let transactions = preload_transaction_chunks(transactions, strategy)?;
 
-    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, strategy) {
+    if !verify_transaction_batch::<H, B, _>(namespace, rng, cache, &transactions, strategy) {
         return None;
     }
 
@@ -505,7 +524,7 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, Transaction,
+        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction,
         TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
@@ -593,7 +612,7 @@ mod test {
             let hasher = &mut sha256::Sha256::default();
             let private_key = ed25519::PrivateKey::random(test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-            let signed = Transaction::new(
+            let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
                 public_key.clone(),
                 public_key.clone(),
                 NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -626,7 +645,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -660,7 +679,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),

@@ -30,7 +30,8 @@
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
 use constantinople_primitives::{
-    AccountKey, Nonce, PrivateAccount, SignedTransaction, StateAccount, StatePrivatePaymentBackend,
+    AccountKey, Nonce, Payload, PrivateAccount, SignedTransaction, StateAccount,
+    StatePrivatePaymentBackend,
 };
 
 /// Fully loaded base account state for one in-memory execution batch.
@@ -101,13 +102,15 @@ where
 {
     let transfer = transaction.value();
     let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
-    let recipient = transfer.to;
+    let Payload::PublicTransfer { to, value } = &transfer.payload else {
+        return None;
+    };
     Some(PreparedTransfer {
         sender,
-        recipient,
+        recipient: *to,
         sender_prefix: sender.prefix(),
-        recipient_prefix: recipient.prefix(),
-        value: transfer.value.get(),
+        recipient_prefix: to.prefix(),
+        value: value.get(),
         nonce: transfer.nonce,
     })
 }
