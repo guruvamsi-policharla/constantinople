@@ -29,13 +29,15 @@
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, Nonce, SignedTransaction};
+use constantinople_primitives::{
+    AccountKey, Nonce, PrivateAccount, SignedTransaction, StateAccount, StatePrivatePaymentBackend,
+};
 
 /// Fully loaded base account state for one in-memory execution batch.
-pub type State = AHashMap<AccountKey, Account>;
+pub type State = AHashMap<AccountKey, StateAccount>;
 
 /// Deterministic account writes produced by execution.
-pub type Changeset = Vec<(AccountKey, Account)>;
+pub type Changeset = Vec<(AccountKey, StateAccount)>;
 
 /// Account execution plan for one batch.
 pub(crate) struct ExecutionPlan {
@@ -332,7 +334,7 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<Execution
 }
 
 /// Applies one credit to an account.
-pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
+pub(crate) fn apply_credit(account: &mut StateAccount, value: u64) -> Option<()> {
     account.balance = account.balance.checked_add(value)?;
     Some(())
 }
@@ -341,16 +343,16 @@ pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
 ///
 /// Returns one final account per workload entry, in `account_keys` order.
 pub(crate) fn apply_general_accounts(
-    values: &[Option<Account>],
+    values: &[Option<StateAccount>],
     workload: &GeneralWorkload,
     transfers: &[PreparedTransfer],
-) -> Option<Vec<Account>> {
+) -> Option<Vec<StateAccount>> {
     assert_eq!(values.len(), workload.account_keys.len());
     assert_eq!(values.len(), workload.effects.len());
 
     let mut writes = Vec::with_capacity(workload.effects.len());
     for (effect, value) in workload.effects.iter().zip(values) {
-        let mut account = value.unwrap_or_default();
+        let mut account = value.clone().unwrap_or_default();
         for index in &effect.sent {
             let transfer = &transfers[*index as usize];
             if !account.nonce.consume(transfer.nonce) {
@@ -377,7 +379,7 @@ fn execute_discrete(
         Changeset::with_capacity(plan.sender_keys.len() + plan.recipient_keys.len());
     for (sender_key, transfer_index) in plan.sender_keys.iter().zip(&plan.transfers) {
         let transfer = &transfers[*transfer_index];
-        let mut sender = state.get(&transfer.sender).copied().unwrap_or_default();
+        let mut sender = state.get(&transfer.sender).cloned().unwrap_or_default();
         if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
             return None;
         }
@@ -392,7 +394,7 @@ fn execute_discrete(
         if transfer.sender == transfer.recipient {
             continue;
         }
-        let mut recipient = state.get(&transfer.recipient).copied().unwrap_or_default();
+        let mut recipient = state.get(&transfer.recipient).cloned().unwrap_or_default();
         apply_credit(&mut recipient, transfer.value)?;
         changeset.push((transfer.recipient, recipient));
     }
@@ -428,7 +430,7 @@ pub struct SelectiveExecutor {
     accounts: Vec<WorkingAccount>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WorkingAccount {
     /// Block-start balance.
     start_balance: u64,
@@ -440,6 +442,8 @@ struct WorkingAccount {
     credit: u64,
     /// Whether any applied transfer touched this account.
     touched: bool,
+    /// Private-payment commitment state carried through from block start.
+    private: PrivateAccount<StatePrivatePaymentBackend>,
 }
 
 impl Default for SelectiveExecutor {
@@ -480,20 +484,21 @@ impl SelectiveExecutor {
 
     /// Registers the staged block-start values for the keys the last
     /// [`begin_round`](Self::begin_round) returned, in the same order.
-    pub fn register(&mut self, values: &[Option<Account>]) {
+    pub fn register(&mut self, values: &[Option<StateAccount>]) {
         assert_eq!(
             self.accounts.len() + values.len(),
             self.keys.len(),
             "registered values must cover exactly the unregistered keys"
         );
         for value in values {
-            let start = value.unwrap_or_default();
+            let start = value.clone().unwrap_or_default();
             self.accounts.push(WorkingAccount {
                 start_balance: start.balance,
                 nonce: start.nonce,
                 debit: 0,
                 credit: 0,
                 touched: false,
+                private: start.private,
             });
         }
     }
@@ -564,7 +569,7 @@ impl SelectiveExecutor {
 
     /// Final values for every account touched by an applied transfer, as
     /// staged-index updates in staged order.
-    pub fn into_updates(self) -> Vec<(usize, Option<Account>)> {
+    pub fn into_updates(self) -> Vec<(usize, Option<StateAccount>)> {
         self.accounts
             .into_iter()
             .enumerate()
@@ -573,9 +578,10 @@ impl SelectiveExecutor {
                 let balance = account.start_balance - account.debit + account.credit;
                 (
                     index,
-                    Some(Account {
+                    Some(StateAccount {
                         balance,
                         nonce: account.nonce,
+                        private: account.private,
                     }),
                 )
             })
@@ -591,11 +597,11 @@ pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changese
     let plan = execution_plan(transfers)?;
     let mut changeset = execute_discrete(state, &plan.discrete, transfers)?;
     if !plan.general.is_empty() {
-        let accounts: Vec<Option<Account>> = plan
+        let accounts: Vec<Option<StateAccount>> = plan
             .general
             .account_keys()
             .iter()
-            .map(|key| state.get(key).copied())
+            .map(|key| state.get(key).cloned())
             .collect();
         let written = apply_general_accounts(&accounts, &plan.general, transfers)?;
         changeset.extend(plan.general.account_keys().iter().copied().zip(written));

@@ -3,7 +3,7 @@
 
 use commonware_cryptography::{Hasher as _, Sha256};
 use constantinople_application::executor::{PreparedTransfer, SelectiveExecutor, State, compute};
-use constantinople_primitives::{Account, AccountKey, Nonce};
+use constantinople_primitives::{AccountKey, Nonce, StateAccount};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -47,9 +47,10 @@ fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTr
         };
         state.insert(
             sender,
-            Account {
+            StateAccount {
                 balance: 1_000_000,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
         if stale_every > 0 && (i as usize).is_multiple_of(stale_every) {
@@ -80,10 +81,11 @@ fn run<T>(label: &str, n: usize, mut op: impl FnMut() -> T) {
 fn selective(
     state: &State,
     transfers: &[PreparedTransfer],
-) -> (usize, Vec<(usize, Option<Account>)>) {
+) -> (usize, Vec<(usize, Option<StateAccount>)>) {
     let mut executor = SelectiveExecutor::new();
     let keys = executor.begin_round(transfers);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    let values: Vec<Option<StateAccount>> =
+        keys.iter().map(|key| state.get(key).cloned()).collect();
     executor.register(&values);
     let applied = executor.apply(transfers);
     let kept = applied.iter().filter(|applied| **applied).count();

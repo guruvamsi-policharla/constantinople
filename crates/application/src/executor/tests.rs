@@ -2,7 +2,7 @@ use super::{Changeset, PreparedTransfer, State, compute, prepare_transfer};
 use commonware_codec::FixedSize as _;
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
+    AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, StateAccount, Transaction,
     TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
@@ -37,10 +37,11 @@ impl TestSigner {
     }
 }
 
-fn account(balance: u64, nonce: u64) -> Account {
-    Account {
+fn account(balance: u64, nonce: u64) -> StateAccount {
+    StateAccount {
         balance,
         nonce: Nonce::new(nonce, 0),
+        private: Default::default(),
     }
 }
 
@@ -49,13 +50,13 @@ fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
 }
 
 fn changeset_account(
-    changeset: &[(AccountKey, Account)],
+    changeset: &[(AccountKey, StateAccount)],
     public_key: ed25519::PublicKey,
-) -> Account {
+) -> StateAccount {
     let account_key = account_key(&public_key);
     changeset
         .iter()
-        .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
+        .find_map(|(candidate, account)| (candidate == &account_key).then(|| account.clone()))
         .expect("account should be in changeset")
 }
 
@@ -73,7 +74,7 @@ fn executes_run_ahead_nonces() {
     let recipient = TestSigner::from_seed(3);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 3, 2),
@@ -95,7 +96,7 @@ fn rejects_insufficient_balance() {
     let recipient = TestSigner::from_seed(1);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(5, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![signer.sign(recipient.public_key, 6, 0)];
     assert!(run(&accounts, &transactions).is_none());
@@ -107,7 +108,7 @@ fn rejects_duplicate_run_ahead_nonce() {
     let recipient = TestSigner::from_seed(5);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let transactions = vec![
         signer.sign(recipient.public_key.clone(), 3, 2),
@@ -122,7 +123,7 @@ fn rejects_far_ahead_duplicate_nonce() {
     let recipient = TestSigner::from_seed(7);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
+    accounts.insert(account_key(&recipient.public_key), StateAccount::default());
 
     let nonce = NONCE_BITMAP_CAPACITY + 1;
     let transactions = vec![
@@ -407,9 +408,10 @@ fn failed_debit_rejects_batch() {
     accounts.insert(account_key(&funded.public_key), account(100, 0));
     accounts.insert(
         account_key(&recipient.public_key),
-        Account {
+        StateAccount {
             balance: u64::MAX - 1,
             nonce: Nonce::new(0, 0),
+            private: Default::default(),
         },
     );
 
@@ -477,10 +479,11 @@ fn prefix_collision_only_demotes_to_the_general_lane() {
 fn run_selective(
     state: &State,
     transfers: &[PreparedTransfer],
-) -> (Vec<bool>, Vec<(AccountKey, Account)>) {
+) -> (Vec<bool>, Vec<(AccountKey, StateAccount)>) {
     let mut executor = super::SelectiveExecutor::new();
     let keys = executor.begin_round(transfers);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    let values: Vec<Option<StateAccount>> =
+        keys.iter().map(|key| state.get(key).cloned()).collect();
     executor.register(&values);
     let applied = executor.apply(transfers);
     let changes = executor
@@ -497,7 +500,7 @@ fn assert_survivors_verify(
     state: &State,
     transfers: &[PreparedTransfer],
     applied: &[bool],
-    selective_changes: &[(AccountKey, Account)],
+    selective_changes: &[(AccountKey, StateAccount)],
 ) {
     let survivors: Vec<PreparedTransfer> = transfers
         .iter()
@@ -612,17 +615,19 @@ fn selective_multi_round_matches_single_pass() {
     // Two rounds through one executor (the refill shape)...
     let mut executor = super::SelectiveExecutor::new();
     let keys = executor.begin_round(&first);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    let values: Vec<Option<StateAccount>> =
+        keys.iter().map(|key| state.get(key).cloned()).collect();
     executor.register(&values);
     assert_eq!(executor.apply(&first), vec![true, false]);
     let more = executor.begin_round(&second);
     assert_eq!(more.len(), 1, "only Bob's account is new");
-    let values: Vec<Option<Account>> = more.iter().map(|key| state.get(key).copied()).collect();
+    let values: Vec<Option<StateAccount>> =
+        more.iter().map(|key| state.get(key).cloned()).collect();
     executor.register(&values);
     assert_eq!(executor.apply(&second), vec![true, true]);
     let mut all_keys = keys;
     all_keys.extend(more);
-    let mut multi: Vec<(AccountKey, Account)> = executor
+    let mut multi: Vec<(AccountKey, StateAccount)> = executor
         .into_updates()
         .into_iter()
         .map(|(index, account)| (all_keys[index], account.expect("written")))

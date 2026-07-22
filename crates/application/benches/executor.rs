@@ -81,6 +81,7 @@ fn build_unique_fixture(transaction_count: usize) -> (State, Transfers) {
             Account {
                 balance: 1,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
         accounts.insert(
@@ -107,6 +108,7 @@ fn build_shared_fixture(transaction_count: usize) -> (State, Transfers) {
             Account {
                 balance: transaction_count as u64,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
     }
