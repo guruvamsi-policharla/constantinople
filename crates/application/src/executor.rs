@@ -29,9 +29,12 @@
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
+use commonware_parallel::Strategy;
+use commonware_privacy::payments::Backend;
 use constantinople_primitives::{
-    AccountKey, Nonce, Payload, PrivateAccount, SignedTransaction, StateAccount,
-    StatePrivatePaymentBackend,
+    AccountKey, Nonce, Payload, PrivateAccount, PrivatePaymentBackend, SignedTransaction,
+    StateAccount, StatePrivatePaymentBackend, to_state_burn_proof, to_state_commitment,
+    to_state_fund_proof, to_state_transfer_proof,
 };
 
 /// Fully loaded base account state for one in-memory execution batch.
@@ -39,6 +42,110 @@ pub type State = AHashMap<AccountKey, StateAccount>;
 
 /// Deterministic account writes produced by execution.
 pub type Changeset = Vec<(AccountKey, StateAccount)>;
+
+/// The state-side private payment backend executing and verifying proofs.
+type ExecutionBackend = StatePrivatePaymentBackend;
+
+type ExecutionCommitment = <ExecutionBackend as Backend>::Commitment;
+type FundVerification = (
+    u64,
+    <ExecutionBackend as Backend>::Commitment,
+    <ExecutionBackend as Backend>::FundProof,
+);
+type TransferVerification = (
+    <ExecutionBackend as Backend>::Commitment,
+    <ExecutionBackend as Backend>::Commitment,
+    <ExecutionBackend as Backend>::TransferProof,
+);
+type BurnVerification = (
+    <ExecutionBackend as Backend>::Commitment,
+    u64,
+    <ExecutionBackend as Backend>::BurnProof,
+);
+
+/// Deferred private-proof verification claims collected during execution.
+///
+/// Applying a private operation mutates commitment state immediately and
+/// queues its proof here; the whole batch is verified once, after
+/// speculation, via [`Self::verify_with_strategy`].
+#[derive(Debug, Default)]
+pub struct PrivateVerifications {
+    pub(crate) funds: Vec<FundVerification>,
+    pub(crate) transfers: Vec<TransferVerification>,
+    pub(crate) burns: Vec<BurnVerification>,
+}
+
+impl PrivateVerifications {
+    pub const fn new() -> Self {
+        Self {
+            funds: Vec::new(),
+            transfers: Vec::new(),
+            burns: Vec::new(),
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.funds.is_empty() && self.transfers.is_empty() && self.burns.is_empty()
+    }
+
+    pub const fn len(&self) -> usize {
+        self.funds.len() + self.transfers.len() + self.burns.len()
+    }
+
+    /// Batch-verifies every collected proof on the caller's strategy.
+    pub fn verify_with_strategy(&self, strategy: &impl Strategy) -> bool {
+        <ExecutionBackend as Backend>::batch_verify_with_strategy(
+            strategy,
+            <ExecutionBackend as PrivatePaymentBackend>::params(),
+            &self.funds,
+            &self.transfers,
+            &self.burns,
+            &mut rand::rng(),
+        )
+    }
+}
+
+fn verify_fund(
+    value: u64,
+    commitment: &<ExecutionBackend as Backend>::Commitment,
+    proof: &<ExecutionBackend as Backend>::FundProof,
+) -> bool {
+    <ExecutionBackend as Backend>::batch_verify(
+        <ExecutionBackend as PrivatePaymentBackend>::params(),
+        &[(value, commitment.clone(), proof.clone())],
+        &[],
+        &[],
+        &mut rand::rng(),
+    )
+}
+
+fn verify_transfer(
+    current: &ExecutionCommitment,
+    amount: &ExecutionCommitment,
+    proof: &<ExecutionBackend as Backend>::TransferProof,
+) -> bool {
+    <ExecutionBackend as Backend>::batch_verify(
+        <ExecutionBackend as PrivatePaymentBackend>::params(),
+        &[],
+        &[(current.clone(), amount.clone(), proof.clone())],
+        &[],
+        &mut rand::rng(),
+    )
+}
+
+fn verify_burn(
+    current: &ExecutionCommitment,
+    value: u64,
+    proof: &<ExecutionBackend as Backend>::BurnProof,
+) -> bool {
+    <ExecutionBackend as Backend>::batch_verify(
+        <ExecutionBackend as PrivatePaymentBackend>::params(),
+        &[],
+        &[],
+        &[(current.clone(), value, proof.clone())],
+        &mut rand::rng(),
+    )
+}
 
 /// Account execution plan for one batch.
 pub(crate) struct ExecutionPlan {
@@ -78,46 +185,160 @@ impl GeneralWorkload {
     }
 }
 
-/// Transfer data used by the executor.
-#[derive(Debug, Clone, Copy)]
-pub struct PreparedTransfer {
+/// Operation data used by the executor, with proofs converted to the
+/// state-side backend representation.
+#[derive(Debug, Clone)]
+pub struct PreparedOperation {
     /// Sender account key.
     pub sender: AccountKey,
-    /// Recipient account key.
-    pub recipient: AccountKey,
     /// Sender key prefix used for routing and transient indexing.
     pub sender_prefix: u64,
-    /// Recipient key prefix used for routing and transient indexing.
-    pub recipient_prefix: u64,
-    /// Amount transferred.
-    pub value: u64,
     /// Sender nonce required by the transaction.
     pub nonce: u64,
+    /// The prepared action.
+    pub payload: PreparedPayload,
+}
+
+/// Prepared payload with decoded account keys and state-side proof types.
+#[derive(Debug, Clone)]
+pub enum PreparedPayload {
+    /// Public transfer.
+    PublicTransfer {
+        recipient: AccountKey,
+        recipient_prefix: u64,
+        value: u64,
+    },
+    /// Private fund.
+    PrivateFund {
+        value: u64,
+        commitment: <ExecutionBackend as Backend>::Commitment,
+        proof: <ExecutionBackend as Backend>::FundProof,
+    },
+    /// Private transfer.
+    PrivateTransfer {
+        recipient: AccountKey,
+        recipient_prefix: u64,
+        amount: <ExecutionBackend as Backend>::Commitment,
+        proof: <ExecutionBackend as Backend>::TransferProof,
+    },
+    /// Private burn.
+    PrivateBurn {
+        value: u64,
+        proof: <ExecutionBackend as Backend>::BurnProof,
+    },
+    /// Explicit private rollover.
+    PrivateRollover,
+}
+
+impl PreparedOperation {
+    /// Builds a public-transfer operation; used by tests and benchmarks.
+    pub fn public_transfer(
+        sender: AccountKey,
+        recipient: AccountKey,
+        value: u64,
+        nonce: u64,
+    ) -> Self {
+        Self {
+            sender,
+            sender_prefix: sender.prefix(),
+            nonce,
+            payload: PreparedPayload::PublicTransfer {
+                recipient,
+                recipient_prefix: recipient.prefix(),
+                value,
+            },
+        }
+    }
+
+    /// The recipient's `(prefix, key)` when the payload credits another
+    /// account (public and private transfers only).
+    pub const fn recipient_entry(&self) -> Option<(u64, &AccountKey)> {
+        match &self.payload {
+            PreparedPayload::PublicTransfer {
+                recipient,
+                recipient_prefix,
+                ..
+            }
+            | PreparedPayload::PrivateTransfer {
+                recipient,
+                recipient_prefix,
+                ..
+            } => Some((*recipient_prefix, recipient)),
+            PreparedPayload::PrivateFund { .. }
+            | PreparedPayload::PrivateBurn { .. }
+            | PreparedPayload::PrivateRollover => None,
+        }
+    }
+
+    /// Whether the payload is a transfer to a distinct recipient account.
+    fn non_self_recipient(&self) -> Option<(u64, &AccountKey)> {
+        self.recipient_entry()
+            .filter(|(_, recipient)| **recipient != self.sender)
+    }
+
+    /// Whether applying this operation queues a proof for batch verification.
+    pub(crate) const fn has_proof(&self) -> bool {
+        matches!(
+            &self.payload,
+            PreparedPayload::PrivateFund { .. }
+                | PreparedPayload::PrivateTransfer { .. }
+                | PreparedPayload::PrivateBurn { .. }
+        )
+    }
 }
 
 /// Prepares one transaction for account execution.
-pub fn prepare_transfer<H>(transaction: &SignedTransaction<H>) -> Option<PreparedTransfer>
+pub fn prepare_operation<H>(transaction: &SignedTransaction<H>) -> Option<PreparedOperation>
 where
     H: Hasher,
 {
-    let transfer = transaction.value();
-    let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
-    let Payload::PublicTransfer { to, value } = &transfer.payload else {
-        return None;
+    let tx = transaction.value();
+    let sender = AccountKey::from_public_key(tx.sender_lazy().get()?);
+    let payload = match &tx.payload {
+        Payload::PublicTransfer { to, value } => PreparedPayload::PublicTransfer {
+            recipient: *to,
+            recipient_prefix: to.prefix(),
+            value: value.get(),
+        },
+        Payload::PrivateFund {
+            value,
+            commitment,
+            proof,
+        } => PreparedPayload::PrivateFund {
+            value: value.get(),
+            commitment: to_state_commitment(commitment.clone()),
+            proof: to_state_fund_proof(proof.clone()),
+        },
+        Payload::PrivateTransfer { to, amount, proof } => PreparedPayload::PrivateTransfer {
+            recipient: *to,
+            recipient_prefix: to.prefix(),
+            amount: to_state_commitment(amount.clone()),
+            proof: to_state_transfer_proof(proof.clone()),
+        },
+        Payload::PrivateBurn { value, proof } => PreparedPayload::PrivateBurn {
+            value: value.get(),
+            proof: to_state_burn_proof(proof.clone()),
+        },
+        Payload::PrivateRollover => PreparedPayload::PrivateRollover,
     };
-    Some(PreparedTransfer {
+    Some(PreparedOperation {
         sender,
-        recipient: *to,
         sender_prefix: sender.prefix(),
-        recipient_prefix: to.prefix(),
-        value: value.get(),
-        nonce: transfer.nonce,
+        nonce: tx.nonce,
+        payload,
     })
+}
+
+/// Which side of a private operation an account replay entry covers.
+#[derive(Debug, Clone, Copy)]
+enum PrivateRole {
+    Sender,
+    Recipient,
 }
 
 #[derive(Default)]
 pub(crate) struct AccountEffect {
-    /// Transfer indices sent by this account, in block order.
+    /// Operation indices sent by this account, in block order.
     sent: Vec<u32>,
     /// Total non-self debit to subtract from the account.
     debit: u64,
@@ -125,6 +346,14 @@ pub(crate) struct AccountEffect {
     self_transfer_floor: u64,
     /// Total credit to add to the account after debits.
     credit: u64,
+    /// Private commitment operations touching this account, in block order.
+    ///
+    /// Commitment mutations do not commute (burn zeroes `current`, rollover
+    /// folds `pending` into it), so they replay per account in block-index
+    /// order instead of aggregating. An account's `current` depends only on
+    /// its own sent operations, and its `pending` on order-interleaved
+    /// deposits, so per-account replay reproduces global block order exactly.
+    private_ops: Vec<(u32, PrivateRole)>,
 }
 
 struct AccountIndexTable {
@@ -268,59 +497,87 @@ impl GeneralBuilder {
 }
 
 /// Builds the execution plan used by both DB-backed and in-memory execution.
-pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan> {
+pub(crate) fn execution_plan(operations: &[PreparedOperation]) -> Option<ExecutionPlan> {
     // Count account touches by each key's precomputed 64-bit prefix instead
     // of rehashing full 32-byte keys. A prefix collision between distinct
-    // keys only merges their counts, which can only demote transfers to the
+    // keys only merges their counts, which can only demote operations to the
     // general lane; that lane deduplicates by full key and applies the same
     // per-account checks as the discrete lane, so routing stays
     // consensus-neutral.
     let mut touches: AHashMap<u64, u32> =
-        AHashMap::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        *touches.entry(transfer.sender_prefix).or_default() += 1;
-        if transfer.sender != transfer.recipient {
-            *touches.entry(transfer.recipient_prefix).or_default() += 1;
+        AHashMap::with_capacity(operations.len().saturating_mul(2));
+    for operation in operations {
+        *touches.entry(operation.sender_prefix).or_default() += 1;
+        if let Some((recipient_prefix, _)) = operation.non_self_recipient() {
+            *touches.entry(recipient_prefix).or_default() += 1;
         }
     }
 
     let mut general = None;
     let mut discrete = DiscreteWorkload {
-        transfers: Vec::with_capacity(transfers.len()),
-        sender_keys: Vec::with_capacity(transfers.len()),
-        recipient_keys: Vec::with_capacity(transfers.len()),
+        transfers: Vec::with_capacity(operations.len()),
+        sender_keys: Vec::with_capacity(operations.len()),
+        recipient_keys: Vec::with_capacity(operations.len()),
     };
 
-    for (index, transfer) in transfers.iter().enumerate() {
+    for (index, operation) in operations.iter().enumerate() {
         let sender_is_unique = touches
-            .get(&transfer.sender_prefix)
+            .get(&operation.sender_prefix)
             .copied()
             .unwrap_or_default()
             == 1;
-        let recipient_is_unique = transfer.sender == transfer.recipient
-            || touches
-                .get(&transfer.recipient_prefix)
-                .copied()
-                .unwrap_or_default()
-                == 1;
+        let recipient = operation.non_self_recipient();
+        let recipient_is_unique = recipient.is_none_or(|(recipient_prefix, _)| {
+            touches.get(&recipient_prefix).copied().unwrap_or_default() == 1
+        });
         if sender_is_unique && recipient_is_unique {
             discrete.transfers.push(index);
-            discrete.sender_keys.push(transfer.sender);
-            if transfer.sender != transfer.recipient {
-                discrete.recipient_keys.push(transfer.recipient);
+            discrete.sender_keys.push(operation.sender);
+            if let Some((_, recipient)) = recipient {
+                discrete.recipient_keys.push(*recipient);
             }
             continue;
         }
 
-        let general = general.get_or_insert_with(|| GeneralBuilder::new(transfers.len()));
-        let sender = general.account(transfer.sender_prefix, &transfer.sender);
+        let general = general.get_or_insert_with(|| GeneralBuilder::new(operations.len()));
+        let sender = general.account(operation.sender_prefix, &operation.sender);
         sender.sent.push(index as u32);
-        if transfer.sender == transfer.recipient {
-            sender.self_transfer_floor = sender.self_transfer_floor.max(transfer.value);
-        } else {
-            sender.debit = sender.debit.checked_add(transfer.value)?;
-            let recipient = general.account(transfer.recipient_prefix, &transfer.recipient);
-            recipient.credit = recipient.credit.checked_add(transfer.value)?;
+        match &operation.payload {
+            PreparedPayload::PublicTransfer {
+                recipient,
+                recipient_prefix,
+                value,
+            } => {
+                if operation.sender == *recipient {
+                    sender.self_transfer_floor = sender.self_transfer_floor.max(*value);
+                } else {
+                    sender.debit = sender.debit.checked_add(*value)?;
+                    let recipient = general.account(*recipient_prefix, recipient);
+                    recipient.credit = recipient.credit.checked_add(*value)?;
+                }
+            }
+            PreparedPayload::PrivateFund { value, .. } => {
+                sender.debit = sender.debit.checked_add(*value)?;
+                sender.private_ops.push((index as u32, PrivateRole::Sender));
+            }
+            PreparedPayload::PrivateTransfer {
+                recipient,
+                recipient_prefix,
+                ..
+            } => {
+                sender.private_ops.push((index as u32, PrivateRole::Sender));
+                let recipient = general.account(*recipient_prefix, recipient);
+                recipient
+                    .private_ops
+                    .push((index as u32, PrivateRole::Recipient));
+            }
+            PreparedPayload::PrivateBurn { value, .. } => {
+                sender.credit = sender.credit.checked_add(*value)?;
+                sender.private_ops.push((index as u32, PrivateRole::Sender));
+            }
+            PreparedPayload::PrivateRollover => {
+                sender.private_ops.push((index as u32, PrivateRole::Sender));
+            }
         }
     }
 
@@ -342,13 +599,111 @@ pub(crate) fn apply_credit(account: &mut StateAccount, value: u64) -> Option<()>
     Some(())
 }
 
+/// Applies one discrete-lane sender operation to its block-start account.
+///
+/// Public balance checks run against the block-start value (nonce is the
+/// final, mutating gate), commitment mutations apply immediately, and proofs
+/// queue on `verifications` for post-speculation batch verification.
+pub(crate) fn apply_discrete_sender(
+    account: &mut StateAccount,
+    operation: &PreparedOperation,
+    verifications: &mut PrivateVerifications,
+) -> Option<()> {
+    match &operation.payload {
+        PreparedPayload::PublicTransfer {
+            recipient, value, ..
+        } => {
+            if account.balance < *value || !account.nonce.consume(operation.nonce) {
+                return None;
+            }
+            if operation.sender != *recipient {
+                account.balance -= *value;
+            }
+        }
+        PreparedPayload::PrivateFund {
+            value,
+            commitment,
+            proof,
+        } => {
+            if account.balance < *value || !account.nonce.consume(operation.nonce) {
+                return None;
+            }
+            account.balance -= *value;
+            verifications
+                .funds
+                .push((*value, commitment.clone(), proof.clone()));
+            account.private.deposit(commitment);
+        }
+        PreparedPayload::PrivateTransfer {
+            recipient,
+            amount,
+            proof,
+            ..
+        } => {
+            if !account.nonce.consume(operation.nonce) {
+                return None;
+            }
+            verifications.transfers.push((
+                account.private.current.clone(),
+                amount.clone(),
+                proof.clone(),
+            ));
+            account.private.withdraw(amount);
+            if operation.sender == *recipient {
+                account.private.deposit(amount);
+            }
+        }
+        PreparedPayload::PrivateBurn { value, proof } => {
+            let balance = account.balance.checked_add(*value)?;
+            if !account.nonce.consume(operation.nonce) {
+                return None;
+            }
+            verifications
+                .burns
+                .push((account.private.current.clone(), *value, proof.clone()));
+            account.balance = balance;
+            account.private.burn();
+        }
+        PreparedPayload::PrivateRollover => {
+            if !account.nonce.consume(operation.nonce) {
+                return None;
+            }
+            account.private.rollover();
+        }
+    }
+    Some(())
+}
+
+/// Applies one discrete-lane recipient credit to its block-start account.
+///
+/// Only transfer payloads reach here (recipient keys are built from exactly
+/// the non-self transfer operations).
+pub(crate) fn apply_discrete_recipient(
+    account: &mut StateAccount,
+    operation: &PreparedOperation,
+) -> Option<()> {
+    match &operation.payload {
+        PreparedPayload::PublicTransfer { value, .. } => apply_credit(account, *value),
+        PreparedPayload::PrivateTransfer { amount, .. } => {
+            account.private.deposit(amount);
+            Some(())
+        }
+        PreparedPayload::PrivateFund { .. }
+        | PreparedPayload::PrivateBurn { .. }
+        | PreparedPayload::PrivateRollover => {
+            unreachable!("recipient keys are built from transfer operations only")
+        }
+    }
+}
+
 /// Applies account-owned effects to loaded accounts.
 ///
 /// Returns one final account per workload entry, in `account_keys` order.
 pub(crate) fn apply_general_accounts(
     values: &[Option<StateAccount>],
     workload: &GeneralWorkload,
-    transfers: &[PreparedTransfer],
+    operations: &[PreparedOperation],
+    verifications: &mut PrivateVerifications,
 ) -> Option<Vec<StateAccount>> {
     assert_eq!(values.len(), workload.account_keys.len());
     assert_eq!(values.len(), workload.effects.len());
@@ -357,8 +712,8 @@ pub(crate) fn apply_general_accounts(
     for (effect, value) in workload.effects.iter().zip(values) {
         let mut account = value.clone().unwrap_or_default();
         for index in &effect.sent {
-            let transfer = &transfers[*index as usize];
-            if !account.nonce.consume(transfer.nonce) {
+            let operation = &operations[*index as usize];
+            if !account.nonce.consume(operation.nonce) {
                 return None;
             }
         }
@@ -367,6 +722,51 @@ pub(crate) fn apply_general_accounts(
         }
         account.balance -= effect.debit;
         apply_credit(&mut account, effect.credit)?;
+
+        // Replay this account's commitment operations in block-index order;
+        // see the `private_ops` field docs for why replay (not aggregation)
+        // is required and why per-account order suffices.
+        for (index, role) in &effect.private_ops {
+            let operation = &operations[*index as usize];
+            match (&operation.payload, role) {
+                (
+                    PreparedPayload::PrivateFund {
+                        value,
+                        commitment,
+                        proof,
+                    },
+                    PrivateRole::Sender,
+                ) => {
+                    verifications
+                        .funds
+                        .push((*value, commitment.clone(), proof.clone()));
+                    account.private.deposit(commitment);
+                }
+                (PreparedPayload::PrivateTransfer { amount, proof, .. }, PrivateRole::Sender) => {
+                    verifications.transfers.push((
+                        account.private.current.clone(),
+                        amount.clone(),
+                        proof.clone(),
+                    ));
+                    account.private.withdraw(amount);
+                }
+                (PreparedPayload::PrivateTransfer { amount, .. }, PrivateRole::Recipient) => {
+                    account.private.deposit(amount);
+                }
+                (PreparedPayload::PrivateBurn { value, proof }, PrivateRole::Sender) => {
+                    verifications.burns.push((
+                        account.private.current.clone(),
+                        *value,
+                        proof.clone(),
+                    ));
+                    account.private.burn();
+                }
+                (PreparedPayload::PrivateRollover, PrivateRole::Sender) => {
+                    account.private.rollover();
+                }
+                _ => unreachable!("private replay entries match their payload variants"),
+            }
+        }
         writes.push(account);
     }
     Some(writes)
@@ -375,31 +775,27 @@ pub(crate) fn apply_general_accounts(
 fn execute_discrete(
     state: &State,
     plan: &DiscreteWorkload,
-    transfers: &[PreparedTransfer],
+    operations: &[PreparedOperation],
+    verifications: &mut PrivateVerifications,
 ) -> Option<Changeset> {
     assert_eq!(plan.sender_keys.len(), plan.transfers.len());
     let mut changeset =
         Changeset::with_capacity(plan.sender_keys.len() + plan.recipient_keys.len());
-    for (sender_key, transfer_index) in plan.sender_keys.iter().zip(&plan.transfers) {
-        let transfer = &transfers[*transfer_index];
-        let mut sender = state.get(&transfer.sender).cloned().unwrap_or_default();
-        if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
-            return None;
-        }
-        if transfer.sender != transfer.recipient {
-            sender.balance -= transfer.value;
-        }
+    for (sender_key, operation_index) in plan.sender_keys.iter().zip(&plan.transfers) {
+        let operation = &operations[*operation_index];
+        let mut sender = state.get(&operation.sender).cloned().unwrap_or_default();
+        apply_discrete_sender(&mut sender, operation, verifications)?;
         changeset.push((*sender_key, sender));
     }
 
-    for transfer_index in &plan.transfers {
-        let transfer = &transfers[*transfer_index];
-        if transfer.sender == transfer.recipient {
+    for operation_index in &plan.transfers {
+        let operation = &operations[*operation_index];
+        let Some((_, recipient_key)) = operation.non_self_recipient() else {
             continue;
-        }
-        let mut recipient = state.get(&transfer.recipient).cloned().unwrap_or_default();
-        apply_credit(&mut recipient, transfer.value)?;
-        changeset.push((transfer.recipient, recipient));
+        };
+        let mut recipient = state.get(recipient_key).cloned().unwrap_or_default();
+        apply_discrete_recipient(&mut recipient, operation)?;
+        changeset.push((*recipient_key, recipient));
     }
 
     Some(changeset)
@@ -432,6 +828,9 @@ pub struct SelectiveExecutor {
     /// index because keys are staged in exactly this order.
     accounts: Vec<WorkingAccount>,
 }
+
+/// Opaque snapshot of a [`SelectiveExecutor`]'s working account state.
+pub struct SelectorCheckpoint(Vec<WorkingAccount>);
 
 #[derive(Clone)]
 struct WorkingAccount {
@@ -467,13 +866,15 @@ impl SelectiveExecutor {
     /// Records the accounts a candidate round touches, returning the keys not
     /// seen in any earlier round, in the order their block-start values must
     /// be staged (their dense indices continue the staged read space).
-    pub fn begin_round(&mut self, transfers: &[PreparedTransfer]) -> Vec<AccountKey> {
+    pub fn begin_round(&mut self, operations: &[PreparedOperation]) -> Vec<AccountKey> {
         let before = self.keys.len();
-        for transfer in transfers {
-            for (prefix, key) in [
-                (transfer.sender_prefix, transfer.sender),
-                (transfer.recipient_prefix, transfer.recipient),
-            ] {
+        for operation in operations {
+            let recipient = operation
+                .recipient_entry()
+                .map(|(prefix, key)| (prefix, *key));
+            for (prefix, key) in
+                core::iter::once((operation.sender_prefix, operation.sender)).chain(recipient)
+            {
                 let (_, inserted) = self
                     .indices
                     .get_or_insert(prefix, key, self.keys.len() as u32);
@@ -483,6 +884,19 @@ impl SelectiveExecutor {
             }
         }
         self.keys[before..].to_vec()
+    }
+
+    /// Snapshots working account state before a trial application round.
+    pub fn checkpoint(&self) -> SelectorCheckpoint {
+        SelectorCheckpoint(self.accounts.clone())
+    }
+
+    /// Rewinds working account state to a checkpoint taken this round.
+    ///
+    /// Keys and dense indices only grow in `begin_round`, so a checkpoint
+    /// from after registration stays index-aligned.
+    pub fn restore(&mut self, checkpoint: SelectorCheckpoint) {
+        self.accounts = checkpoint.0;
     }
 
     /// Registers the staged block-start values for the keys the last
@@ -506,68 +920,202 @@ impl SelectiveExecutor {
         }
     }
 
-    /// Applies `transfers` in order, returning one applied/dropped flag per
-    /// transfer. Every touched account must be registered.
-    pub fn apply(&mut self, transfers: &[PreparedTransfer]) -> Vec<bool> {
-        let mut applied = Vec::with_capacity(transfers.len());
-        for transfer in transfers {
-            applied.push(self.apply_one(transfer));
+    /// Applies `operations` in order, returning one applied/dropped flag per
+    /// operation plus the private proofs the applied operations queued for
+    /// batch verification. Every touched account must be registered.
+    pub fn apply(&mut self, operations: &[PreparedOperation]) -> (Vec<bool>, PrivateVerifications) {
+        let mut verifications = PrivateVerifications::new();
+        let mut applied = Vec::with_capacity(operations.len());
+        for operation in operations {
+            applied.push(self.apply_one(operation, false, &mut verifications));
         }
+        (applied, verifications)
+    }
+
+    /// Like [`Self::apply`], but verifies each private proof inline before
+    /// applying it and drops offenders individually. Used to attribute
+    /// failures after a round's batch verification fails.
+    pub fn apply_verifying(&mut self, operations: &[PreparedOperation]) -> Vec<bool> {
+        let mut verifications = PrivateVerifications::new();
+        let mut applied = Vec::with_capacity(operations.len());
+        for operation in operations {
+            applied.push(self.apply_one(operation, true, &mut verifications));
+        }
+        debug_assert!(verifications.is_empty());
         applied
     }
 
-    fn apply_one(&mut self, transfer: &PreparedTransfer) -> bool {
+    fn apply_one(
+        &mut self,
+        operation: &PreparedOperation,
+        verify_each: bool,
+        verifications: &mut PrivateVerifications,
+    ) -> bool {
         let sender = self
             .indices
-            .get(transfer.sender_prefix, &transfer.sender)
+            .get(operation.sender_prefix, &operation.sender)
             .expect("touched account must be registered") as usize;
 
-        if transfer.sender == transfer.recipient {
-            let account = &mut self.accounts[sender];
+        match &operation.payload {
+            PreparedPayload::PublicTransfer {
+                recipient,
+                recipient_prefix,
+                value,
+            } => {
+                if operation.sender == *recipient {
+                    let account = &mut self.accounts[sender];
 
-            // Affordable from the start balance (self-transfers never debit),
-            // with the nonce as the final, mutating gate.
-            if account.start_balance < transfer.value || !account.nonce.consume(transfer.nonce) {
-                return false;
+                    // Affordable from the start balance (self-transfers never
+                    // debit), with the nonce as the final, mutating gate.
+                    if account.start_balance < *value || !account.nonce.consume(operation.nonce) {
+                        return false;
+                    }
+                    account.touched = true;
+                    return true;
+                }
+                let recipient =
+                    self.indices
+                        .get(*recipient_prefix, recipient)
+                        .expect("touched account must be registered") as usize;
+
+                // Check everything that could fail before consuming the
+                // nonce, so a dropped transfer leaves no trace.
+                let Some(debit) = self.accounts[sender].debit.checked_add(*value) else {
+                    return false;
+                };
+                if self.accounts[sender].start_balance < debit {
+                    return false;
+                }
+
+                // The recipient's final value is `start - debits + credits`;
+                // its debits only grow after this point, so checking against
+                // the current debit total is conservative.
+                let Some(credit) = self.accounts[recipient].credit.checked_add(*value) else {
+                    return false;
+                };
+                if (self.accounts[recipient].start_balance - self.accounts[recipient].debit)
+                    .checked_add(credit)
+                    .is_none()
+                {
+                    return false;
+                }
+                if !self.accounts[sender].nonce.consume(operation.nonce) {
+                    return false;
+                }
+
+                self.accounts[sender].debit = debit;
+                self.accounts[sender].touched = true;
+                self.accounts[recipient].credit = credit;
+                self.accounts[recipient].touched = true;
+                true
             }
-            account.touched = true;
-            return true;
+            PreparedPayload::PrivateFund {
+                value,
+                commitment,
+                proof,
+            } => {
+                let Some(debit) = self.accounts[sender].debit.checked_add(*value) else {
+                    return false;
+                };
+                if self.accounts[sender].start_balance < debit {
+                    return false;
+                }
+                if verify_each && !verify_fund(*value, commitment, proof) {
+                    return false;
+                }
+                if !self.accounts[sender].nonce.consume(operation.nonce) {
+                    return false;
+                }
+                let account = &mut self.accounts[sender];
+                account.debit = debit;
+                account.private.deposit(commitment);
+                account.touched = true;
+                if !verify_each {
+                    verifications
+                        .funds
+                        .push((*value, commitment.clone(), proof.clone()));
+                }
+                true
+            }
+            PreparedPayload::PrivateTransfer {
+                recipient,
+                recipient_prefix,
+                amount,
+                proof,
+            } => {
+                // Transfer proofs bind the sender's working `current`
+                // commitment at apply time, so the claim is captured here and
+                // cannot be hoisted ahead of selection.
+                let current = self.accounts[sender].private.current.clone();
+                if verify_each && !verify_transfer(&current, amount, proof) {
+                    return false;
+                }
+                if operation.sender == *recipient {
+                    if !self.accounts[sender].nonce.consume(operation.nonce) {
+                        return false;
+                    }
+                    let account = &mut self.accounts[sender];
+                    account.private.withdraw(amount);
+                    account.private.deposit(amount);
+                    account.touched = true;
+                } else {
+                    let recipient = self
+                        .indices
+                        .get(*recipient_prefix, recipient)
+                        .expect("touched account must be registered")
+                        as usize;
+                    if !self.accounts[sender].nonce.consume(operation.nonce) {
+                        return false;
+                    }
+                    self.accounts[sender].private.withdraw(amount);
+                    self.accounts[sender].touched = true;
+                    self.accounts[recipient].private.deposit(amount);
+                    self.accounts[recipient].touched = true;
+                }
+                if !verify_each {
+                    verifications
+                        .transfers
+                        .push((current, amount.clone(), proof.clone()));
+                }
+                true
+            }
+            PreparedPayload::PrivateBurn { value, proof } => {
+                let account = &self.accounts[sender];
+                let Some(credit) = account.credit.checked_add(*value) else {
+                    return false;
+                };
+                if (account.start_balance - account.debit)
+                    .checked_add(credit)
+                    .is_none()
+                {
+                    return false;
+                }
+                let current = account.private.current.clone();
+                if verify_each && !verify_burn(&current, *value, proof) {
+                    return false;
+                }
+                if !self.accounts[sender].nonce.consume(operation.nonce) {
+                    return false;
+                }
+                let account = &mut self.accounts[sender];
+                account.credit = credit;
+                account.private.burn();
+                account.touched = true;
+                if !verify_each {
+                    verifications.burns.push((current, *value, proof.clone()));
+                }
+                true
+            }
+            PreparedPayload::PrivateRollover => {
+                if !self.accounts[sender].nonce.consume(operation.nonce) {
+                    return false;
+                }
+                let account = &mut self.accounts[sender];
+                account.private.rollover();
+                account.touched = true;
+                true
+            }
         }
-        let recipient = self
-            .indices
-            .get(transfer.recipient_prefix, &transfer.recipient)
-            .expect("touched account must be registered") as usize;
-
-        // Check everything that could fail before consuming the nonce, so a
-        // dropped transfer leaves no trace.
-        let Some(debit) = self.accounts[sender].debit.checked_add(transfer.value) else {
-            return false;
-        };
-        if self.accounts[sender].start_balance < debit {
-            return false;
-        }
-
-        // The recipient's final value is `start - debits + credits`; its
-        // debits only grow after this point, so checking against the current
-        // debit total is conservative.
-        let Some(credit) = self.accounts[recipient].credit.checked_add(transfer.value) else {
-            return false;
-        };
-        if (self.accounts[recipient].start_balance - self.accounts[recipient].debit)
-            .checked_add(credit)
-            .is_none()
-        {
-            return false;
-        }
-        if !self.accounts[sender].nonce.consume(transfer.nonce) {
-            return false;
-        }
-
-        self.accounts[sender].debit = debit;
-        self.accounts[sender].touched = true;
-        self.accounts[recipient].credit = credit;
-        self.accounts[recipient].touched = true;
-        true
     }
 
     /// Final values for every account touched by an applied transfer, as
@@ -594,11 +1142,16 @@ impl SelectiveExecutor {
 
 /// Computes a batch changeset against an in-memory base state.
 ///
-/// Returns the sorted changeset, or `None` if any transfer fails its nonce or
-/// balance check or any recipient credit overflows.
-pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
-    let plan = execution_plan(transfers)?;
-    let mut changeset = execute_discrete(state, &plan.discrete, transfers)?;
+/// Returns the sorted changeset, or `None` if any operation fails its nonce
+/// or balance check or any recipient credit overflows. Private proofs queue
+/// on `verifications`; the caller decides when to batch-verify them.
+pub fn compute(
+    state: &State,
+    operations: &[PreparedOperation],
+    verifications: &mut PrivateVerifications,
+) -> Option<Changeset> {
+    let plan = execution_plan(operations)?;
+    let mut changeset = execute_discrete(state, &plan.discrete, operations, verifications)?;
     if !plan.general.is_empty() {
         let accounts: Vec<Option<StateAccount>> = plan
             .general
@@ -606,10 +1159,27 @@ pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changese
             .iter()
             .map(|key| state.get(key).cloned())
             .collect();
-        let written = apply_general_accounts(&accounts, &plan.general, transfers)?;
+        let written = apply_general_accounts(&accounts, &plan.general, operations, verifications)?;
         changeset.extend(plan.general.account_keys().iter().copied().zip(written));
     }
     changeset.sort_unstable_by_key(|(key, _)| *key);
+    Some(changeset)
+}
+
+/// Computes a batch changeset and batch-verifies its private proofs.
+///
+/// All or nothing: returns `None` on any nonce/balance failure or if any
+/// private proof in the batch is invalid.
+pub fn execute_with_strategy(
+    state: &State,
+    operations: &[PreparedOperation],
+    strategy: &impl Strategy,
+) -> Option<Changeset> {
+    let mut verifications = PrivateVerifications::new();
+    let changeset = compute(state, operations, &mut verifications)?;
+    if !verifications.is_empty() && !verifications.verify_with_strategy(strategy) {
+        return None;
+    }
     Some(changeset)
 }
 

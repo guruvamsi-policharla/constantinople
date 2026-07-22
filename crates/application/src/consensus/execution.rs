@@ -93,7 +93,7 @@ use super::{
     },
     reject_verify,
 };
-use crate::executor::{self, PreparedTransfer};
+use crate::executor::{self, PreparedOperation, PrivateVerifications};
 use commonware_codec::EncodeSize as _;
 use commonware_consensus::types::Round;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -159,7 +159,7 @@ where
 #[tracing::instrument(name = "application.execute.compute", level = "info", skip_all)]
 pub async fn compute<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
-    transfers: Arc<Vec<PreparedTransfer>>,
+    transfers: Arc<Vec<PreparedOperation>>,
     strategy: &S,
 ) -> (StateStaged<E, H, EightCap, S>, Option<StateUpdates>)
 where
@@ -182,7 +182,22 @@ where
         accounts = values.len().traced()
     );
     let updates = strategy
-        .spawn(move |_: S| build_span.in_scope(|| build_updates(plan, transfers, values)))
+        .spawn(move |s: S| {
+            build_span.in_scope(|| {
+                let mut verifications = PrivateVerifications::new();
+                let updates = build_updates(plan, transfers, values, &mut verifications)?;
+                if !verifications.is_empty() {
+                    let verify_span = info_span!(
+                        "application.execute.private_verify",
+                        proofs = verifications.len().traced()
+                    );
+                    if !verify_span.in_scope(|| verifications.verify_with_strategy(&s)) {
+                        return None;
+                    }
+                }
+                Some(updates)
+            })
+        })
         .await;
     (staged, updates)
 }
@@ -276,42 +291,41 @@ where
 /// buffers.
 fn build_updates(
     plan: executor::ExecutionPlan,
-    transfers: Arc<Vec<PreparedTransfer>>,
+    transfers: Arc<Vec<PreparedOperation>>,
     values: LoadedAccounts,
+    verifications: &mut PrivateVerifications,
 ) -> Option<StateUpdates> {
     let executor::ExecutionPlan { discrete, general } = &plan;
     let mut updates = StateUpdates::with_capacity(values.len());
 
-    // Discrete senders: one write per transfer, in transfer order.
-    for (transfer_index, value) in discrete.transfers.iter().zip(values.senders()) {
-        let transfer = &transfers[*transfer_index];
+    // Discrete senders: one write per operation, in block order.
+    for (operation_index, value) in discrete.transfers.iter().zip(values.senders()) {
+        let operation = &transfers[*operation_index];
         let mut account = value.clone().unwrap_or_default();
-        if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
-            return None;
-        }
-        if transfer.sender != transfer.recipient {
-            account.balance -= transfer.value;
-        }
+        executor::apply_discrete_sender(&mut account, operation, verifications)?;
         updates.push((updates.len(), Some(account)));
     }
 
-    // Discrete recipients: one write per non-self transfer, in transfer
-    // order. The zip is exhaustive because recipient_keys was built from
-    // exactly the non-self transfers (asserted against the staged read count
-    // in load_accounts).
-    let non_self = discrete.transfers.iter().filter(|&&transfer_index| {
-        transfers[transfer_index].sender != transfers[transfer_index].recipient
+    // Discrete recipients: one write per non-self transfer, in block order.
+    // The zip is exhaustive because recipient_keys was built from exactly the
+    // non-self transfer operations (asserted against the staged read count in
+    // load_accounts).
+    let non_self = discrete.transfers.iter().filter(|&&operation_index| {
+        transfers[operation_index]
+            .recipient_entry()
+            .is_some_and(|(_, recipient)| *recipient != transfers[operation_index].sender)
     });
-    for (transfer_index, value) in non_self.zip(values.recipients()) {
-        let transfer = &transfers[*transfer_index];
+    for (operation_index, value) in non_self.zip(values.recipients()) {
+        let operation = &transfers[*operation_index];
         let mut account = value.clone().unwrap_or_default();
-        executor::apply_credit(&mut account, transfer.value)?;
+        executor::apply_discrete_recipient(&mut account, operation)?;
         updates.push((updates.len(), Some(account)));
     }
 
     // General lane: one write per affected account, in account order.
     if !general.is_empty() {
-        let written = executor::apply_general_accounts(values.general(), general, &transfers)?;
+        let written =
+            executor::apply_general_accounts(values.general(), general, &transfers, verifications)?;
         for account in written {
             updates.push((updates.len(), Some(account)));
         }
@@ -324,15 +338,15 @@ fn build_updates(
 pub fn prepare_signed<H, S>(
     strategy: &S,
     txs: &[SignedTransaction<H>],
-) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
+) -> Option<(Vec<PreparedOperation>, Vec<H::Digest>)>
 where
     H: Hasher,
     S: Strategy,
 {
     strategy
         .try_map_collect_vec(txs, |tx| {
-            executor::prepare_transfer(tx)
-                .map(|transfer| (transfer, *tx.message_digest()))
+            executor::prepare_operation(tx)
+                .map(|operation| (operation, *tx.message_digest()))
                 .ok_or(())
         })
         .ok()
@@ -342,7 +356,7 @@ where
 pub(super) fn prepare_lazy<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
-) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
+) -> Result<(Vec<PreparedOperation>, Vec<H::Digest>)>
 where
     H: Hasher,
     S: Strategy,
@@ -350,8 +364,8 @@ where
     strategy
         .try_map_collect_vec(body, |lazy| {
             let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
-            let transfer = executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?;
-            Ok((transfer, *tx.message_digest()))
+            let operation = executor::prepare_operation(tx).ok_or(MALFORMED_TRANSACTION)?;
+            Ok((operation, *tx.message_digest()))
         })
         .map(|prepared| prepared.into_iter().unzip())
 }
@@ -446,15 +460,15 @@ where
                 let mut selector = selector;
                 move |s: S| {
                     let (prepared, transfers) = prepare_span.in_scope(|| {
-                        let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
+                        let prepared: Vec<Option<(PreparedOperation, H::Digest)>> = s
                             .map_collect_vec(&candidates, |tx| {
-                                executor::prepare_transfer(tx)
-                                    .map(|transfer| (transfer, *tx.message_digest()))
+                                executor::prepare_operation(tx)
+                                    .map(|operation| (operation, *tx.message_digest()))
                             });
-                        let transfers: Vec<PreparedTransfer> = prepared
+                        let transfers: Vec<PreparedOperation> = prepared
                             .iter()
                             .flatten()
-                            .map(|(transfer, _)| *transfer)
+                            .map(|(operation, _)| operation.clone())
                             .collect();
                         (prepared, transfers)
                     });
@@ -509,9 +523,25 @@ where
                 let span = select_span.clone();
                 let mut selector = selector;
                 let mut body = body;
-                move |_: S| {
+                move |s: S| {
                     span.in_scope(|| {
-                        let applied = selector.apply(&transfers);
+                        // Proofs queue during the trial application because
+                        // transfer claims bind the sender's working
+                        // commitment at apply time. If the round's batch
+                        // fails, rewind and re-apply with per-proof
+                        // verification so only offenders drop (never the
+                        // whole private lane).
+                        let checkpoint = transfers
+                            .iter()
+                            .any(PreparedOperation::has_proof)
+                            .then(|| selector.checkpoint());
+                        let (mut applied, verifications) = selector.apply(&transfers);
+                        if !verifications.is_empty() && !verifications.verify_with_strategy(&s) {
+                            selector.restore(
+                                checkpoint.expect("proof-bearing round captured a checkpoint"),
+                            );
+                            applied = selector.apply_verifying(&transfers);
+                        }
                         let mut flags = applied.into_iter();
                         let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
                         let mut included = 0usize;
@@ -661,7 +691,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
-    transfers: Vec<PreparedTransfer>,
+    transfers: Vec<PreparedOperation>,
     digests: Vec<H::Digest>,
     strategy: S,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
