@@ -25,7 +25,6 @@ use constantinople_primitives::{
     AccountKey, ChainPrivatePaymentBackend, DEFAULT_ACCOUNT_BALANCE, Payload, PrivatePaymentBackend,
 };
 use core::num::NonZeroU64;
-use futures::future::join_all;
 use rand::{CryptoRng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 use tracing::info;

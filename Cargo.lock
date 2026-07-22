@@ -1990,6 +1990,7 @@ dependencies = [
  "clap",
  "commonware-actor",
  "commonware-codec",
+ "commonware-coding",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-deployer",

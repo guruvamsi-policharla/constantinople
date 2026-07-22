@@ -33,6 +33,10 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    1024 * 1024
+}
+
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
@@ -119,6 +123,8 @@ pub struct ValidatorConfig {
     #[serde(default = "default_max_propose_bytes")]
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
+    #[serde(default = "default_max_shard_bytes")]
+    pub max_shard_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
@@ -234,6 +240,7 @@ pub struct LoadedConfig {
     /// Maximum bytes proposed per block.
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
+    pub max_shard_bytes: usize,
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     pub state_page_cache_bytes: usize,
@@ -372,6 +379,7 @@ fn decode_with_network(
         max_propose_bytes: config.max_propose_bytes,
         state_page_cache_bytes: config.state_page_cache_bytes,
         other_page_cache_bytes: config.other_page_cache_bytes,
+        max_shard_bytes: config.max_shard_bytes,
         max_pool_bytes: config.max_pool_bytes,
         public_key_cache_size: config.public_key_cache_size,
         otel,
@@ -531,9 +539,9 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, default_upload_buffer,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -658,6 +666,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 state_page_cache_bytes: default_page_cache_bytes(),
                 other_page_cache_bytes: default_page_cache_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -694,6 +703,7 @@ mod tests {
                 max_propose_bytes: default_max_propose_bytes(),
                 state_page_cache_bytes: default_page_cache_bytes(),
                 other_page_cache_bytes: default_page_cache_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -726,6 +736,7 @@ mod tests {
             vec![bootstrapper_entry(peer_key)],
         );
         config.max_propose_bytes = 1_234_567;
+        config.max_shard_bytes = 2_345_678;
         config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
@@ -757,6 +768,7 @@ mod tests {
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_shard_bytes, 2_345_678);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
@@ -793,6 +805,7 @@ mod tests {
             vec![bootstrapper_entry(peer_key)],
         );
         config.max_propose_bytes = 1_234_567;
+        config.max_shard_bytes = 2_345_678;
         config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
@@ -825,6 +838,7 @@ hosts:
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_shard_bytes, 2_345_678);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
