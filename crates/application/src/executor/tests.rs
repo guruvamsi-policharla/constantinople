@@ -497,7 +497,8 @@ fn assert_survivors_verify(
     let survivors: Vec<PreparedOperation> = transfers
         .iter()
         .zip(applied)
-        .filter_map(|(transfer, applied)| applied.then(|| transfer.clone()))
+        .filter(|(_, applied)| **applied)
+        .map(|(transfer, _)| transfer.clone())
         .collect();
     let baseline = compute(state, &survivors, &mut PrivateVerifications::new())
         .expect("survivors must verify all-or-nothing");
@@ -740,7 +741,8 @@ mod private_ops {
         let survivors: Vec<TestTransaction> = transactions
             .iter()
             .zip(applied)
-            .filter_map(|(tx, applied)| applied.then(|| tx.clone()))
+            .filter(|(_, applied)| **applied)
+            .map(|(tx, _)| tx.clone())
             .collect();
         let baseline = execute(state, &survivors).expect("survivors must verify all-or-nothing");
         let mut selective = selective_changes.to_vec();

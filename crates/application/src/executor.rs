@@ -112,7 +112,7 @@ fn verify_fund(
 ) -> bool {
     <ExecutionBackend as Backend>::batch_verify(
         <ExecutionBackend as PrivatePaymentBackend>::params(),
-        &[(value, commitment.clone(), proof.clone())],
+        &[(value, commitment.clone(), *proof)],
         &[],
         &[],
         &mut rand::rng(),
@@ -127,7 +127,7 @@ fn verify_transfer(
     <ExecutionBackend as Backend>::batch_verify(
         <ExecutionBackend as PrivatePaymentBackend>::params(),
         &[],
-        &[(current.clone(), amount.clone(), proof.clone())],
+        &[(current.clone(), amount.clone(), *proof)],
         &[],
         &mut rand::rng(),
     )
@@ -142,7 +142,7 @@ fn verify_burn(
         <ExecutionBackend as PrivatePaymentBackend>::params(),
         &[],
         &[],
-        &[(current.clone(), value, proof.clone())],
+        &[(current.clone(), value, *proof)],
         &mut rand::rng(),
     )
 }
@@ -200,6 +200,10 @@ pub struct PreparedOperation {
 }
 
 /// Prepared payload with decoded account keys and state-side proof types.
+///
+/// Proof-bearing variants dwarf `PrivateRollover`, but this enum sits on the
+/// execution hot path where boxing would cost an allocation per operation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PreparedPayload {
     /// Public transfer.
@@ -288,6 +292,9 @@ impl PreparedOperation {
 }
 
 /// Prepares one transaction for account execution.
+// The zkpari fund proof is the unit type, which trips `unit_arg` on the
+// backend-generic conversion call.
+#[allow(clippy::unit_arg)]
 pub fn prepare_operation<H>(transaction: &SignedTransaction<H>) -> Option<PreparedOperation>
 where
     H: Hasher,
@@ -307,17 +314,17 @@ where
         } => PreparedPayload::PrivateFund {
             value: value.get(),
             commitment: to_state_commitment(commitment.clone()),
-            proof: to_state_fund_proof(proof.clone()),
+            proof: to_state_fund_proof(*proof),
         },
         Payload::PrivateTransfer { to, amount, proof } => PreparedPayload::PrivateTransfer {
             recipient: *to,
             recipient_prefix: to.prefix(),
             amount: to_state_commitment(amount.clone()),
-            proof: to_state_transfer_proof(proof.clone()),
+            proof: to_state_transfer_proof(*proof),
         },
         Payload::PrivateBurn { value, proof } => PreparedPayload::PrivateBurn {
             value: value.get(),
-            proof: to_state_burn_proof(proof.clone()),
+            proof: to_state_burn_proof(*proof),
         },
         Payload::PrivateRollover => PreparedPayload::PrivateRollover,
     };
@@ -631,7 +638,7 @@ pub(crate) fn apply_discrete_sender(
             account.balance -= *value;
             verifications
                 .funds
-                .push((*value, commitment.clone(), proof.clone()));
+                .push((*value, commitment.clone(), *proof));
             account.private.deposit(commitment);
         }
         PreparedPayload::PrivateTransfer {
@@ -643,11 +650,9 @@ pub(crate) fn apply_discrete_sender(
             if !account.nonce.consume(operation.nonce) {
                 return None;
             }
-            verifications.transfers.push((
-                account.private.current.clone(),
-                amount.clone(),
-                proof.clone(),
-            ));
+            verifications
+                .transfers
+                .push((account.private.current.clone(), amount.clone(), *proof));
             account.private.withdraw(amount);
             if operation.sender == *recipient {
                 account.private.deposit(amount);
@@ -660,7 +665,7 @@ pub(crate) fn apply_discrete_sender(
             }
             verifications
                 .burns
-                .push((account.private.current.clone(), *value, proof.clone()));
+                .push((account.private.current.clone(), *value, *proof));
             account.balance = balance;
             account.private.burn();
         }
@@ -739,14 +744,14 @@ pub(crate) fn apply_general_accounts(
                 ) => {
                     verifications
                         .funds
-                        .push((*value, commitment.clone(), proof.clone()));
+                        .push((*value, commitment.clone(), *proof));
                     account.private.deposit(commitment);
                 }
                 (PreparedPayload::PrivateTransfer { amount, proof, .. }, PrivateRole::Sender) => {
                     verifications.transfers.push((
                         account.private.current.clone(),
                         amount.clone(),
-                        proof.clone(),
+                        *proof,
                     ));
                     account.private.withdraw(amount);
                 }
@@ -754,11 +759,9 @@ pub(crate) fn apply_general_accounts(
                     account.private.deposit(amount);
                 }
                 (PreparedPayload::PrivateBurn { value, proof }, PrivateRole::Sender) => {
-                    verifications.burns.push((
-                        account.private.current.clone(),
-                        *value,
-                        proof.clone(),
-                    ));
+                    verifications
+                        .burns
+                        .push((account.private.current.clone(), *value, *proof));
                     account.private.burn();
                 }
                 (PreparedPayload::PrivateRollover, PrivateRole::Sender) => {
@@ -1033,7 +1036,7 @@ impl SelectiveExecutor {
                 if !verify_each {
                     verifications
                         .funds
-                        .push((*value, commitment.clone(), proof.clone()));
+                        .push((*value, commitment.clone(), *proof));
                 }
                 true
             }
@@ -1075,7 +1078,7 @@ impl SelectiveExecutor {
                 if !verify_each {
                     verifications
                         .transfers
-                        .push((current, amount.clone(), proof.clone()));
+                        .push((current, amount.clone(), *proof));
                 }
                 true
             }
@@ -1102,7 +1105,7 @@ impl SelectiveExecutor {
                 account.private.burn();
                 account.touched = true;
                 if !verify_each {
-                    verifications.burns.push((current, *value, proof.clone()));
+                    verifications.burns.push((current, *value, *proof));
                 }
                 true
             }
