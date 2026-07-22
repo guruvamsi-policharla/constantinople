@@ -197,8 +197,14 @@ pub(crate) struct GenerateArgs {
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
     /// Maximum decoded consensus shard payload bytes accepted from peers.
-    #[arg(long = "max-shard-bytes", default_value_t = default_max_shard_bytes())]
-    max_shard_bytes: usize,
+    ///
+    /// Defaults to a bound derived from `--max-propose-bytes` and the
+    /// validator count: blocks split into `floor((validators - 1) / 3) + 1`
+    /// data shards, so small clusters produce much larger shards than large
+    /// ones. Explicit values below the derived bound are rejected — peers
+    /// would drop every shard of a full block and consensus would wedge.
+    #[arg(long = "max-shard-bytes")]
+    max_shard_bytes: Option<usize>,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
@@ -717,6 +723,19 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
+    if let Some(max_shard_bytes) = args.max_shard_bytes {
+        let bound = derived_shard_bound(args.max_propose_bytes, args.validators);
+        assert!(
+            max_shard_bytes >= bound,
+            "--max-shard-bytes {max_shard_bytes} cannot carry a full \
+             --max-propose-bytes {} block: {} validators split blocks into \
+             {} data shards, so peers need to accept shards up to {bound} \
+             bytes (raise --max-shard-bytes or lower --max-propose-bytes)",
+            args.max_propose_bytes,
+            args.validators,
+            (args.validators.saturating_sub(1) as usize) / 3 + 1,
+        );
+    }
 }
 
 pub(crate) fn total_spammer_private_lanes(args: &GenerateArgs) -> usize {
@@ -839,6 +858,25 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_shard_bytes() -> usize {
     1024 * 1024
+}
+
+/// Largest shard a full proposal can produce for this cluster size, with
+/// 25% headroom for chunk proofs and framing.
+///
+/// Mirrors the marshal's coding config: blocks split into
+/// `max_faults + 1 = floor((validators - 1) / 3) + 1` data shards.
+pub(crate) const fn derived_shard_bound(max_propose_bytes: usize, validators: u32) -> usize {
+    let minimum_shards = (validators.saturating_sub(1) as usize) / 3 + 1;
+    (max_propose_bytes.div_ceil(minimum_shards)) * 5 / 4
+}
+
+/// The shard limit written to node configs: the explicit `--max-shard-bytes`
+/// when given, otherwise the derived bound (but never below the historical
+/// 1 MiB default, which large clusters already run with).
+pub(crate) fn resolved_max_shard_bytes(args: &GenerateArgs) -> usize {
+    args.max_shard_bytes.unwrap_or_else(|| {
+        derived_shard_bound(args.max_propose_bytes, args.validators).max(default_max_shard_bytes())
+    })
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -1031,7 +1069,62 @@ mod tests {
             panic!("expected generate command");
         };
         let generate = *generate;
-        assert_eq!(generate.max_shard_bytes, 2_097_152);
+        assert_eq!(generate.max_shard_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn derives_shard_bound_from_cluster_size() {
+        // 4 validators -> 2 data shards: an 8 MiB block needs ~5 MiB shards.
+        assert_eq!(
+            super::derived_shard_bound(8 * 1024 * 1024, 4),
+            8 * 1024 * 1024 / 2 * 5 / 4
+        );
+        // 50 validators -> 17 data shards: well under the 1 MiB floor.
+        assert!(super::derived_shard_bound(8 * 1024 * 1024, 50) < super::default_max_shard_bytes());
+    }
+
+    #[test]
+    fn derived_shard_limit_never_drops_below_historical_default() {
+        let mut args = generate_args_for_bounds(50);
+        args.max_shard_bytes = None;
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::default_max_shard_bytes()
+        );
+
+        let args = generate_args_for_bounds(4);
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::derived_shard_bound(args.max_propose_bytes, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot carry a full")]
+    fn rejects_shard_limit_too_small_for_full_blocks() {
+        let mut args = generate_args_for_bounds(4);
+        // The historical 1 MiB default cannot carry 8 MiB blocks at 4
+        // validators; explicit values must fail at generate time instead of
+        // wedging consensus at the first full block.
+        args.max_shard_bytes = Some(super::default_max_shard_bytes());
+        super::validate_generate_args(&args);
+    }
+
+    fn generate_args_for_bounds(validators: u32) -> super::GenerateArgs {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            &validators.to_string(),
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        *generate
     }
 
     #[test]
