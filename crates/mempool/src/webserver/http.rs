@@ -100,10 +100,12 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
+/// Smallest encoded payload: a one-byte tag (private rollover).
+const MIN_PAYLOAD_TAG_BYTES: usize = 1;
+
 const fn min_signed_transaction_bytes() -> usize {
     TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
+        + MIN_PAYLOAD_TAG_BYTES
         + MIN_U64_VARINT_BYTES
         + TransactionSignature::MIN_SIZE
 }
@@ -280,7 +282,7 @@ where
             .into_iter()
             .map(LazySignedTransaction::new)
             .collect::<Vec<_>>();
-        let transactions = verify_transaction_chunks::<H, _>(
+        let transactions = verify_transaction_chunks::<H, _, _>(
             namespace,
             &mut sys_rng(),
             &public_key_cache,

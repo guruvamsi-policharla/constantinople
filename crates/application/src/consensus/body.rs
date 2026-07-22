@@ -32,7 +32,7 @@ where
         span.in_scope(|| {
             let transactions = body.as_ref().as_slice();
             (preload_transaction_slice(transactions, &strategy)
-                && verify_transaction_batch::<H, _>(
+                && verify_transaction_batch::<H, _, _>(
                     namespace,
                     &mut rng,
                     &public_key_cache,
