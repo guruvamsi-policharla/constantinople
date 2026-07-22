@@ -57,6 +57,14 @@ struct Cli {
     #[arg(long, default_value_t = 8090)]
     port: u16,
 
+    /// TCP port the Prometheus metrics endpoint binds on `0.0.0.0`.
+    ///
+    /// Defaults to the port the deployer scrapes on remote instances. Local
+    /// deployments share one host with the validators, whose metrics ports
+    /// start at 9090, so the local generator passes a non-colliding port.
+    #[arg(long, default_value_t = METRICS_PORT)]
+    metrics_port: u16,
+
     /// Directory used by the simulator's RocksDB engine.
     #[arg(long, conflicts_with_all = ["hosts", "config"])]
     data_dir: Option<PathBuf>,
@@ -229,6 +237,7 @@ fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
 async fn run(
     data_dir: &Path,
     port: u16,
+    metrics_port: u16,
     db_parallelism: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let engine = Arc::new(RocksStore::open(
@@ -243,7 +252,7 @@ async fn run(
         .layer(middleware::from_fn_with_state(metrics, track_ingest))
         .layer(CorsLayer::very_permissive());
 
-    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], METRICS_PORT));
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], metrics_port));
     let metrics_app = Router::new()
         .route("/metrics", get(serve_metrics))
         .with_state(registry);
@@ -263,6 +272,7 @@ async fn run(
 
 fn main() {
     let cli = Cli::parse();
+    let metrics_port = cli.metrics_port;
     let (data_dir, port, db_parallelism) = load_settings(cli);
     fmt()
         .with_env_filter(
@@ -276,7 +286,7 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        if let Err(error) = run(&data_dir, port, db_parallelism).await {
+        if let Err(error) = run(&data_dir, port, metrics_port, db_parallelism).await {
             eprintln!("chain-indexer exited with error: {error}");
             std::process::exit(1);
         }

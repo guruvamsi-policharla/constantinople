@@ -322,10 +322,18 @@ fn local_run_commands(
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
+        // Everything shares the loopback host, so the chain indexer's metrics
+        // endpoint (9090 by default, for the remote deployer's scraper) must
+        // move past the validator/secondary/spammer metrics range.
+        let indexer_metrics_port = local
+            .base_metrics_port
+            .checked_add(args.validators as u16 + total_secondaries as u16 + 1)
+            .expect("chain-indexer metrics port overflow");
         commands.push(format!(
-            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            indexer_metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -796,6 +804,15 @@ mod tests {
         assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
+
+        // The store's metrics endpoint must clear the loopback host's
+        // validator (base 9090 + 2), secondary (+1), and spammer metrics
+        // range: 2 validators + 1 indexer secondary land it on 9094.
+        let store_cmd = commands
+            .iter()
+            .find(|c| c.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+        assert!(store_cmd.contains("--metrics-port 9094"));
     }
 
     #[test]
