@@ -1786,6 +1786,7 @@ dependencies = [
  "commonware-macros",
  "commonware-math",
  "commonware-parallel",
+ "commonware-privacy",
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",

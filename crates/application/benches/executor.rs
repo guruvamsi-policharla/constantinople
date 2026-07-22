@@ -1,6 +1,6 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
-use constantinople_application::executor::{self, PreparedTransfer, State};
+use constantinople_application::executor::{self, PreparedOperation, PrivateVerifications, State};
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
@@ -14,7 +14,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
-type Transfers = Vec<PreparedTransfer>;
+type Transfers = Vec<PreparedOperation>;
 
 const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
@@ -58,9 +58,13 @@ fn bench_compute(
         |bencher, _| {
             bencher.iter(|| {
                 black_box(
-                    executor::compute(black_box(state), black_box(transfers))
-                        .expect("bench transfers should execute")
-                        .len(),
+                    executor::compute(
+                        black_box(state),
+                        black_box(transfers),
+                        &mut PrivateVerifications::new(),
+                    )
+                    .expect("bench transfers should execute")
+                    .len(),
                 )
             });
         },
@@ -133,10 +137,11 @@ fn build_shared_fixture(transaction_count: usize) -> (State, Transfers) {
 fn finalize_fixture(accounts: State, transactions: Vec<TestTransaction>) -> (State, Transfers) {
     let transfers = transactions
         .iter()
-        .map(executor::prepare_transfer)
+        .map(executor::prepare_operation)
         .collect::<Option<Vec<_>>>()
         .expect("bench transactions should prepare");
-    executor::compute(&accounts, &transfers).expect("bench fixtures must be valid");
+    executor::compute(&accounts, &transfers, &mut PrivateVerifications::new())
+        .expect("bench fixtures must be valid");
     (accounts, transfers)
 }
 
