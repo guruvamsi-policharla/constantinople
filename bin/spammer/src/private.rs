@@ -404,7 +404,10 @@ mod tests {
         let sink = sink_key(999);
         let mut state = PrivateSpamState::new();
         let mut rng = StdRng::seed_from_u64(7);
-        let value = 1;
+        // Drain in a handful of steps: each transfer builds two real range
+        // proofs, so a value-1 drain scales test time with the default
+        // balance.
+        let value = DEFAULT_ACCOUNT_BALANCE / 4;
 
         // 1. Fund the whole public balance into pending.
         let (tx, effect) = plan_and_sign(
@@ -456,7 +459,7 @@ mod tests {
             apply_effect(&mut state, &effect);
             transfers += 1;
         }
-        assert_eq!(transfers, DEFAULT_ACCOUNT_BALANCE);
+        assert_eq!(transfers, DEFAULT_ACCOUNT_BALANCE / value);
         assert_eq!(state.current.value(), 0);
         assert!(
             state.phase(value).is_none(),
