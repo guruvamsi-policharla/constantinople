@@ -177,7 +177,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
-            max_shard_bytes: args.max_shard_bytes,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -234,7 +234,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
-            max_shard_bytes: args.max_shard_bytes,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -532,7 +532,7 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
-            max_shard_bytes: default_max_shard_bytes(),
+            max_shard_bytes: None,
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -589,7 +589,7 @@ mod tests {
         args.indexer = true;
         args.relayer = true;
         args.max_propose_bytes = 1_150_000;
-        args.max_shard_bytes = 2_097_152;
+        args.max_shard_bytes = Some(2_097_152);
         let remote = remote_args();
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
 
