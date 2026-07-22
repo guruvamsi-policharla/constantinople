@@ -14,7 +14,7 @@ use core::ops::Deref;
 use derive_more::{Debug, Display};
 
 /// Default starting balance for accounts that have not been written yet.
-pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
+pub const DEFAULT_ACCOUNT_BALANCE: u64 = 1000;
 
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
