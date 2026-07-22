@@ -8,9 +8,9 @@ use crate::{
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, total_spammer_private_lanes, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    total_spammer_private_lanes, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -510,8 +510,8 @@ mod tests {
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
         default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
-        default_page_cache_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries, validate_generate_args,
+        default_page_cache_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;

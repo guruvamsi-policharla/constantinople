@@ -327,8 +327,8 @@ mod tests {
     async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
         let stats = test_stats();
         let batch = test_batch();
-        let body =
-            r#"{"status":"partially_finalized","height":7,"included":[0],"filtered":1}"#.to_string();
+        let body = r#"{"status":"partially_finalized","height":7,"included":[0],"filtered":1}"#
+            .to_string();
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 

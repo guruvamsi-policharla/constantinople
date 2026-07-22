@@ -184,7 +184,7 @@ fn plan_and_sign(
             );
             (
                 Payload::PrivateTransfer {
-                    to: sink.clone(),
+                    to: *sink,
                     amount: amount.clone(),
                     proof,
                 },
