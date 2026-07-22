@@ -4,8 +4,8 @@ use crate::{
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
     ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    total_secondaries, total_spammer_private_lanes,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -115,6 +115,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: args.max_shard_bytes,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -191,6 +192,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: args.max_shard_bytes,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -406,7 +408,7 @@ fn local_run_commands(
             args.spammer_workload.as_str(),
             args.spammer_private_proof_mode.as_str(),
             args.spammer_private_batch,
-            args.spammer_private_lanes,
+            total_spammer_private_lanes(args),
         ));
     }
 
@@ -447,6 +449,7 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            max_shard_bytes: crate::default_max_shard_bytes(),
             spammer,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -613,7 +616,7 @@ mod tests {
         assert!(commands[3].contains("--workload private"));
         assert!(commands[3].contains("--private-proof-mode simulated"));
         assert!(commands[3].contains("--private-batch 32"));
-        assert!(commands[3].contains("--private-lanes 12"));
+        assert!(commands[3].contains("--private-lanes 24"));
         // Simulated mode runs the whole cluster on zkpari; the spammer also gets
         // the simulator trapdoor feature.
         assert!(commands[0].contains("constantinople-primitives/privacy-backend-zkpari"));

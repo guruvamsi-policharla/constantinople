@@ -8,8 +8,9 @@ use crate::{
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    generate_remote_cluster_material, indexer_enabled, secondary_roles,
+    total_secondaries, total_spammer_private_lanes, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -176,6 +177,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: args.max_shard_bytes,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -232,6 +234,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: args.max_shard_bytes,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -292,7 +295,7 @@ fn remote_spammer_config(
         workload: args.spammer_workload,
         private_proof_mode: args.spammer_private_proof_mode,
         private_batch: args.spammer_private_batch,
-        private_lanes: args.spammer_private_lanes,
+        private_lanes: total_spammer_private_lanes(args),
     }
 }
 
@@ -496,16 +499,19 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, build_validators, port_configs,
+        remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
+        default_page_cache_bytes, default_public_key_cache_size,
+        generate_local_cluster_material, total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -526,6 +532,7 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            max_shard_bytes: default_max_shard_bytes(),
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -576,6 +583,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_validators_use_generated_max_propose_bytes() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        args.max_propose_bytes = 1_150_000;
+        args.max_shard_bytes = 2_097_152;
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(&args, &remote, Path::new("/tmp"), &material);
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
+
+        assert!(
+            validators
+                .iter()
+                .chain(secondaries.iter())
+                .all(|validator| {
+                    validator.config.max_propose_bytes == 1_150_000
+                        && validator.config.max_shard_bytes == 2_097_152
+                })
+        );
+    }
+
     fn validator(index: u32) -> super::GeneratedValidator {
         super::GeneratedValidator {
             public_key_hex: format!("validator-{index}"),
@@ -598,6 +629,7 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 state_page_cache_bytes: default_page_cache_bytes(),
                 other_page_cache_bytes: default_page_cache_bytes(),
@@ -700,6 +732,7 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert_eq!(relayed.private_lanes, args.validators as usize * 8);
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,

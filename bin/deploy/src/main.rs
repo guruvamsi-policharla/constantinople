@@ -196,6 +196,9 @@ pub(crate) struct GenerateArgs {
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+    /// Maximum decoded consensus shard payload bytes accepted from peers.
+    #[arg(long = "max-shard-bytes", default_value_t = default_max_shard_bytes())]
+    max_shard_bytes: usize,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
@@ -230,8 +233,10 @@ pub(crate) struct GenerateArgs {
     /// Private operations per submitted batch (private workload only).
     #[arg(long, default_value_t = 64)]
     spammer_private_batch: usize,
-    /// Concurrent private lanes; more lanes keep more blocks populated
-    /// (private workload only).
+    /// Concurrent private lanes per primary validator.
+    ///
+    /// The deployer multiplies this by `--validators` before writing the
+    /// spammer config so private workload pressure scales with cluster size.
     #[arg(long, default_value_t = 8)]
     spammer_private_lanes: usize,
 
@@ -492,6 +497,7 @@ pub(crate) struct ValidatorConfig {
     /// Maximum bytes proposed per block.
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
+    max_shard_bytes: usize,
     max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     state_page_cache_bytes: usize,
@@ -713,6 +719,13 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     );
 }
 
+pub(crate) fn total_spammer_private_lanes(args: &GenerateArgs) -> usize {
+    let validators = usize::try_from(args.validators).expect("validator count fits usize");
+    args.spammer_private_lanes
+        .checked_mul(validators)
+        .expect("--spammer-private-lanes * --validators must fit usize")
+}
+
 pub(crate) fn generate_local_cluster_material(
     validators: u32,
     secondaries: u32,
@@ -822,6 +835,10 @@ pub(crate) fn default_bootstrappers(
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
+}
+
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    1024 * 1024
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -971,6 +988,50 @@ mod tests {
         .expect_err("sampling rate above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn parses_max_propose_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-propose-bytes",
+            "1150000",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_propose_bytes, 1_150_000);
+    }
+
+    #[test]
+    fn parses_max_shard_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-shard-bytes",
+            "2097152",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_shard_bytes, 2_097_152);
     }
 
     #[test]
