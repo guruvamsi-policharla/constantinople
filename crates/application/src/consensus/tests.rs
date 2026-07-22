@@ -139,6 +139,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             Some(Account {
                 balance: 1_000_000,
                 nonce: Nonce::default(),
+                private: Default::default(),
             }),
         );
     }

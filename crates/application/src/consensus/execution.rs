@@ -105,7 +105,7 @@ use commonware_runtime::{
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
+use constantinople_primitives::{Header, LazySignedTransaction, SignedTransaction, StateAccount};
 use std::{
     future::{Future, ready},
     pin::Pin,
@@ -205,7 +205,7 @@ where
 
 struct LoadedAccounts {
     /// Staged values in read order: senders, then recipients, then general.
-    values: Vec<Option<Account>>,
+    values: Vec<Option<StateAccount>>,
     sender_len: usize,
     recipient_len: usize,
 }
@@ -215,15 +215,15 @@ impl LoadedAccounts {
         self.values.len()
     }
 
-    fn senders(&self) -> &[Option<Account>] {
+    fn senders(&self) -> &[Option<StateAccount>] {
         &self.values[..self.sender_len]
     }
 
-    fn recipients(&self) -> &[Option<Account>] {
+    fn recipients(&self) -> &[Option<StateAccount>] {
         &self.values[self.sender_len..self.sender_len + self.recipient_len]
     }
 
-    fn general(&self) -> &[Option<Account>] {
+    fn general(&self) -> &[Option<StateAccount>] {
         &self.values[self.sender_len + self.recipient_len..]
     }
 }
@@ -285,7 +285,7 @@ fn build_updates(
     // Discrete senders: one write per transfer, in transfer order.
     for (transfer_index, value) in discrete.transfers.iter().zip(values.senders()) {
         let transfer = &transfers[*transfer_index];
-        let mut account = value.unwrap_or_default();
+        let mut account = value.clone().unwrap_or_default();
         if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
             return None;
         }
@@ -304,7 +304,7 @@ fn build_updates(
     });
     for (transfer_index, value) in non_self.zip(values.recipients()) {
         let transfer = &transfers[*transfer_index];
-        let mut account = value.unwrap_or_default();
+        let mut account = value.clone().unwrap_or_default();
         executor::apply_credit(&mut account, transfer.value)?;
         updates.push((updates.len(), Some(account)));
     }

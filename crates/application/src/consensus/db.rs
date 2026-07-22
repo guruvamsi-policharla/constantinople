@@ -23,12 +23,12 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::sync::TracedAsyncRwLock;
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_primitives::{AccountKey, StateAccount};
 use std::{future::Future, sync::Arc};
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, StateAccount, H, T, S>>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -49,10 +49,13 @@ pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    FixedJournal<
+        E,
+        AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>>,
+    >,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>,
     S,
 >;
 
@@ -61,10 +64,13 @@ pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
 pub type StateStaged<E, H, T, S> = AnyStaged<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    FixedJournal<
+        E,
+        AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>>,
+    >,
     UnorderedIndex<T, mmr::Location>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    UnorderedUpdate<AccountKey, FixedEncoding<StateAccount>>,
     S,
 >;
 
@@ -72,7 +78,7 @@ pub type StateStaged<E, H, T, S> = AnyStaged<
 ///
 /// The state root depends only on the final key->value set each index resolves
 /// to, so entry order is not consensus relevant.
-pub type StateUpdates = Vec<(usize, Option<Account>)>;
+pub type StateUpdates = Vec<(usize, Option<StateAccount>)>;
 
 pub(super) type TransactionBatch<E, H, S> =
     <TransactionDatabase<E, H, S> as DatabaseSet<E>>::Unmerkleized;
@@ -140,7 +146,7 @@ mod tests {
         merkle::full::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
     };
     use commonware_utils::{NZU16, NZU64, NZUsize};
-    use constantinople_primitives::{Account, AccountKey, Nonce};
+    use constantinople_primitives::{AccountKey, Nonce, StateAccount};
 
     type Db = StateDatabase<deterministic::Context, Sha256, EightCap, Sequential>;
 
@@ -172,9 +178,10 @@ mod tests {
             let db =
                 <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache)).await;
             let key = |byte| AccountKey::from([byte; AccountKey::SIZE]);
-            let account = |balance| Account {
+            let account = |balance| StateAccount {
                 balance,
                 nonce: Nonce::default(),
+                private: Default::default(),
             };
             let a = key(1);
             let b = key(2);

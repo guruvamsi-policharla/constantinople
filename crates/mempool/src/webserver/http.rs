@@ -11,9 +11,9 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::sys_rng;
@@ -374,6 +374,8 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
+    private: String,
+    pending: String,
 }
 
 #[derive(serde::Serialize)]
@@ -387,6 +389,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
+            private: hex(&account.private.current.encode()),
+            pending: hex(&account.private.pending.encode()),
         }
     }
 }

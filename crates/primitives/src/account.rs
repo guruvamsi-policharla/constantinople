@@ -1,6 +1,7 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, StatePrivatePaymentBackend,
     TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
@@ -181,44 +182,121 @@ impl Read for Nonce {
 }
 
 /// An account, as represented in the state of the chain.
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
+///
+/// The associated-type bounds on the private-payment backend live on the
+/// [`PrivatePaymentBackend`] supertrait, so `B: PrivatePaymentBackend` is the
+/// only bound needed here.
+#[derive(Debug, Display, Clone, PartialEq, Eq, Hash)]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
-pub struct Account {
+pub struct Account<B: PrivatePaymentBackend = ChainPrivatePaymentBackend> {
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
     /// Consumed and run-ahead transaction nonce state.
     pub nonce: Nonce,
+    /// Private-payment commitment state.
+    pub private: PrivateAccount<B>,
 }
 
-impl Default for Account {
+/// Account representation used by local state-database storage.
+pub type StateAccount = Account<StatePrivatePaymentBackend>;
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn to_state_account(account: Account) -> StateAccount {
+    account
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn from_state_account(account: StateAccount) -> Account {
+    account
+}
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_account(account: Account) -> StateAccount {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedUnchecked(commitment.0)
+    }
+
+    StateAccount {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn from_state_account(account: StateAccount) -> Account {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedChecked(commitment.0)
+    }
+
+    Account {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
+}
+
+impl<B: PrivatePaymentBackend> Default for Account<B> {
     fn default() -> Self {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
             nonce: Nonce::default(),
+            private: PrivateAccount::default(),
         }
     }
 }
 
-impl FixedSize for Account {
-    const SIZE: usize = u64::SIZE + Nonce::SIZE;
+impl<B: PrivatePaymentBackend> FixedSize for Account<B> {
+    const SIZE: usize = u64::SIZE + Nonce::SIZE + PrivateAccount::<B>::SIZE;
 }
 
-impl Write for Account {
+impl<B: PrivatePaymentBackend> Write for Account<B> {
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
+        self.private.write(buf);
     }
 }
 
-impl Read for Account {
+impl<B: PrivatePaymentBackend> Read for Account<B> {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: Nonce::read(buf)?,
+            private: PrivateAccount::read(buf)?,
         })
     }
 }
@@ -309,28 +387,28 @@ mod tests {
 
     #[test]
     fn account_codec_roundtrip() {
-        let account = Account {
+        let account: Account = Account {
             balance: 42,
             nonce: Nonce::new(7, 3),
+            private: PrivateAccount::default(),
         };
 
-        let mut buf = Vec::with_capacity(Account::SIZE);
+        let mut buf = Vec::with_capacity(<Account>::SIZE);
         account.write(&mut buf);
-        assert_eq!(buf.len(), Account::SIZE);
+        assert_eq!(buf.len(), <Account>::SIZE);
 
-        let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
+        let decoded = <Account>::decode(&mut &buf[..]).expect("decoding should succeed");
         assert_eq!(decoded, account);
     }
 
     #[test]
     fn account_default_starts_funded() {
-        assert_eq!(
-            Account::default(),
-            Account {
-                balance: DEFAULT_ACCOUNT_BALANCE,
-                nonce: Nonce::default(),
-            }
-        );
+        let expected: Account = Account {
+            balance: DEFAULT_ACCOUNT_BALANCE,
+            nonce: Nonce::default(),
+            private: PrivateAccount::default(),
+        };
+        assert_eq!(<Account>::default(), expected);
     }
 
     #[test]
