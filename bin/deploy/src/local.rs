@@ -3,8 +3,8 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, total_spammer_private_lanes, validate_generate_args,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, log_spammer_plan,
+    resolve_spammer_plan, secondary_roles, total_secondaries, validate_generate_args,
     write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -23,6 +23,7 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
+    log_spammer_plan(args);
     assert!(args.validators >= 1, "need at least one validator");
 
     let output_dir = absolute_path(&args.output_dir);
@@ -370,6 +371,7 @@ fn local_run_commands(
     }
 
     if args.spammer {
+        let plan = resolve_spammer_plan(args);
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
@@ -407,7 +409,7 @@ fn local_run_commands(
              --private-proof-mode {} \
              --private-batch {} \
              --private-lanes {}",
-            args.spammer_accounts,
+            plan.accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
@@ -415,8 +417,8 @@ fn local_run_commands(
             args.spammer_presigned_batches,
             args.spammer_workload.as_str(),
             args.spammer_private_proof_mode.as_str(),
-            args.spammer_private_batch,
-            total_spammer_private_lanes(args),
+            plan.private_batch,
+            plan.total_private_lanes,
         ));
     }
 
@@ -459,7 +461,7 @@ mod tests {
             startup: StartupModeConfig::MarshalSync,
             max_shard_bytes: None,
             spammer,
-            spammer_accounts: 10,
+            spammer_accounts: Some(10),
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
@@ -467,8 +469,9 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_proof_mode: crate::SpammerProofMode::Real,
-            spammer_private_batch: 64,
-            spammer_private_lanes: 8,
+            spammer_private_batch: None,
+            spammer_private_lanes: None,
+            spammer_target_inflight: None,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -611,8 +614,11 @@ mod tests {
         args.relayer = true;
         args.spammer_workload = crate::SpammerWorkload::Private;
         args.spammer_private_proof_mode = crate::SpammerProofMode::Simulated;
-        args.spammer_private_batch = 32;
-        args.spammer_private_lanes = 12;
+        // Explicit private sizing; accounts derive from it (10 would be
+        // rejected as unable to fill every lane's batch).
+        args.spammer_accounts = None;
+        args.spammer_private_batch = Some(32);
+        args.spammer_private_lanes = Some(12);
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -637,6 +643,7 @@ mod tests {
         let mut args = test_args(true);
         args.relayer = true;
         args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_accounts = None;
         args.spammer_private_proof_mode = crate::SpammerProofMode::Real;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),

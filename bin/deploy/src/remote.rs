@@ -8,9 +8,9 @@ use crate::{
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    total_spammer_private_lanes, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    generate_remote_cluster_material, indexer_enabled, log_spammer_plan, resolve_spammer_plan,
+    secondary_roles, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -30,6 +30,7 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     validate_generate_args(args);
+    log_spammer_plan(args);
     assert!(args.validators >= 1, "need at least one validator");
     assert!(!remote.regions.is_empty(), "need at least one region");
     assert!(
@@ -281,8 +282,9 @@ fn remote_spammer_config(
     remote: &RemoteArgs,
     material: &ClusterMaterial,
 ) -> SpammerConfig {
+    let plan = resolve_spammer_plan(args);
     SpammerConfig {
-        accounts: args.spammer_accounts,
+        accounts: plan.accounts,
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
         rayon_threads: args.spammer_rayon_threads,
@@ -294,8 +296,8 @@ fn remote_spammer_config(
         accounts_jitter: args.spammer_accounts_jitter,
         workload: args.spammer_workload,
         private_proof_mode: args.spammer_private_proof_mode,
-        private_batch: args.spammer_private_batch,
-        private_lanes: total_spammer_private_lanes(args),
+        private_batch: plan.private_batch,
+        private_lanes: plan.total_private_lanes,
     }
 }
 
@@ -534,7 +536,7 @@ mod tests {
             startup: StartupModeConfig::MarshalSync,
             max_shard_bytes: None,
             spammer: false,
-            spammer_accounts: 10,
+            spammer_accounts: Some(10),
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
@@ -542,8 +544,9 @@ mod tests {
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
             spammer_private_proof_mode: crate::SpammerProofMode::Real,
-            spammer_private_batch: 64,
-            spammer_private_lanes: 8,
+            spammer_private_batch: None,
+            spammer_private_lanes: None,
+            spammer_target_inflight: None,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
