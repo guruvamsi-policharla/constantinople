@@ -275,6 +275,7 @@ pub async fn run_private(
     proof_mode: PrivateProofMode,
     batch_size: usize,
     lanes: usize,
+    relayer_targets: Vec<String>,
     stats: Arc<Stats>,
 ) {
     assert!(batch_size > 0, "--private-batch must be > 0");
@@ -301,14 +302,11 @@ pub async fn run_private(
         if count == 0 {
             continue;
         }
-        // Lanes stay unpinned: the relayer forwards each batch to the next
-        // two view leaders and re-targets as leadership rotates, so a lane's
-        // round-trip tracks finalization latency. Pinning a lane to one
-        // leader (as the public path does per submitter) caps it at one
-        // batch per full leader rotation instead — `validators x view-time`,
-        // which throttled a 50-validator cluster to a quarter of its
-        // throughput.
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), lane, None);
+        // Spread lanes across the provided leader targets (mirrors the public
+        // path); fall back to the relayer's default routing when none are given.
+        let target = (!relayer_targets.is_empty())
+            .then(|| relayer_targets[lane % relayer_targets.len()].clone());
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), lane, target);
         lane_handles.push(tokio::spawn(run_lane(
             submitter,
             count as u32,

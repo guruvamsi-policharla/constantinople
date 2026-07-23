@@ -166,6 +166,7 @@ fn main() {
                     private_proof_mode,
                     private_batch,
                     private_lanes,
+                    config.relayer_targets,
                     stats,
                 )
                 .await;
