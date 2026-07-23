@@ -254,12 +254,14 @@ pub(crate) struct GenerateArgs {
     /// Target private transactions in flight across the whole cluster
     /// (private workload only).
     ///
-    /// Each lane keeps one batch in flight until it finalizes, so sustained
-    /// TPS is roughly this target divided by the finalization round-trip in
-    /// seconds. Any of `--spammer-private-lanes`, `--spammer-private-batch`,
-    /// and `--spammer-accounts` left unset are derived to satisfy the target;
-    /// explicit values are respected and validated against it instead. The
-    /// resolved plan is logged at generate time.
+    /// Each lane keeps one batch in flight and pins one leader, so a lane
+    /// lands one batch per leader rotation: sustained TPS is roughly this
+    /// target divided by the rotation period (validators x view time; ~4s at
+    /// 50 validators and ~80ms views). Any of `--spammer-private-lanes`,
+    /// `--spammer-private-batch`, and `--spammer-accounts` left unset are
+    /// derived to satisfy the target; explicit values are respected and
+    /// validated against it instead. The resolved plan is logged at generate
+    /// time.
     #[arg(long)]
     spammer_target_inflight: Option<usize>,
 
@@ -930,7 +932,9 @@ pub(crate) fn log_spammer_plan(args: &GenerateArgs) {
     const ACCOUNT_BALANCE: u64 = 1_000;
     let ops_per_account = ACCOUNT_BALANCE / args.spammer_value.max(1) + 2;
     let total_ops = u64::from(plan.accounts).saturating_mul(ops_per_account);
-    // At a ~1s finalization round-trip, TPS ~= the in-flight count.
+    // Assumes TPS ~= the in-flight count (a ~1s effective round-trip). Pinned
+    // lanes on large clusters cycle once per leader rotation, which is
+    // slower, so this is a floor on the actual runway.
     let est_runway_minutes = total_ops / (plan.inflight.max(1) as u64) / 60;
 
     tracing::info!(
@@ -939,7 +943,7 @@ pub(crate) fn log_spammer_plan(args: &GenerateArgs) {
         inflight = plan.inflight,
         accounts = plan.accounts,
         est_runway_minutes,
-        "private spammer plan (sustained TPS ~= inflight / finalization round-trip seconds)"
+        "private spammer plan (sustained TPS ~= inflight / leader rotation seconds)"
     );
 
     // Lanes pin distinct leaders, so each leader's mempool sees roughly its
