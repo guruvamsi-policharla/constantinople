@@ -1046,4 +1046,134 @@ mod private_ops {
 
         assert!(execute(&accounts, &transactions).is_none());
     }
+
+    #[test]
+    fn private_duplicate_nonce_transfer_is_dropped_without_commitment_changes() {
+        let params = ChainBackend::params();
+        let mut rng = rng();
+        let signer = TestSigner::from_seed(60);
+        let recipient = TestSigner::from_seed(61);
+
+        // The sender holds a spendable current of 7 whose opening the client
+        // kept, so the transfer below is provable against it: only the reused
+        // nonce makes the operation invalid.
+        let (current, current_opening, _proof) = ChainBackend::fund(params, 7, &mut rng);
+        let (amount, _amount_opening, transfer_proof) =
+            ChainBackend::transfer(params, &current, &current_opening, 3, &mut rng);
+        let (fund_commitment, _opening, fund_proof) = ChainBackend::fund(params, 4, &mut rng);
+
+        let mut accounts = State::new();
+        let mut sender_start = account(10, 0);
+        sender_start.private.current = state_commitment(&current);
+        accounts.insert(account_key(&signer.public_key), sender_start);
+        accounts.insert(account_key(&recipient.public_key), account(1, 0));
+
+        let transactions = vec![
+            sign_payload(
+                &signer,
+                Payload::PrivateFund {
+                    value: NonZeroU64::new(4).unwrap(),
+                    commitment: fund_commitment.clone(),
+                    proof: fund_proof,
+                },
+                0,
+            ),
+            sign_payload(
+                &signer,
+                Payload::PrivateTransfer {
+                    to: account_key(&recipient.public_key),
+                    amount,
+                    proof: transfer_proof,
+                },
+                0, // duplicate of the fund's already-consumed nonce
+            ),
+        ];
+
+        let (applied, changes) = propose(&accounts, &transactions);
+        assert_eq!(applied, vec![true, false]);
+        assert_survivors_match(&accounts, &transactions, &applied, &changes);
+
+        // The whole batch is rejected under all-or-nothing verification.
+        assert!(execute(&accounts, &transactions).is_none());
+
+        // The dropped transfer left the fund's writes intact and mutated no
+        // commitment state: current is unspent and the recipient is unwritten.
+        let (_, account) = changes
+            .iter()
+            .find(|(key, _)| *key == account_key(&signer.public_key))
+            .expect("sender was written");
+        assert_eq!(account.balance, 6);
+        assert_eq!(account.nonce, Nonce::new(1, 0));
+        assert_eq!(account.private.current, state_commitment(&current));
+        assert_eq!(
+            account.private.pending,
+            StateCommitment::zero() + &state_commitment(&fund_commitment)
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|(key, _)| *key != account_key(&recipient.public_key)),
+            "dropped transfer must not credit the recipient"
+        );
+    }
+
+    #[test]
+    fn private_ops_execute_run_ahead_nonces() {
+        let params = ChainBackend::params();
+        let mut rng = rng();
+        let signer = TestSigner::from_seed(62);
+        let recipient = TestSigner::from_seed(63);
+        let mut accounts = State::new();
+        accounts.insert(account_key(&signer.public_key), account(10, 0));
+        accounts.insert(account_key(&recipient.public_key), account(1, 0));
+
+        let (fund_commitment, fund_opening, fund_proof) = ChainBackend::fund(params, 4, &mut rng);
+        let (amount, _amount_opening, proof) =
+            ChainBackend::transfer(params, &fund_commitment, &fund_opening, 4, &mut rng);
+
+        // The fund/rollover/transfer pipeline applies in block order while
+        // its nonces arrive out of order (2, 0, 1), mirroring the public
+        // run-ahead contract in `executes_run_ahead_nonces`.
+        let transactions = vec![
+            sign_payload(
+                &signer,
+                Payload::PrivateFund {
+                    value: NonZeroU64::new(4).unwrap(),
+                    commitment: fund_commitment.clone(),
+                    proof: fund_proof,
+                },
+                2,
+            ),
+            sign_payload(&signer, Payload::PrivateRollover, 0),
+            sign_payload(
+                &signer,
+                Payload::PrivateTransfer {
+                    to: account_key(&recipient.public_key),
+                    amount: amount.clone(),
+                    proof,
+                },
+                1,
+            ),
+        ];
+
+        let (applied, changes) = propose(&accounts, &transactions);
+        assert_eq!(applied, vec![true, true, true]);
+        assert_survivors_match(&accounts, &transactions, &applied, &changes);
+
+        let written = execute(&accounts, &transactions).expect("run-ahead pipeline executes");
+        let sender_account = changeset_account(&written, signer.public_key);
+        assert_eq!(sender_account.balance, 6);
+        // Consuming 2 then 0 then 1 compacts the run-ahead bitmap to base 3.
+        assert_eq!(sender_account.nonce, Nonce::new(3, 0));
+        assert_eq!(
+            sender_account.private.current,
+            state_commitment(&fund_commitment) - &state_commitment(&amount)
+        );
+        assert_eq!(sender_account.private.pending, StateCommitment::zero());
+        let recipient_account = changeset_account(&written, recipient.public_key);
+        assert_eq!(
+            recipient_account.private.pending,
+            StateCommitment::zero() + &state_commitment(&amount)
+        );
+    }
 }

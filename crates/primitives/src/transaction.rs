@@ -471,12 +471,51 @@ mod test {
     use commonware_codec::{DecodeExt, EncodeSize};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
+    use commonware_privacy::payments::Backend as _;
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
+
+    const NAMESPACE: &[u8] = b"test namespace";
 
     fn test_sender() -> TransactionPublicKey {
         let mut rng = StdRng::from_seed([7u8; 32]);
         TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key())
+    }
+
+    /// Seals and signs `payload` from a deterministic ed25519 sender.
+    fn sign_payload(payload: Payload, nonce: u64) -> SignedTransaction<sha256::Sha256> {
+        let mut rng = StdRng::from_seed([21u8; 32]);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        Transaction::from_payload(sender, payload, nonce).seal_and_sign(
+            &signer,
+            NAMESPACE,
+            &mut sha256::Sha256::default(),
+        )
+    }
+
+    /// Asserts a signed transaction carrying `payload` decodes back to equal
+    /// fields and re-encodes to the exact original bytes.
+    fn assert_signed_payload_roundtrip(payload: Payload, nonce: u64) {
+        let signed = sign_payload(payload, nonce);
+
+        let encoded = signed.encode();
+        let decoded = SignedTransaction::<sha256::Sha256>::decode(&mut &encoded[..])
+            .expect("decoding should succeed");
+
+        assert_eq!(
+            decoded, signed,
+            "decoded signed transaction should match the original"
+        );
+        assert_eq!(decoded.value().payload, signed.value().payload);
+        assert_eq!(decoded.value().nonce, signed.value().nonce);
+        assert_eq!(decoded.value().sender(), signed.value().sender());
+        assert_eq!(decoded.signature(), signed.signature());
+        assert_eq!(
+            decoded.encode(),
+            encoded,
+            "re-encoding must reproduce the original bytes"
+        );
     }
 
     #[test]
@@ -614,5 +653,93 @@ mod test {
             .expect("decoding should defer sender validation");
 
         assert!(decoded.sender().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Proof-bearing payload variants, constructed with the configured chain
+    // backend (mock under default features, real zkpari BN254 under
+    // --all-features) so commitments and proofs are real wire values.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn signed_private_fund_roundtrip() {
+        let params = ChainPrivatePaymentBackend::params();
+        let mut rng = StdRng::from_seed([22u8; 32]);
+        let (commitment, _opening, proof) = ChainPrivatePaymentBackend::fund(params, 9, &mut rng);
+
+        assert_signed_payload_roundtrip(
+            Payload::PrivateFund {
+                value: NonZeroU64::new(9).expect("test value should be non-zero"),
+                commitment,
+                proof,
+            },
+            3,
+        );
+    }
+
+    #[test]
+    fn signed_private_transfer_roundtrip() {
+        let params = ChainPrivatePaymentBackend::params();
+        let mut rng = StdRng::from_seed([23u8; 32]);
+        // Transfer proofs bind to the sender's current commitment, so derive
+        // the spend from a funded commitment whose opening is known.
+        let (current, current_opening, _proof) =
+            ChainPrivatePaymentBackend::fund(params, 7, &mut rng);
+        let (amount, _amount_opening, proof) =
+            ChainPrivatePaymentBackend::transfer(params, &current, &current_opening, 3, &mut rng);
+
+        assert_signed_payload_roundtrip(
+            Payload::PrivateTransfer {
+                to: AccountKey::from_public_key(&test_sender()),
+                amount,
+                proof,
+            },
+            4,
+        );
+    }
+
+    #[test]
+    fn signed_private_burn_roundtrip() {
+        let params = ChainPrivatePaymentBackend::params();
+        let mut rng = StdRng::from_seed([24u8; 32]);
+        let (current, current_opening, _proof) =
+            ChainPrivatePaymentBackend::fund(params, 7, &mut rng);
+        let proof =
+            ChainPrivatePaymentBackend::burn(params, &current, &current_opening, 4, &mut rng);
+
+        assert_signed_payload_roundtrip(
+            Payload::PrivateBurn {
+                value: NonZeroU64::new(4).expect("test value should be non-zero"),
+                proof,
+            },
+            5,
+        );
+    }
+
+    #[test]
+    fn signed_private_transfer_truncated_decode_is_rejected() {
+        let params = ChainPrivatePaymentBackend::params();
+        let mut rng = StdRng::from_seed([25u8; 32]);
+        let (current, current_opening, _proof) =
+            ChainPrivatePaymentBackend::fund(params, 7, &mut rng);
+        let (amount, _amount_opening, proof) =
+            ChainPrivatePaymentBackend::transfer(params, &current, &current_opening, 2, &mut rng);
+
+        let signed = sign_payload(
+            Payload::PrivateTransfer {
+                to: AccountKey::from_public_key(&test_sender()),
+                amount,
+                proof,
+            },
+            6,
+        );
+        let encoded = signed.encode();
+
+        for len in 0..encoded.len() {
+            assert!(
+                SignedTransaction::<sha256::Sha256>::decode(&mut &encoded[..len]).is_err(),
+                "decoding a transaction truncated to {len} bytes must fail"
+            );
+        }
     }
 }
