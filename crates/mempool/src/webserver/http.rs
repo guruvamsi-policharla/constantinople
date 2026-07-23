@@ -376,8 +376,11 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
-    private: String,
-    pending: String,
+    /// Hex-encoded spendable private commitment (`PrivateAccount::current`).
+    private_current: String,
+    /// Hex-encoded incoming private commitment awaiting rollover
+    /// (`PrivateAccount::pending`).
+    private_pending: String,
 }
 
 #[derive(serde::Serialize)]
@@ -391,8 +394,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
-            private: hex(&account.private.current.encode()),
-            pending: hex(&account.private.pending.encode()),
+            private_current: hex(&account.private.current.encode()),
+            private_pending: hex(&account.private.pending.encode()),
         }
     }
 }
