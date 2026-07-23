@@ -563,7 +563,11 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{prefix}-{unique}-{counter}{suffix}"))
+        // The counter alone cannot disambiguate across processes (nextest runs
+        // each test in its own process, so every counter starts at 0), and the
+        // system clock is too coarse to separate simultaneous test starts.
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("{prefix}-{unique}-{pid}-{counter}{suffix}"))
     }
 
     /// Test fixture: a validator cluster with `primary_count` primaries and
