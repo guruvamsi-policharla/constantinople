@@ -187,6 +187,7 @@ where
     /// from the state cache so backfill and replay scans cannot evict its
     /// working set.
     pub other_page_cache_bytes: usize,
+    pub shard_codec: CodecConfig,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -467,9 +468,7 @@ where
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
-                },
+                shard_codec_cfg: config.shard_codec.clone(),
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,

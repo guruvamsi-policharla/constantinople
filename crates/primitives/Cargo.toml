@@ -21,8 +21,10 @@ commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-runtime.workspace = true
+commonware-privacy.workspace = true
 
 # Other
+ark-bn254 = { workspace = true, optional = true }
 bytes.workspace = true
 p256.workspace = true
 tracing.workspace = true
@@ -44,6 +46,7 @@ rand = { workspace = true, features = ["std_rng"] }
 arbitrary = { workspace = true, features = ["derive"] }
 
 [features]
+default = ["privacy-backend-mock"]
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",
@@ -51,4 +54,26 @@ arbitrary = [
 	"commonware-math/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
+]
+# Private-payment backend selection is workspace-global: enabling a feature
+# here switches ChainPrivatePaymentBackend for every dependent crate via
+# cargo feature unification. Valid combinations:
+#   - privacy-backend-mock (default): zero-size proofs, trivial verification.
+#   - privacy-backend-zkpari: real BN254 commitments/range proofs. Coexists
+#     with the default mock feature and wins (the type aliases prefer zkpari
+#     via not(...) guards), so builds don't need default-features = false.
+#   - privacy-backend-simulator: add-on granting trapdoor proof forging for
+#     load generation; requires one of the base backends (compile_error!
+#     otherwise) and composes with either.
+privacy-backend-mock = [
+	"commonware-privacy/codec",
+	"commonware-privacy/mocks",
+]
+privacy-backend-zkpari = [
+	"commonware-privacy/codec",
+	"commonware-privacy/zkpari",
+	"dep:ark-bn254",
+]
+privacy-backend-simulator = [
+	"commonware-privacy/simulator",
 ]

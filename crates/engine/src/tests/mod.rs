@@ -12,6 +12,7 @@ use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
     TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
 };
+use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
@@ -343,6 +344,9 @@ impl EngineDefinition for TestEngineDefinition {
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
                     prunable_items_per_section,
+                    shard_codec: CodecConfig {
+                        maximum_shard_size: 1024 * 1024,
+                    },
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,

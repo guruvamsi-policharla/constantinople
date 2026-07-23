@@ -3,9 +3,9 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, log_spammer_plan,
+    resolve_spammer_plan, secondary_roles, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -23,6 +23,7 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
+    log_spammer_plan(args);
     assert!(args.validators >= 1, "need at least one validator");
 
     let output_dir = absolute_path(&args.output_dir);
@@ -115,6 +116,7 @@ fn build_validators(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -191,6 +193,7 @@ fn build_secondaries(
             state_page_cache_bytes: args.state_page_cache_bytes,
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -283,11 +286,21 @@ fn local_run_commands(
     simplex_verification_material: &str,
 ) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
+    // The simulated proof mode runs the whole cluster on the zkpari backend, so
+    // validators, the indexer, and the spammer must all be built with it (they
+    // must agree on the proof/state encoding). The spammer additionally uses the
+    // simulator trapdoor to generate transfer proofs cheaply.
+    let zkpari = args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated;
+    let cluster_features = if zkpari {
+        " --features constantinople-primitives/privacy-backend-zkpari"
+    } else {
+        ""
+    };
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
-                "cargo run --release --bin constantinople -- --config {} --peers {}",
+                "cargo run --release --bin constantinople{cluster_features} -- --config {} --peers {}",
                 path.display(),
                 peers_path.display()
             )
@@ -298,7 +311,7 @@ fn local_run_commands(
     for index in 0..total_secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
-            "cargo run --release --bin constantinople -- --config {} --peers {}",
+            "cargo run --release --bin constantinople{cluster_features} -- --config {} --peers {}",
             path.display(),
             peers_path.display()
         ));
@@ -310,10 +323,18 @@ fn local_run_commands(
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
+        // Everything shares the loopback host, so the chain indexer's metrics
+        // endpoint (9090 by default, for the remote deployer's scraper) must
+        // move past the validator/secondary/spammer metrics range.
+        let indexer_metrics_port = local
+            .base_metrics_port
+            .checked_add(args.validators as u16 + total_secondaries as u16 + 1)
+            .expect("chain-indexer metrics port overflow");
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            indexer_metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -322,12 +343,12 @@ fn local_run_commands(
         // subscribes to this service (not the raw store) for live block
         // metadata.
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "cargo run --release{cluster_features} -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
@@ -350,6 +371,7 @@ fn local_run_commands(
     }
 
     if args.spammer {
+        let plan = resolve_spammer_plan(args);
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
@@ -364,8 +386,17 @@ fn local_run_commands(
             .base_metrics_port
             .checked_add(args.validators as u16 + total_secondaries as u16)
             .expect("spammer metrics port overflow");
+
+        // Simulated proof mode builds the spammer on the zkpari backend with the
+        // simulator trapdoor (matching the rest of the cluster).
+        let spammer_bin = if zkpari {
+            "cargo run --release --bin constantinople-spammer \
+             --features constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator"
+        } else {
+            "cargo run --release --bin constantinople-spammer"
+        };
         commands.push(format!(
-            "cargo run --release --bin constantinople-spammer -- \
+            "{spammer_bin} -- \
              {network_source} \
              --accounts {} \
              --value {} \
@@ -373,13 +404,21 @@ fn local_run_commands(
              --rayon-threads {} \
              --accounts-jitter {} \
              --presigned-batches {} \
-             --metrics-port {metrics_port}",
-            args.spammer_accounts,
+             --metrics-port {metrics_port} \
+             --workload {} \
+             --private-proof-mode {} \
+             --private-batch {} \
+             --private-lanes {}",
+            plan.accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
+            args.spammer_workload.as_str(),
+            args.spammer_private_proof_mode.as_str(),
+            plan.private_batch,
+            plan.total_private_lanes,
         ));
     }
 
@@ -420,13 +459,19 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            max_shard_bytes: None,
             spammer,
-            spammer_accounts: 10,
+            spammer_accounts: Some(10),
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_workload: crate::SpammerWorkload::Public,
+            spammer_private_proof_mode: crate::SpammerProofMode::Real,
+            spammer_private_batch: None,
+            spammer_private_lanes: None,
+            spammer_target_inflight: None,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -561,6 +606,53 @@ mod tests {
         );
 
         assert!(commands[3].contains("--presigned-batches 32"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_private_workload_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_private_proof_mode = crate::SpammerProofMode::Simulated;
+        // Explicit private sizing; accounts derive from it (10 would be
+        // rejected as unable to fill every lane's batch).
+        args.spammer_accounts = None;
+        args.spammer_private_batch = Some(32);
+        args.spammer_private_lanes = Some(12);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--workload private"));
+        assert!(commands[3].contains("--private-proof-mode simulated"));
+        assert!(commands[3].contains("--private-batch 32"));
+        assert!(commands[3].contains("--private-lanes 24"));
+        // Simulated mode runs the whole cluster on zkpari; the spammer also gets
+        // the simulator trapdoor feature.
+        assert!(commands[0].contains("constantinople-primitives/privacy-backend-zkpari"));
+        assert!(commands[3].contains("constantinople-primitives/privacy-backend-zkpari"));
+        assert!(commands[3].contains("constantinople-spammer/privacy-backend-simulator"));
+    }
+
+    #[test]
+    fn real_proof_mode_keeps_mock_cluster() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_workload = crate::SpammerWorkload::Private;
+        args.spammer_accounts = None;
+        args.spammer_private_proof_mode = crate::SpammerProofMode::Real;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+        assert!(commands.iter().all(|c| !c.contains("zkpari")));
     }
 
     #[test]
@@ -719,6 +811,15 @@ mod tests {
         assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
+
+        // The store's metrics endpoint must clear the loopback host's
+        // validator (base 9090 + 2), secondary (+1), and spammer metrics
+        // range: 2 validators + 1 indexer secondary land it on 9094.
+        let store_cmd = commands
+            .iter()
+            .find(|c| c.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+        assert!(store_cmd.contains("--metrics-port 9094"));
     }
 
     #[test]

@@ -67,6 +67,61 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
+Add `--spammer-workload private` to instead generate private payments (each
+account cycles fund -> rollover -> transfer). Use `--spammer-private-proof-mode
+simulated` to run the whole cluster (validators, indexer, and spammer) on the
+**zkpari** BN254 backend, with the spammer using the simulator trapdoor to
+generate transfer proofs cheaply — the generated commands add the
+`privacy-backend-zkpari`/`privacy-backend-simulator` features automatically. The
+default (`real`) keeps the fast mock backend:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --relayer --output-dir ./local \
+  --spammer --spammer-workload private \
+  local --base-port 3000 --base-http-port 8080
+```
+
+The private spammer runs `--spammer-private-lanes` (default `8`) concurrent
+lanes per validator, each over a disjoint slice of accounts. The deployer
+multiplies this by `--validators` before starting the spammer. A single lane
+only lands one batch per finalization round-trip, leaving the blocks in between
+empty; more lanes keep more batches in flight so every block is populated.
+Raise it if you still see gaps.
+
+### Sizing the private workload with `--spammer-target-inflight`
+
+The private knobs are coupled: each lane keeps one `--spammer-private-batch`
+batch in flight, a batch takes at most one operation per source account, and
+lanes pin to leaders — so a lane lands one batch per *leader rotation*
+(`validators x view-time`; ~4s at 50 validators and ~80ms views). Sustained
+TPS is roughly *transactions in flight ÷ rotation seconds*: hitting 50K TPS
+on a 50-validator cluster takes ~200K in flight, not 50K. Instead of
+balancing `--spammer-private-lanes`, `--spammer-private-batch`, and
+`--spammer-accounts` by hand, state the in-flight count directly:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 50 --relayer --output-dir ./deploy \
+  --spammer --spammer-workload private \
+  --spammer-target-inflight 50000 \
+  remote ...
+```
+
+Whichever of the three knobs are left unset are derived to satisfy the target
+(lanes stay a whole multiple of the validator count; accounts get 2x headroom
+so temporarily unusable sources don't shrink batches); explicit values are
+respected and validated against it. The resolved plan — lanes, batch,
+in-flight count, accounts, and an estimated runway before the accounts drain —
+is logged at generate time.
+
+Inconsistent sizing fails at generate time instead of silently degrading:
+`--spammer-accounts` too small to fill every lane's batch, explicit
+lanes x batch below the target, or a batch that encodes past
+`--max-propose-bytes` are all rejected with the arithmetic in the error. For
+the private workload, `--spammer-accounts` left unset is always derived (the
+public-workload default of `10` cannot feed a lane fleet).
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
@@ -82,8 +137,10 @@ cargo run --bin constantinople-deploy -- generate \
 
 Add `--spammer-presigned-batches N` (default `16`) to keep more fully signed batches ready
 locally per submitter. The spammer still submits only one batch at a time to each target leader.
-`--spammer-accounts` configures accounts per submitter, so the generated total is
-`spammer_accounts * relayer_submitters`.
+`--spammer-accounts` (default `10`) configures accounts per submitter for the
+public workload, so the generated total is `spammer_accounts * relayer_submitters`;
+for the private workload it is the total source-account pool shared by all lanes
+(see above).
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
 

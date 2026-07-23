@@ -10,7 +10,7 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize};
 use constantinople_application::{
     consensus::{self, StateBatch, StateDatabase},
-    executor::PreparedTransfer,
+    executor::PreparedOperation,
 };
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
@@ -124,13 +124,20 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
     }
 }
 
-fn load_plan(transfers: &[PreparedTransfer]) -> LoadPlan<'_> {
+fn non_self_recipient(transfer: &PreparedOperation) -> Option<&AccountKey> {
+    transfer
+        .recipient_entry()
+        .map(|(_, recipient)| recipient)
+        .filter(|recipient| **recipient != transfer.sender)
+}
+
+fn load_plan(transfers: &[PreparedOperation]) -> LoadPlan<'_> {
     let mut touches: AHashMap<&AccountKey, usize> =
         AHashMap::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
         *touches.entry(&transfer.sender).or_default() += 1;
-        if transfer.sender != transfer.recipient {
-            *touches.entry(&transfer.recipient).or_default() += 1;
+        if let Some(recipient) = non_self_recipient(transfer) {
+            *touches.entry(recipient).or_default() += 1;
         }
     }
 
@@ -142,16 +149,13 @@ fn load_plan(transfers: &[PreparedTransfer]) -> LoadPlan<'_> {
     };
     for transfer in transfers {
         let sender_unique = touches.get(&transfer.sender).copied().unwrap_or_default() == 1;
-        let recipient_unique = transfer.sender == transfer.recipient
-            || touches
-                .get(&transfer.recipient)
-                .copied()
-                .unwrap_or_default()
-                == 1;
+        let recipient = non_self_recipient(transfer);
+        let recipient_unique = recipient
+            .is_none_or(|recipient| touches.get(recipient).copied().unwrap_or_default() == 1);
         if sender_unique && recipient_unique {
             plan.discrete_senders.push(&transfer.sender);
-            if transfer.sender != transfer.recipient {
-                plan.discrete_recipients.push(&transfer.recipient);
+            if let Some(recipient) = recipient {
+                plan.discrete_recipients.push(recipient);
             }
             continue;
         }
@@ -159,27 +163,22 @@ fn load_plan(transfers: &[PreparedTransfer]) -> LoadPlan<'_> {
         if general_seen.insert(&transfer.sender) {
             plan.general.push(&transfer.sender);
         }
-        if transfer.sender != transfer.recipient && general_seen.insert(&transfer.recipient) {
-            plan.general.push(&transfer.recipient);
+        if let Some(recipient) = non_self_recipient(transfer)
+            && general_seen.insert(recipient)
+        {
+            plan.general.push(recipient);
         }
     }
     plan
 }
 
-fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
+fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedOperation> {
     match fixture {
         Fixture::Unique => (0..n)
             .map(|i| {
                 let sender = key(i as u64);
                 let recipient = key(n as u64 + i as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce: 0,
-                }
+                PreparedOperation::public_transfer(sender, recipient, 1, 0)
             })
             .collect(),
         Fixture::Shared => {
@@ -193,14 +192,7 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
                     nonces[sender_index] += 1;
                     let sender = key(sender_index as u64);
                     let recipient = key(recipient_index as u64);
-                    PreparedTransfer {
-                        sender,
-                        recipient,
-                        sender_prefix: sender.prefix(),
-                        recipient_prefix: recipient.prefix(),
-                        value: 1,
-                        nonce,
-                    }
+                    PreparedOperation::public_transfer(sender, recipient, 1, nonce)
                 })
                 .collect()
         }
@@ -216,26 +208,12 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
                 nonces[sender_index] += 1;
                 let sender = key(sender_index as u64);
                 let recipient = key(recipient_index as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce,
-                }
+                PreparedOperation::public_transfer(sender, recipient, 1, nonce)
             });
             let unique_transfers = (0..unique).map(|i| {
                 let sender = key(n as u64 + i as u64);
                 let recipient = key(n as u64 + unique as u64 + i as u64);
-                PreparedTransfer {
-                    sender,
-                    recipient,
-                    sender_prefix: sender.prefix(),
-                    recipient_prefix: recipient.prefix(),
-                    value: 1,
-                    nonce: 0,
-                }
+                PreparedOperation::public_transfer(sender, recipient, 1, 0)
             });
             shared_transfers.chain(unique_transfers).collect()
         }
@@ -298,7 +276,7 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
 
 async fn time_compute(
     batch: Batch,
-    transfers: Arc<Vec<PreparedTransfer>>,
+    transfers: Arc<Vec<PreparedOperation>>,
     strategy: &Rayon,
 ) -> (usize, Duration, Duration, String) {
     let start = Instant::now();
@@ -432,6 +410,7 @@ fn main() {
                 Some(Account {
                     balance: 1_000_000,
                     nonce: Nonce::default(),
+                    private: Default::default(),
                 }),
             );
         }
@@ -442,6 +421,7 @@ fn main() {
                     Some(Account {
                         balance: 1_000_000,
                         nonce: Nonce::default(),
+                        private: Default::default(),
                     }),
                 );
             }

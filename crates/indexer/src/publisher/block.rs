@@ -11,10 +11,7 @@ use bytes::Bytes;
 use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
-};
-use std::array::TryFromSliceError;
+use constantinople_primitives::{AccountKey, LazySignedTransaction, Payload, TransactionPublicKey};
 use tracing::warn;
 
 /// Encoded block rows split by index surface.
@@ -154,21 +151,16 @@ where
     H: Hasher,
 {
     let signed_bytes = transaction.encoded_signed_transaction();
-    let transaction_size = Transaction::<H::Digest>::SIZE;
-    if signed_bytes.len() < transaction_size {
+    let Some(signed) = transaction.get() else {
         warn!(
             height,
-            block_index,
-            signed_len = signed_bytes.len(),
-            transaction_size,
-            "indexer: skipping transaction with truncated signed payload"
+            block_index, "indexer: skipping malformed transaction"
         );
         return None;
-    }
-
-    let transaction_bytes = &signed_bytes[..transaction_size];
+    };
+    let tx = signed.value();
     let Some(sender) =
-        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
+        AccountKey::from_public_key_bytes(&signed_bytes[..TransactionPublicKey::SIZE])
     else {
         warn!(
             height,
@@ -176,43 +168,25 @@ where
         );
         return None;
     };
-
-    let to_start = TransactionPublicKey::SIZE;
-    let to_end = to_start + AccountKey::SIZE;
-    let value_start = to_end;
-    let value_end = value_start + u64::SIZE;
-    let nonce_start = value_end;
-    let nonce_end = nonce_start + u64::SIZE;
-    let value = read_u64(&transaction_bytes[value_start..value_end])
-        .expect("transaction value slice has fixed width");
-    if value == 0 {
-        warn!(
-            height,
-            block_index, "indexer: skipping transaction with zero value"
-        );
-        return None;
-    }
-
-    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
-        .expect("transaction nonce slice has fixed width");
+    let (to_account, value) = match &tx.payload {
+        Payload::PublicTransfer { to, value } => (*to, value.get()),
+        Payload::PrivateTransfer { to, .. } => (*to, 0),
+        Payload::PrivateFund { .. } | Payload::PrivateBurn { .. } | Payload::PrivateRollover => {
+            (sender, 0)
+        }
+    };
     let mut to = [0u8; AccountKey::SIZE];
-    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
+    to.copy_from_slice(to_account.as_ref());
 
-    let mut hasher = H::new();
-    hasher.update(transaction_bytes);
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest: *signed.message_digest(),
         bytes: signed_bytes,
         sender,
         to,
         value,
-        nonce,
+        nonce: tx.nonce,
     })
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
 #[cfg(test)]
@@ -233,8 +207,8 @@ mod tests {
     use commonware_math::algebra::Random;
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_primitives::{
-        Block, Header, LazySignedTransaction, Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction,
-        TransactionPublicKey,
+        Block, ChainPrivatePaymentBackend, Header, LazySignedTransaction, PrivatePaymentBackend,
+        Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
     use core::num::NonZeroU64;
     use exoware_sql::CellValue;
@@ -307,6 +281,181 @@ mod tests {
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);
+    }
+
+    #[test]
+    fn private_payloads_index_zero_value_with_per_arm_recipients() {
+        let mut rng = StdRng::from_seed([11; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let sender_account = AccountKey::from_public_key(&sender);
+        let recipient = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+            ed25519::PrivateKey::random(&mut rng).public_key(),
+        ));
+
+        let payloads = private_payloads::<ChainPrivatePaymentBackend>(recipient, &mut rng);
+        let transactions = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                // Offset nonces so they never coincide with block indices,
+                // keeping the index and nonce row columns distinguishable.
+                let nonce = u64::try_from(index).expect("index fits u64") + 10;
+                Transaction::<sha256::Digest>::from_payload(sender.clone(), payload, nonce)
+                    .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default())
+            })
+            .collect::<Vec<_>>();
+        let block = Block::<Commitment, PublicKey, Sha256>::new(
+            test_header(consensus_key.public_key(), transactions.len()),
+            transactions,
+        )
+        .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        assert_eq!(rows.transaction_digests.len(), 4);
+
+        // PrivateFund has no recipient: the sender self-references and no
+        // receiver row is emitted.
+        let fund = activity_rows_for_index(&rows.sql, 0);
+        assert_eq!(fund.len(), 1, "fund should index one sender row");
+        assert_activity_row(
+            fund[0],
+            sender_account.as_ref(),
+            TxActivityRole::Sender,
+            sender_account.as_ref(),
+            0,
+            10,
+        );
+
+        // PrivateRollover has the same self-referential shape as fund.
+        let rollover = activity_rows_for_index(&rows.sql, 1);
+        assert_eq!(rollover.len(), 1, "rollover should index one sender row");
+        assert_activity_row(
+            rollover[0],
+            sender_account.as_ref(),
+            TxActivityRole::Sender,
+            sender_account.as_ref(),
+            0,
+            11,
+        );
+
+        // PrivateTransfer names a public recipient but hides the amount, so
+        // both activity rows carry the counterparty with value zero.
+        let transfer = activity_rows_for_index(&rows.sql, 2);
+        assert_eq!(
+            transfer.len(),
+            2,
+            "transfer should index sender and receiver rows"
+        );
+        assert_activity_row(
+            transfer[0],
+            sender_account.as_ref(),
+            TxActivityRole::Sender,
+            recipient.as_ref(),
+            0,
+            12,
+        );
+        assert_activity_row(
+            transfer[1],
+            recipient.as_ref(),
+            TxActivityRole::Receiver,
+            sender_account.as_ref(),
+            0,
+            12,
+        );
+
+        // PrivateBurn has no recipient and the de-shielded value stays
+        // unindexed.
+        let burn = activity_rows_for_index(&rows.sql, 3);
+        assert_eq!(burn.len(), 1, "burn should index one sender row");
+        assert_activity_row(
+            burn[0],
+            sender_account.as_ref(),
+            TxActivityRole::Sender,
+            sender_account.as_ref(),
+            0,
+            13,
+        );
+    }
+
+    /// One payload per private arm, built with the configured chain backend.
+    ///
+    /// Generic over the backend so the prover methods resolve through the
+    /// `PrivatePaymentBackend` supertrait (mock under default features, real
+    /// zkpari proving under `--all-features`). Mirrors the executor's
+    /// `private_ops` construction: fund proofs bind the public value and
+    /// transfer proofs bind the sender's current commitment.
+    fn private_payloads<B>(to: AccountKey, rng: &mut StdRng) -> [Payload<B>; 4]
+    where
+        B: PrivatePaymentBackend,
+    {
+        let params = B::params();
+        let (commitment, _opening, fund_proof) = B::fund(params, 4, rng);
+        let (current, current_opening, _current_proof) = B::fund(params, 7, rng);
+        let (amount, _amount_opening, transfer_proof) =
+            B::transfer(params, &current, &current_opening, 3, rng);
+        let burn_proof = B::burn(params, &current, &current_opening, 2, rng);
+        [
+            Payload::PrivateFund {
+                value: NonZeroU64::new(4).expect("test value should be non-zero"),
+                commitment,
+                proof: fund_proof,
+            },
+            Payload::PrivateRollover,
+            Payload::PrivateTransfer {
+                to,
+                amount,
+                proof: transfer_proof,
+            },
+            Payload::PrivateBurn {
+                value: NonZeroU64::new(2).expect("test value should be non-zero"),
+                proof: burn_proof,
+            },
+        ]
+    }
+
+    fn activity_rows_for_index(rows: &[SqlRow], index: u64) -> Vec<&SqlRow> {
+        rows.iter()
+            .filter(|row| {
+                row.table == TX_ACTIVITY_TABLE
+                    && matches!(row.values.get(2), Some(CellValue::UInt64(i)) if *i == index)
+            })
+            .collect()
+    }
+
+    fn assert_activity_row(
+        row: &SqlRow,
+        expected_account: &[u8],
+        expected_role: TxActivityRole,
+        expected_counterparty: &[u8],
+        expected_value: u64,
+        expected_nonce: u64,
+    ) {
+        let Some(CellValue::FixedBinary(account)) = row.values.first() else {
+            panic!("activity account should be fixed binary");
+        };
+        assert_eq!(account.as_slice(), expected_account);
+        let Some(CellValue::UInt64(role)) = row.values.get(3) else {
+            panic!("activity role should be u64");
+        };
+        let expected_role = match expected_role {
+            TxActivityRole::Sender => 0,
+            TxActivityRole::Receiver => 1,
+        };
+        assert_eq!(*role, expected_role, "activity role mismatch");
+        let Some(CellValue::FixedBinary(counterparty)) = row.values.get(5) else {
+            panic!("activity counterparty should be fixed binary");
+        };
+        assert_eq!(counterparty.as_slice(), expected_counterparty);
+        let Some(CellValue::UInt64(value)) = row.values.get(6) else {
+            panic!("activity value should be u64");
+        };
+        assert_eq!(*value, expected_value, "activity value mismatch");
+        let Some(CellValue::UInt64(nonce)) = row.values.get(7) else {
+            panic!("activity nonce should be u64");
+        };
+        assert_eq!(*nonce, expected_nonce, "activity nonce mismatch");
     }
 
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {

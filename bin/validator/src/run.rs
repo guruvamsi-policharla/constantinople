@@ -8,6 +8,7 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
+use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter,
     simplex::elector::RoundRobin,
@@ -690,6 +691,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         http_listen,
         metrics_listen,
         max_propose_bytes,
+        max_shard_bytes,
         max_pool_bytes,
         state_page_cache_bytes,
         other_page_cache_bytes,
@@ -923,6 +925,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 state_page_cache_bytes,
                 other_page_cache_bytes,
+                shard_codec: CodecConfig {
+                    maximum_shard_size: max_shard_bytes,
+                },
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
@@ -1028,11 +1033,11 @@ mod tests {
     };
     use commonware_utils::{non_empty_range, sequence::FixedBytes};
     use constantinople_primitives::{
-        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
+        AccountKey, Block, Header, Sealable, SignedTransaction, StateAccount,
     };
     use std::{future::pending, time::Duration};
 
-    type TestAccountValue = FixedBytes<{ Account::SIZE }>;
+    type TestAccountValue = FixedBytes<{ StateAccount::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 

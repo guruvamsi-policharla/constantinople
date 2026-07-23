@@ -35,6 +35,17 @@ inputs:
 runs:
   using: composite
   steps:
+    # constantinople consumes commonware-privacy (and the [patch.crates-io]
+    # entries) as path dependencies on a sibling ../monorepo checkout; nothing
+    # builds without it. Pinned to an exact commit on the gv-privacy-2026.7
+    # branch for reproducibility — update the SHA when that branch advances.
+    - name: Checkout commonware monorepo (path dependencies)
+      shell: bash
+      run: |
+        if [ ! -d "${GITHUB_WORKSPACE}/../monorepo" ]; then
+          git clone --filter=blob:none https://github.com/commonwarexyz/monorepo "${GITHUB_WORKSPACE}/../monorepo"
+        fi
+        git -C "${GITHUB_WORKSPACE}/../monorepo" checkout 03f74856afc8f759a20f7fec36716e5f5d41976f
     # Use /mnt for Cargo builds on Linux (has ~70GB vs ~14GB on /)
     - name: Relocate Cargo directories to /mnt on Linux
       if: runner.os == 'Linux'

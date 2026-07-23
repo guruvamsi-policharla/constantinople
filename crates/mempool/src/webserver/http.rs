@@ -11,9 +11,9 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::sys_rng;
@@ -100,10 +100,12 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
+/// Smallest encoded payload: a one-byte tag (private rollover).
+const MIN_PAYLOAD_TAG_BYTES: usize = 1;
+
 const fn min_signed_transaction_bytes() -> usize {
     TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
+        + MIN_PAYLOAD_TAG_BYTES
         + MIN_U64_VARINT_BYTES
         + TransactionSignature::MIN_SIZE
 }
@@ -280,7 +282,7 @@ where
             .into_iter()
             .map(LazySignedTransaction::new)
             .collect::<Vec<_>>();
-        let transactions = verify_transaction_chunks::<H, _>(
+        let transactions = verify_transaction_chunks::<H, _, _>(
             namespace,
             &mut sys_rng(),
             &public_key_cache,
@@ -374,6 +376,11 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: NonceResponse,
+    /// Hex-encoded spendable private commitment (`PrivateAccount::current`).
+    private_current: String,
+    /// Hex-encoded incoming private commitment awaiting rollover
+    /// (`PrivateAccount::pending`).
+    private_pending: String,
 }
 
 #[derive(serde::Serialize)]
@@ -387,6 +394,8 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: NonceResponse::from(account.nonce),
+            private_current: hex(&account.private.current.encode()),
+            private_pending: hex(&account.private.pending.encode()),
         }
     }
 }
@@ -402,33 +411,118 @@ impl From<Nonce> for NonceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router};
+    use super::{
+        super::{AccountReader, TxStatus, mailbox::Message},
+        Account, AccountReaderCell, AppState, MAX_CONCURRENT_INGRESS, Nonce, PublicKeyCache,
+        Semaphore, SignedTransaction, TransactionPublicKey, hex, router,
+    };
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Method, Request, StatusCode, header},
     };
     use commonware_codec::Encode;
-    use commonware_cryptography::{ed25519, sha256};
+    use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_parallel::Sequential;
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
+    use constantinople_primitives::{
+        ChainPrivatePaymentBackend, Payload, PrivateAccount, PrivatePaymentBackend, Transaction,
+    };
+    use core::num::NonZeroU64;
+    use futures::future::{BoxFuture, FutureExt as _};
+    use rand::{SeedableRng as _, rngs::StdRng};
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
-        let (sender, _receiver) = mpsc::channel(1);
+    const NAMESPACE: &[u8] = b"mempool-http-test";
+
+    /// Builds the router plus the actor-side receiver and account-reader
+    /// cell, for tests that stand in for the mempool actor or state database.
+    fn test_router_parts(
+        context: impl Metrics,
+        max_batch_bytes: usize,
+    ) -> (
+        axum::Router,
+        mpsc::Receiver<Message<sha256::Digest, ed25519::PublicKey, sha256::Sha256>>,
+        AccountReaderCell,
+    ) {
+        let (sender, receiver) = mpsc::channel(1);
+        let account_reader: AccountReaderCell = Arc::new(std::sync::OnceLock::new());
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
-            namespace: b"mempool-http-test",
+            namespace: NAMESPACE,
             max_batch_bytes,
             strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
-            account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
+            account_reader: account_reader.clone(),
             ingress_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS)),
         });
 
-        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state)
+        (
+            router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state),
+            receiver,
+            account_reader,
+        )
+    }
+
+    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
+        test_router_parts(context, max_batch_bytes).0
+    }
+
+    fn sign_tx(key: &ed25519::PrivateKey, nonce: u64) -> SignedTransaction<sha256::Sha256> {
+        let public_key = TransactionPublicKey::ed25519(key.public_key());
+        Transaction::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            nonce,
+        )
+        .seal_and_sign(key, NAMESPACE, &mut sha256::Sha256::default())
+    }
+
+    fn sign_payload(
+        key: &ed25519::PrivateKey,
+        payload: Payload,
+        nonce: u64,
+    ) -> SignedTransaction<sha256::Sha256> {
+        Transaction::from_payload(
+            TransactionPublicKey::ed25519(key.public_key()),
+            payload,
+            nonce,
+        )
+        .seal_and_sign(key, NAMESPACE, &mut sha256::Sha256::default())
+    }
+
+    /// Funds a commitment with the configured chain backend (mock under
+    /// default features, real zkpari BN254 under `--all-features`). The
+    /// generic indirection reaches the `Backend` supertrait methods without
+    /// naming `commonware-privacy`, which this crate does not depend on.
+    fn fund<B: PrivatePaymentBackend>(
+        value: u64,
+        rng: &mut StdRng,
+    ) -> (B::Commitment, B::FundProof) {
+        let (commitment, _opening, proof) = B::fund(B::params(), value, rng);
+        (commitment, proof)
+    }
+
+    fn private_fund_payload(value: u64, rng: &mut StdRng) -> Payload {
+        let (commitment, proof) = fund::<ChainPrivatePaymentBackend>(value, rng);
+        Payload::PrivateFund {
+            value: NonZeroU64::new(value).expect("test value should be non-zero"),
+            commitment,
+            proof,
+        }
+    }
+
+    /// Serves one fixed account for `/account` lookups.
+    struct StaticAccountReader(Account);
+
+    impl AccountReader for StaticAccountReader {
+        fn get<'a>(&'a self, _public_key: TransactionPublicKey) -> BoxFuture<'a, Option<Account>> {
+            let account = self.0.clone();
+            async move { Some(account) }.boxed()
+        }
     }
 
     #[test]
@@ -482,6 +576,130 @@ mod tests {
             assert_eq!(
                 response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
                 Some(&header::HeaderValue::from_static("*")),
+            );
+        });
+    }
+
+    /// A batch carrying a valid `PrivateFund` payload decodes, verifies, and
+    /// resolves through the same `/transactions` submit path as a public
+    /// transfer.
+    #[test]
+    fn submitted_private_fund_batch_is_accepted_with_public_transfer() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (app, mut receiver, _account_reader) = test_router_parts(context, 4 * 1024 * 1024);
+            let mut rng = StdRng::from_seed([29; 32]);
+            let key = ed25519::PrivateKey::from_seed(42);
+            let fund_payload = private_fund_payload(4, &mut rng);
+            let batch = vec![
+                sign_tx(&key, 0),
+                sign_payload(&key, fund_payload.clone(), 1),
+            ];
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions")
+                .body(Body::from(batch.encode()))
+                .expect("request should build");
+
+            // Stand in for the mempool actor: receive the verified batch and
+            // resolve it as finalized.
+            let response_task = tokio::spawn(app.oneshot(request));
+            let message = receiver
+                .recv()
+                .await
+                .expect("router should forward the batch");
+            let Message::Submit {
+                digests,
+                transactions,
+                result,
+                ..
+            } = message
+            else {
+                panic!("submission should reach the actor as a submit message");
+            };
+            assert_eq!(digests.len(), 2);
+            assert!(matches!(
+                transactions[0].value().payload,
+                Payload::PublicTransfer { .. }
+            ));
+            assert_eq!(transactions[1].value().payload, fund_payload);
+            result
+                .expect("http submissions carry a result sender")
+                .send(TxStatus::Finalized { height: 7 })
+                .expect("handler should await the result");
+
+            let response = response_task
+                .await
+                .expect("request task should not panic")
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should buffer");
+            assert_eq!(
+                serde_json::from_slice::<TxStatus>(&body).expect("status should deserialize"),
+                TxStatus::Finalized { height: 7 },
+            );
+        });
+    }
+
+    /// `/account` serializes non-zero private commitment state as the hex
+    /// `private_current`/`private_pending` fields (renamed from
+    /// `private`/`pending`).
+    #[test]
+    fn account_response_serializes_private_state_as_hex() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (app, _receiver, account_reader) = test_router_parts(context, 4 * 1024 * 1024);
+            let mut rng = StdRng::from_seed([31; 32]);
+            let (current, _proof) = fund::<ChainPrivatePaymentBackend>(7, &mut rng);
+            let (pending, _proof) = fund::<ChainPrivatePaymentBackend>(3, &mut rng);
+            let current_hex = hex(&current.encode());
+            let pending_hex = hex(&pending.encode());
+            let account = Account {
+                balance: 42,
+                nonce: Nonce::new(2, 1),
+                private: PrivateAccount { current, pending },
+            };
+            assert!(
+                account_reader
+                    .set(Arc::new(StaticAccountReader(account)))
+                    .is_ok()
+            );
+
+            let public_key =
+                TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(43).public_key());
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/account/{}", hex(&public_key.encode())))
+                .body(Body::empty())
+                .expect("request should build");
+
+            let response = app.oneshot(request).await.expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should buffer");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("account should deserialize");
+            let zero = hex(&PrivateAccount::<ChainPrivatePaymentBackend>::zero()
+                .current
+                .encode());
+            assert_ne!(current_hex, zero, "state under test must be non-zero");
+            assert_eq!(json["balance"], 42);
+            assert_eq!(json["nonce"]["base"], 2);
+            assert_eq!(json["nonce"]["bitmap"], 1);
+            assert_eq!(json["private_current"], current_hex);
+            assert_eq!(json["private_pending"], pending_hex);
+            let object = json
+                .as_object()
+                .expect("account response should be an object");
+            assert!(
+                !object.contains_key("private"),
+                "field was renamed to private_current"
+            );
+            assert!(
+                !object.contains_key("pending"),
+                "field was renamed to private_pending"
             );
         });
     }

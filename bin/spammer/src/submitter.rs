@@ -99,7 +99,6 @@ pub struct RelayerSubmitter {
     http: reqwest::Client,
     stats: Arc<Stats>,
     target_leader: Option<String>,
-    leader_fanout: usize,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -110,31 +109,57 @@ enum RelayerBatchStatus {
     },
     PartiallyFinalized {
         height: u64,
-        included: u64,
+        included: Vec<u64>,
         filtered: u64,
     },
     Dropped,
 }
 
+/// Which transactions in a submitted private batch finalized.
+pub enum SubmitOutcome {
+    /// Every transaction in the batch finalized.
+    AllFinalized,
+    /// Only the transactions at these batch indices finalized.
+    Partial(std::collections::HashSet<u64>),
+    /// Nothing finalized (dropped or submit error) — retry with fresh proofs.
+    None,
+}
+
+impl SubmitOutcome {
+    /// Whether the transaction at `index` in the submitted batch finalized.
+    pub fn finalized(&self, index: u64) -> bool {
+        match self {
+            Self::AllFinalized => true,
+            Self::Partial(included) => included.contains(&index),
+            Self::None => false,
+        }
+    }
+}
+
 impl RelayerSubmitter {
-    pub fn new(
-        url: String,
-        stats: Arc<Stats>,
-        _target_offset: usize,
-        target_leader: Option<String>,
-    ) -> Self {
+    pub fn new(url: String, stats: Arc<Stats>, target_leader: Option<String>) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
             target_leader,
-            leader_fanout: 1,
         }
     }
 
-    /// Submits a signed batch once. Failed or dropped batches are abandoned so
-    /// the next outer loop iteration uses a fresh nonce set.
+    /// Submits a signed batch once, discarding the outcome. Failed or dropped
+    /// batches are abandoned so the next outer loop iteration uses a fresh
+    /// nonce set (the public workload's contract).
     pub async fn submit(&self, batch: Vec<Tx>) {
+        let _ = self.submit_private(&batch).await;
+    }
+
+    /// Submits a batch and reports which transactions finalized.
+    ///
+    /// The relayer response is definitive (the call blocks until the batch is
+    /// finalized, partially finalized, or dropped), so the private workload
+    /// can advance only the finalized accounts' state and retry the rest with
+    /// fresh proofs.
+    pub async fn submit_private(&self, batch: &[Tx]) -> SubmitOutcome {
         let count = batch.len() as u64;
         let body = batch.encode();
         self.stats.record_submitted(count);
@@ -142,31 +167,37 @@ impl RelayerSubmitter {
             Ok(RelayerBatchStatus::Finalized { height }) => {
                 self.stats.record_finalized(count);
                 debug!(height, count, "relayed batch finalized");
+                SubmitOutcome::AllFinalized
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
                 height,
                 included,
                 filtered,
             }) => {
-                self.stats.record_finalized(included);
+                self.stats.record_finalized(included.len() as u64);
                 self.stats.record_filtered(filtered);
                 info!(
                     height,
-                    included, filtered, "relayed batch partially finalized, advancing"
+                    included = included.len(),
+                    filtered,
+                    "relayed batch partially finalized"
                 );
+                SubmitOutcome::Partial(included.into_iter().collect())
             }
             Ok(RelayerBatchStatus::Dropped) => {
                 self.stats.record_dropped(count);
-                debug!(count, "relayed batch dropped, advancing");
+                debug!(count, "relayed batch dropped");
+                SubmitOutcome::None
             }
             Err(error) => {
                 self.stats.record_error();
                 warn!(
                     error = %error,
                     backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
-                    "relayer submit error, advancing"
+                    "relayer submit error"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                SubmitOutcome::None
             }
         }
     }
@@ -175,11 +206,7 @@ impl RelayerSubmitter {
         let mut request = self
             .http
             .post(format!("{}/transactions", self.url))
-            .header("content-type", "application/octet-stream")
-            .header(
-                "x-constantinople-relayer-leader-fanout",
-                self.leader_fanout.to_string(),
-            );
+            .header("content-type", "application/octet-stream");
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
@@ -229,7 +256,7 @@ mod tests {
         let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
         let batch = test_batch();
         let count = batch.len() as u64;
 
@@ -246,7 +273,7 @@ mod tests {
         let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
@@ -260,10 +287,10 @@ mod tests {
     async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
         let stats = test_stats();
         let batch = test_batch();
-        let body =
-            r#"{"status":"partially_finalized","height":7,"included":1,"filtered":1}"#.to_string();
+        let body = r#"{"status":"partially_finalized","height":7,"included":[0],"filtered":1}"#
+            .to_string();
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await

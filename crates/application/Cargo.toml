@@ -24,11 +24,14 @@ commonware-utils.workspace = true
 commonware-runtime.workspace = true
 commonware-storage.workspace = true
 commonware-parallel.workspace = true
+# Used for the payments Backend trait only; backend selection is global via
+# constantinople-primitives' privacy-backend-* features.
+commonware-privacy.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
-rand.workspace = true
+rand = { workspace = true, features = ["thread_rng"] }
 bytes.workspace = true
 futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true

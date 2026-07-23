@@ -31,6 +31,10 @@ use tracing_subscriber::fmt;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const STORAGE_CLASS: &str = "gp3";
+/// Graviton4 instance type for the binary instances. Must stay on Graviton4 to
+/// match the `neoverse-v2` graviton build target in `docker/docker-bake.hcl`; a
+/// Graviton3 (c7g) type hits illegal instructions on startup.
+const DEFAULT_INSTANCE_TYPE: &str = "c8g.4xlarge";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
@@ -91,6 +95,62 @@ struct SimplexVerificationMaterialArgs {
     config: PathBuf,
 }
 
+/// Transaction mix the generated spammer runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerWorkload {
+    #[default]
+    Public,
+    Private,
+}
+
+impl SpammerWorkload {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// Proof mode for the generated spammer's private transfers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
+impl SpammerProofMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct GenerateArgs {
     /// Number of primary (voting) validators.
@@ -136,13 +196,28 @@ pub(crate) struct GenerateArgs {
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+    /// Maximum decoded consensus shard payload bytes accepted from peers.
+    ///
+    /// Defaults to a bound derived from `--max-propose-bytes` and the
+    /// validator count: blocks split into `floor((validators - 1) / 3) + 1`
+    /// data shards, so small clusters produce much larger shards than large
+    /// ones. Explicit values below the derived bound are rejected — peers
+    /// would drop every shard of a full block and consensus would wedge.
+    #[arg(long = "max-shard-bytes")]
+    max_shard_bytes: Option<usize>,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
     spammer: bool,
-    /// Number of spam accounts per relayer submitter.
-    #[arg(long, default_value_t = 10)]
-    spammer_accounts: u32,
+    /// Number of spam accounts.
+    ///
+    /// Public workload: accounts per relayer submitter (defaults to 10).
+    /// Private workload: total source accounts shared by all lanes. Left
+    /// unset it is derived as 2x the in-flight transaction count; explicit
+    /// values too small to fill every lane's batch are rejected rather than
+    /// silently shrinking batches.
+    #[arg(long)]
+    spammer_accounts: Option<u32>,
     /// Transfer value per spam transaction.
     #[arg(long, default_value_t = 1)]
     spammer_value: u64,
@@ -161,6 +236,34 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Transaction mix the spammer generates.
+    #[arg(long, value_enum, default_value_t = SpammerWorkload::Public)]
+    spammer_workload: SpammerWorkload,
+    /// Proof mode for the spammer's private transfers.
+    #[arg(long, value_enum, default_value_t = SpammerProofMode::Real)]
+    spammer_private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch (private workload only).
+    #[arg(long)]
+    spammer_private_batch: Option<usize>,
+    /// Concurrent private lanes per primary validator.
+    ///
+    /// The deployer multiplies this by `--validators` before writing the
+    /// spammer config so private workload pressure scales with cluster size.
+    #[arg(long)]
+    spammer_private_lanes: Option<usize>,
+    /// Target private transactions in flight across the whole cluster
+    /// (private workload only).
+    ///
+    /// Each lane keeps one batch in flight and pins one leader, so a lane
+    /// lands one batch per leader rotation: sustained TPS is roughly this
+    /// target divided by the rotation period (validators x view time; ~4s at
+    /// 50 validators and ~80ms views). Any of `--spammer-private-lanes`,
+    /// `--spammer-private-batch`, and `--spammer-accounts` left unset are
+    /// derived to satisfy the target; explicit values are respected and
+    /// validated against it instead. The resolved plan is logged at generate
+    /// time.
+    #[arg(long)]
+    spammer_target_inflight: Option<usize>,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]
@@ -209,8 +312,10 @@ pub(crate) struct RemoteArgs {
     /// AWS regions to spread validators across (comma-separated).
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
-    /// EC2 instance type for validators.
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for validators, relayer, indexers, and
+    /// spammer. Defaults to a Graviton4 type to match the `neoverse-v2` graviton
+    /// build; do not use Graviton3 (c7g) — those binaries fault on startup.
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     instance_type: String,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
@@ -233,8 +338,8 @@ pub(crate) struct RemoteArgs {
     /// Provisioned IOPS for the shared chain-indexer io2 volume.
     #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
     chain_indexer_storage_iops: i32,
-    /// EC2 instance type for the monitoring instance.
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for the monitoring host (Grafana/Prometheus).
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     monitoring_instance_type: String,
     /// Monitoring instance EBS volume size in GiB.
     #[arg(long)]
@@ -313,6 +418,26 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Transaction mix to submit.
+    #[serde(default)]
+    pub workload: SpammerWorkload,
+    /// Proof mode for private transfers.
+    #[serde(default)]
+    pub private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch.
+    #[serde(default = "default_spammer_private_batch")]
+    pub private_batch: usize,
+    /// Concurrent private lanes.
+    #[serde(default = "default_spammer_private_lanes")]
+    pub private_lanes: usize,
+}
+
+const fn default_spammer_private_batch() -> usize {
+    64
+}
+
+const fn default_spammer_private_lanes() -> usize {
+    8
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -397,6 +522,7 @@ pub(crate) struct ValidatorConfig {
     /// Maximum bytes proposed per block.
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
+    max_shard_bytes: usize,
     max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     state_page_cache_bytes: usize,
@@ -616,6 +742,224 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
+    // Trigger the spammer sizing assertions before any files are written.
+    let _ = resolve_spammer_plan(args);
+    if let Some(max_shard_bytes) = args.max_shard_bytes {
+        let bound = derived_shard_bound(args.max_propose_bytes, args.validators);
+        assert!(
+            max_shard_bytes >= bound,
+            "--max-shard-bytes {max_shard_bytes} cannot carry a full \
+             --max-propose-bytes {} block: {} validators split blocks into \
+             {} data shards, so peers need to accept shards up to {bound} \
+             bytes (raise --max-shard-bytes or lower --max-propose-bytes)",
+            args.max_propose_bytes,
+            args.validators,
+            (args.validators.saturating_sub(1) as usize) / 3 + 1,
+        );
+    }
+}
+
+/// Conservative encoded size of one private transaction on the zkpari
+/// backend. Points ride the wire uncompressed (64 B G1): a transfer is a
+/// 64 B output commitment + 320 B transfer proof (two range proofs of
+/// 2 G1 + 1 Fr each) plus key/nonce/signature = 523 B, measured at 526 B/tx
+/// in finalized blocks. Deliberately not the compile-time
+/// `Transaction::MAX_SIZE`: the deploy binary builds against the mock
+/// backend, which would understate what a zkpari cluster sees.
+const PRIVATE_TX_BYTES: usize = 576;
+
+/// Source accounts provisioned per in-flight transaction slot when
+/// `--spammer-accounts` is derived. Lanes skip exhausted or mid-retry sources
+/// when filling a batch, so they need spare accounts to keep batches full.
+const PRIVATE_ACCOUNTS_HEADROOM: u32 = 2;
+
+/// Spam accounts per relayer submitter when `--spammer-accounts` is unset
+/// (public workload).
+const DEFAULT_SPAMMER_ACCOUNTS: u32 = 10;
+
+/// Resolved spammer sizing shared by the local and remote generators.
+pub(crate) struct SpammerPlan {
+    /// Total spam accounts (public: per submitter; private: shared by lanes).
+    pub accounts: u32,
+    /// Private operations per submitted batch.
+    pub private_batch: usize,
+    /// Total private lanes across the cluster (per-validator lanes summed).
+    pub total_private_lanes: usize,
+    /// Private transactions in flight once every lane has a batch out.
+    pub inflight: usize,
+}
+
+/// Resolves the spammer sizing knobs, deriving whatever the operator left
+/// unset and rejecting combinations that would silently degrade (the
+/// `--max-shard-bytes` philosophy: impossible explicit values are errors).
+///
+/// The private workload keeps one batch per lane in flight and fills each
+/// batch with at most one operation per source account, so the knobs are
+/// coupled: `validators x lanes x batch` is the in-flight count and accounts
+/// must cover it. `--spammer-target-inflight` states the in-flight count
+/// directly and lets this function do the division.
+pub(crate) fn resolve_spammer_plan(args: &GenerateArgs) -> SpammerPlan {
+    let validators = usize::try_from(args.validators).expect("validator count fits usize");
+    assert!(validators > 0, "--validators must be > 0");
+    let lanes_and_batch = |lanes: usize, batch: usize| {
+        assert!(lanes > 0, "--spammer-private-lanes must be > 0");
+        assert!(batch > 0, "--spammer-private-batch must be > 0");
+        (lanes, batch)
+    };
+
+    if !matches!(args.spammer_workload, SpammerWorkload::Private) {
+        assert!(
+            args.spammer_target_inflight.is_none(),
+            "--spammer-target-inflight only applies to --spammer-workload private"
+        );
+        let (lanes, batch) = lanes_and_batch(
+            args.spammer_private_lanes
+                .unwrap_or_else(default_spammer_private_lanes),
+            args.spammer_private_batch
+                .unwrap_or_else(default_spammer_private_batch),
+        );
+        return SpammerPlan {
+            accounts: args.spammer_accounts.unwrap_or(DEFAULT_SPAMMER_ACCOUNTS),
+            private_batch: batch,
+            total_private_lanes: lanes
+                .checked_mul(validators)
+                .expect("--spammer-private-lanes * --validators must fit usize"),
+            inflight: 0,
+        };
+    }
+
+    let (lanes, batch) = match (
+        args.spammer_private_lanes,
+        args.spammer_private_batch,
+        args.spammer_target_inflight,
+    ) {
+        (Some(lanes), Some(batch), Some(target)) => {
+            let (lanes, batch) = lanes_and_batch(lanes, batch);
+            let capacity = validators
+                .checked_mul(lanes)
+                .and_then(|lanes| lanes.checked_mul(batch))
+                .expect("in-flight capacity fits usize");
+            assert!(
+                capacity >= target,
+                "--spammer-private-lanes {lanes} x --spammer-private-batch {batch} \
+                 across {validators} validators holds only {capacity} transactions \
+                 in flight, below --spammer-target-inflight {target}; raise one of \
+                 them or leave one unset to derive it"
+            );
+            (lanes, batch)
+        }
+        (Some(lanes), None, Some(target)) => {
+            let (lanes, _) = lanes_and_batch(lanes, 1);
+            (lanes, target.div_ceil(validators * lanes).max(1))
+        }
+        (None, Some(batch), Some(target)) => {
+            let (_, batch) = lanes_and_batch(1, batch);
+            (target.div_ceil(validators * batch).max(1), batch)
+        }
+        (None, None, Some(target)) => {
+            // Split the target at the default batch size, then tighten the
+            // batch so the overshoot stays below one batch per lane.
+            let batch = default_spammer_private_batch();
+            let lanes = target.div_ceil(validators * batch).max(1);
+            (lanes, target.div_ceil(validators * lanes).max(1))
+        }
+        (lanes, batch, None) => lanes_and_batch(
+            lanes.unwrap_or_else(default_spammer_private_lanes),
+            batch.unwrap_or_else(default_spammer_private_batch),
+        ),
+    };
+
+    let total_private_lanes = validators
+        .checked_mul(lanes)
+        .expect("--spammer-private-lanes * --validators must fit usize");
+    let inflight = total_private_lanes
+        .checked_mul(batch)
+        .expect("in-flight transaction count fits usize");
+
+    // One batch is also one relayer submission, which leaders bound by
+    // `--max-propose-bytes`.
+    let batch_bytes = batch
+        .checked_mul(PRIVATE_TX_BYTES)
+        .expect("batch byte size fits usize");
+    assert!(
+        batch_bytes <= args.max_propose_bytes,
+        "--spammer-private-batch {batch} encodes to ~{batch_bytes} bytes per \
+         submission, above --max-propose-bytes {}; lower the batch or raise \
+         the propose limit",
+        args.max_propose_bytes,
+    );
+
+    // Each in-flight transaction occupies its own source account (a batch
+    // takes at most one operation per source).
+    let floor = u32::try_from(inflight).expect("in-flight transaction count fits u32");
+    let accounts = args.spammer_accounts.map_or_else(
+        || {
+            floor
+                .checked_mul(PRIVATE_ACCOUNTS_HEADROOM)
+                .expect("derived --spammer-accounts fits u32")
+        },
+        |accounts| {
+            assert!(
+                accounts >= floor,
+                "--spammer-accounts {accounts} cannot fill {total_private_lanes} \
+                 lanes x {batch}-transaction batches: each in-flight transaction \
+                 needs its own source account ({floor} minimum, {} recommended); \
+                 raise --spammer-accounts or leave it unset to derive it",
+                floor.saturating_mul(PRIVATE_ACCOUNTS_HEADROOM),
+            );
+            accounts
+        },
+    );
+
+    SpammerPlan {
+        accounts,
+        private_batch: batch,
+        total_private_lanes,
+        inflight,
+    }
+}
+
+/// Logs the resolved private-workload sizing so derived values are
+/// inspectable rather than implicit. No-op for the public workload.
+pub(crate) fn log_spammer_plan(args: &GenerateArgs) {
+    if !args.spammer || !matches!(args.spammer_workload, SpammerWorkload::Private) {
+        return;
+    }
+    let plan = resolve_spammer_plan(args);
+
+    // Runway: each source clears ~balance/value transfers plus one fund and
+    // one rollover before it is exhausted. Mirrors the primitives crate's
+    // DEFAULT_ACCOUNT_BALANCE (not imported to keep deploy off the privacy
+    // backend dependency tree).
+    const ACCOUNT_BALANCE: u64 = 1_000;
+    let ops_per_account = ACCOUNT_BALANCE / args.spammer_value.max(1) + 2;
+    let total_ops = u64::from(plan.accounts).saturating_mul(ops_per_account);
+    // Assumes TPS ~= the in-flight count (a ~1s effective round-trip). Pinned
+    // lanes on large clusters cycle once per leader rotation, which is
+    // slower, so this is a floor on the actual runway.
+    let est_runway_minutes = total_ops / (plan.inflight.max(1) as u64) / 60;
+
+    tracing::info!(
+        total_lanes = plan.total_private_lanes,
+        batch = plan.private_batch,
+        inflight = plan.inflight,
+        accounts = plan.accounts,
+        est_runway_minutes,
+        "private spammer plan (sustained TPS ~= inflight / leader rotation seconds)"
+    );
+
+    // Lanes pin distinct leaders, so each leader's mempool sees roughly its
+    // own lanes' share of the in-flight bytes.
+    let validators = args.validators.max(1) as usize;
+    let per_leader_bytes = plan.inflight / validators * PRIVATE_TX_BYTES;
+    if per_leader_bytes > args.max_pool_bytes {
+        tracing::warn!(
+            per_leader_bytes,
+            max_pool_bytes = args.max_pool_bytes,
+            "in-flight private transactions may exceed each leader's mempool; \
+             raise --max-pool-bytes or lower --spammer-target-inflight"
+        );
+    }
 }
 
 pub(crate) fn generate_local_cluster_material(
@@ -727,6 +1071,29 @@ pub(crate) fn default_bootstrappers(
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
+}
+
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    1024 * 1024
+}
+
+/// Largest shard a full proposal can produce for this cluster size, with
+/// 25% headroom for chunk proofs and framing.
+///
+/// Mirrors the marshal's coding config: blocks split into
+/// `max_faults + 1 = floor((validators - 1) / 3) + 1` data shards.
+pub(crate) const fn derived_shard_bound(max_propose_bytes: usize, validators: u32) -> usize {
+    let minimum_shards = (validators.saturating_sub(1) as usize) / 3 + 1;
+    (max_propose_bytes.div_ceil(minimum_shards)) * 5 / 4
+}
+
+/// The shard limit written to node configs: the explicit `--max-shard-bytes`
+/// when given, otherwise the derived bound (but never below the historical
+/// 1 MiB default, which large clusters already run with).
+pub(crate) fn resolved_max_shard_bytes(args: &GenerateArgs) -> usize {
+    args.max_shard_bytes.unwrap_or_else(|| {
+        derived_shard_bound(args.max_propose_bytes, args.validators).max(default_max_shard_bytes())
+    })
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -876,6 +1243,226 @@ mod tests {
         .expect_err("sampling rate above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn parses_max_propose_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-propose-bytes",
+            "1150000",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_propose_bytes, 1_150_000);
+    }
+
+    #[test]
+    fn parses_max_shard_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-shard-bytes",
+            "2097152",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_shard_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn derives_shard_bound_from_cluster_size() {
+        // 4 validators -> 2 data shards: an 8 MiB block needs ~5 MiB shards.
+        assert_eq!(
+            super::derived_shard_bound(8 * 1024 * 1024, 4),
+            8 * 1024 * 1024 / 2 * 5 / 4
+        );
+        // 50 validators -> 17 data shards: well under the 1 MiB floor.
+        assert!(super::derived_shard_bound(8 * 1024 * 1024, 50) < super::default_max_shard_bytes());
+    }
+
+    #[test]
+    fn derived_shard_limit_never_drops_below_historical_default() {
+        let mut args = generate_args_for_bounds(50);
+        args.max_shard_bytes = None;
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::default_max_shard_bytes()
+        );
+
+        let args = generate_args_for_bounds(4);
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::derived_shard_bound(args.max_propose_bytes, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot carry a full")]
+    fn rejects_shard_limit_too_small_for_full_blocks() {
+        let mut args = generate_args_for_bounds(4);
+        // The historical 1 MiB default cannot carry 8 MiB blocks at 4
+        // validators; explicit values must fail at generate time instead of
+        // wedging consensus at the first full block.
+        args.max_shard_bytes = Some(super::default_max_shard_bytes());
+        super::validate_generate_args(&args);
+    }
+
+    fn generate_args_for_bounds(validators: u32) -> super::GenerateArgs {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            &validators.to_string(),
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        *generate
+    }
+
+    fn private_plan_args(validators: u32, extra: &[&str]) -> super::GenerateArgs {
+        let validators = validators.to_string();
+        let mut argv = vec![
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            &validators,
+            "--output-dir",
+            "out",
+            "--relayer",
+            "--spammer",
+            "--spammer-workload",
+            "private",
+        ];
+        argv.extend_from_slice(extra);
+        argv.push("local");
+        let cli = Cli::try_parse_from(argv).expect("private invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        *generate
+    }
+
+    #[test]
+    fn target_inflight_derives_lanes_batch_and_accounts() {
+        let args = private_plan_args(50, &["--spammer-target-inflight", "50000"]);
+        let plan = super::resolve_spammer_plan(&args);
+
+        // The plan must meet the target, overshooting by less than one
+        // transaction per lane.
+        assert!(plan.inflight >= 50_000);
+        assert!(plan.inflight - 50_000 < plan.total_private_lanes);
+        // Derived batches never exceed the default batch size.
+        assert!(plan.private_batch <= 64);
+        // Lanes stay a whole multiple of the validator count.
+        assert_eq!(plan.total_private_lanes % 50, 0);
+        // Accounts cover every in-flight slot with headroom.
+        assert_eq!(plan.accounts as usize, plan.inflight * 2);
+    }
+
+    #[test]
+    fn target_inflight_respects_explicit_lanes() {
+        let args = private_plan_args(
+            50,
+            &[
+                "--spammer-target-inflight",
+                "50000",
+                "--spammer-private-lanes",
+                "10",
+            ],
+        );
+        let plan = super::resolve_spammer_plan(&args);
+
+        assert_eq!(plan.total_private_lanes, 500);
+        assert_eq!(plan.private_batch, 100);
+        assert_eq!(plan.inflight, 50_000);
+    }
+
+    #[test]
+    fn private_defaults_hold_without_target() {
+        let args = private_plan_args(2, &[]);
+        let plan = super::resolve_spammer_plan(&args);
+
+        assert_eq!(plan.total_private_lanes, 16);
+        assert_eq!(plan.private_batch, 64);
+        assert_eq!(plan.inflight, 1024);
+        assert_eq!(plan.accounts, 2048);
+    }
+
+    #[test]
+    fn public_workload_keeps_legacy_defaults() {
+        let args = generate_args_for_bounds(4);
+        let plan = super::resolve_spammer_plan(&args);
+
+        assert_eq!(plan.accounts, 10);
+        assert_eq!(plan.private_batch, 64);
+        assert_eq!(plan.total_private_lanes, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "only applies to --spammer-workload private")]
+    fn rejects_target_inflight_for_public_workload() {
+        let mut args = generate_args_for_bounds(4);
+        args.spammer_target_inflight = Some(1000);
+        super::resolve_spammer_plan(&args);
+    }
+
+    #[test]
+    #[should_panic(expected = "needs its own source account")]
+    fn rejects_accounts_below_lane_capacity() {
+        // 2 validators x 8 lanes x 64 batch = 1024 in-flight slots; 100
+        // accounts used to silently shrink batches, now it fails.
+        let args = private_plan_args(2, &["--spammer-accounts", "100"]);
+        super::resolve_spammer_plan(&args);
+    }
+
+    #[test]
+    #[should_panic(expected = "below --spammer-target-inflight")]
+    fn rejects_explicit_sizing_below_target() {
+        let args = private_plan_args(
+            2,
+            &[
+                "--spammer-target-inflight",
+                "1000",
+                "--spammer-private-lanes",
+                "1",
+                "--spammer-private-batch",
+                "1",
+            ],
+        );
+        super::resolve_spammer_plan(&args);
+    }
+
+    #[test]
+    #[should_panic(expected = "above --max-propose-bytes")]
+    fn rejects_batch_larger_than_a_proposal() {
+        // 20000 txs x 512 B > the default 8 MiB propose/submission limit.
+        let args = private_plan_args(1, &["--spammer-private-batch", "20000"]);
+        super::resolve_spammer_plan(&args);
     }
 
     #[test]

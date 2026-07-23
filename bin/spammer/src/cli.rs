@@ -1,5 +1,6 @@
 //! CLI definition.
 
+pub use crate::config::{PrivateProofMode, Workload};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Parser)]
@@ -60,6 +61,28 @@ pub struct Cli {
     /// batch. Must be in `0..=1`.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
+
+    /// Transaction mix to generate.
+    #[arg(long, value_enum, default_value_t = Workload::Public)]
+    pub workload: Workload,
+
+    /// Proof mode for private transfers (only used when `--workload private`).
+    #[arg(long, value_enum, default_value_t = PrivateProofMode::Real)]
+    pub private_proof_mode: PrivateProofMode,
+
+    /// Number of private operations per submitted batch (only used when
+    /// `--workload private`).
+    #[arg(long, default_value_t = 64)]
+    pub private_batch: usize,
+
+    /// Number of concurrent private lanes (only used when `--workload private`).
+    ///
+    /// Each lane drives a disjoint slice of accounts and keeps one batch in
+    /// flight, so more lanes mean more batches finalizing per block. A single
+    /// lane lands one batch per finalization round-trip, leaving intervening
+    /// blocks empty.
+    #[arg(long, default_value_t = 8)]
+    pub private_lanes: usize,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
@@ -165,6 +188,39 @@ mod tests {
         .expect_err("jitter above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn defaults_to_public_workload() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.workload, super::Workload::Public);
+        assert_eq!(cli.private_proof_mode, super::PrivateProofMode::Real);
+    }
+
+    #[test]
+    fn parses_private_workload_flags() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--workload",
+            "private",
+            "--private-proof-mode",
+            "simulated",
+            "--private-batch",
+            "32",
+        ])
+        .expect("private invocation should parse");
+
+        assert_eq!(cli.workload, super::Workload::Private);
+        assert_eq!(cli.private_proof_mode, super::PrivateProofMode::Simulated);
+        assert_eq!(cli.private_batch, 32);
     }
 
     #[test]

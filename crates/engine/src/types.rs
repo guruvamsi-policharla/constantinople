@@ -28,7 +28,7 @@ use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
+use constantinople_primitives::{AccountKey, Block, Header, Sealed, StateAccount};
 use std::{marker::PhantomData, sync::Arc};
 
 /// A finalized block with its seal (commitment-based).
@@ -96,7 +96,7 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
+pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, StateAccount, H, EightCap, T>;
 
 pub type StateSyncDb<E, H, T> = Arc<TracedAsyncRwLock<StateDb<E, H, T>>>;
 

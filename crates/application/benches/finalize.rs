@@ -24,7 +24,7 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize};
 use constantinople_application::{
     consensus::{self, Databases},
-    executor::PreparedTransfer,
+    executor::PreparedOperation,
 };
 use constantinople_primitives::{Account, AccountKey, Nonce};
 use core::num::NonZeroUsize;
@@ -83,19 +83,12 @@ fn transaction_config(strategy: Rayon, cache: &CacheRef) -> keyless_fixed::Compa
     }
 }
 
-fn transfers() -> Vec<PreparedTransfer> {
+fn transfers() -> Vec<PreparedOperation> {
     (0..TXS)
         .map(|i| {
             let sender = key(i as u64);
             let recipient = key(TXS as u64 + i as u64);
-            PreparedTransfer {
-                sender,
-                recipient,
-                sender_prefix: sender.prefix(),
-                recipient_prefix: recipient.prefix(),
-                value: 1,
-                nonce: 0,
-            }
+            PreparedOperation::public_transfer(sender, recipient, 1, 0)
         })
         .collect()
 }
@@ -122,6 +115,7 @@ fn main() {
                     Some(Account {
                         balance: 1_000_000,
                         nonce: Nonce::default(),
+                        private: Default::default(),
                     }),
                 );
             }

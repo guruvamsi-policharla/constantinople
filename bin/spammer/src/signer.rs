@@ -4,12 +4,32 @@ use crate::accounts::SpamAccount;
 use commonware_cryptography::{Sha256, ed25519};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    SignedTransaction, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+    AccountKey, Payload, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+    TransactionPublicKey,
 };
 use core::num::NonZeroU64;
 
 /// Concrete signed transaction type.
 pub type Tx = SignedTransaction<Sha256>;
+
+/// Derives the account key for a spam account's public key.
+pub fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
+    AccountKey::from_public_key(&TransactionPublicKey::ed25519(public_key.clone()))
+}
+
+/// Signs an arbitrary payload for a single sender.
+pub fn sign_payload(sender: &SpamAccount, payload: Payload, nonce: u64) -> Tx {
+    let tx = Transaction::from_payload(
+        TransactionPublicKey::ed25519(sender.public_key.clone()),
+        payload,
+        nonce,
+    );
+    tx.seal_and_sign(
+        &sender.private_key,
+        TRANSACTION_NAMESPACE,
+        &mut Sha256::default(),
+    )
+}
 
 /// Signs one transaction for a single sender in the ring.
 fn sign_one(
@@ -138,7 +158,7 @@ mod tests {
                 .map(constantinople_primitives::LazySignedTransaction::new)
                 .collect();
             assert!(
-                verify_transaction_batch::<Sha256, _>(
+                verify_transaction_batch::<Sha256, _, _>(
                     TRANSACTION_NAMESPACE,
                     &mut commonware_utils::test_rng(),
                     &cache,
