@@ -31,7 +31,6 @@ use tracing::debug;
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
-const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
 const PINNED_SUBMIT_RETRIES: usize = 3;
 
 /// Maximum batches admitted to CPU decoding concurrently.
@@ -244,9 +243,6 @@ async fn submit_transactions<St: Strategy>(
     if let Some(target) = requested_target_leader(&headers) {
         if body.len() > max_request_bytes(state.max_batch_bytes) {
             return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
-        }
-        if requested_leader_fanout(&headers).is_some_and(|fanout| fanout != 1) {
-            return (StatusCode::BAD_REQUEST, String::new());
         }
         return submit_to_pinned_leader(&state, body, &target).await;
     }
@@ -758,15 +754,6 @@ fn requested_target_leader(headers: &HeaderMap) -> Option<String> {
     )
 }
 
-fn requested_leader_fanout(headers: &HeaderMap) -> Option<usize> {
-    headers
-        .get(LEADER_FANOUT_HEADER)?
-        .to_str()
-        .ok()?
-        .parse::<usize>()
-        .ok()
-}
-
 fn normalize_leaders(leaders: Vec<RelayerLeaderConfig>) -> Vec<Leader> {
     let mut leaders = leaders
         .into_iter()
@@ -899,7 +886,6 @@ mod tests {
     fn pinned_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(TARGET_LEADER_HEADER, HeaderValue::from_static("00"));
-        headers.insert(LEADER_FANOUT_HEADER, HeaderValue::from_static("1"));
         headers
     }
 
