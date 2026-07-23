@@ -45,6 +45,9 @@ reqwest.workspace = true
 # Generate transfer proofs with the simulator trapdoor instead of real proving.
 # Requires the simulator backend in constantinople-primitives.
 privacy-backend-simulator = ["constantinople-primitives/privacy-backend-simulator"]
+# Run on the ZK-Pari BN254 backend (must match the cluster's backend; see the
+# feature-matrix notes in constantinople-primitives).
+privacy-backend-zkpari = ["constantinople-primitives/privacy-backend-zkpari"]
 
 [[bin]]
 name = "constantinople-spammer"
