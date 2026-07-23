@@ -5,10 +5,7 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{
-    ChainPrivatePaymentBackend, LazySignedTransaction, PrivatePaymentBackend, Sealable, Sealed,
-    SignedTransaction,
-};
+use crate::{LazySignedTransaction, Sealable, Sealed, SignedTransaction};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
@@ -168,12 +165,11 @@ impl Default for BlockCfg {
 
 /// A block containing signed transactions and required epoch-consensus metadata.
 #[derive(Debug, Clone)]
-pub struct Block<C, P, H, B = ChainPrivatePaymentBackend>
+pub struct Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
@@ -183,24 +179,23 @@ where
     /// decoding does not pay the per-transaction decode + seal-hash cost on the
     /// caller's thread. Materialization is typically driven in parallel at
     /// verify time via a [`commonware_parallel::Strategy`].
-    pub body: Vec<LazySignedTransaction<H, B>>,
+    pub body: Vec<LazySignedTransaction<H>>,
 }
 
 /// A sealed canonical block.
-pub type SealedBlock<C, P, H, B = ChainPrivatePaymentBackend> = Sealed<Block<C, P, H, B>, H>;
+pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
 
 #[cfg(any(feature = "arbitrary", test))]
-impl<C, P, H, B> arbitrary::Arbitrary<'_> for Block<C, P, H, B>
+impl<C, P, H> arbitrary::Arbitrary<'_> for Block<C, P, H>
 where
     C: Digest + for<'a> arbitrary::Arbitrary<'a>,
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
     H: Hasher,
-    B: PrivatePaymentBackend,
     H::Digest: for<'a> arbitrary::Arbitrary<'a>,
-    SignedTransaction<H, B>: for<'a> arbitrary::Arbitrary<'a>,
+    SignedTransaction<H>: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let body: Vec<SignedTransaction<H, B>> = u.arbitrary()?;
+        let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
             body: body.into_iter().map(LazySignedTransaction::new).collect(),
@@ -208,37 +203,34 @@ where
     }
 }
 
-impl<C, P, H, B> PartialEq for Block<C, P, H, B>
+impl<C, P, H> PartialEq for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     fn eq(&self, other: &Self) -> bool {
         self.header == other.header && self.body == other.body
     }
 }
 
-impl<C, P, H, B> Eq for Block<C, P, H, B>
+impl<C, P, H> Eq for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey + Eq,
     H: Hasher,
-    B: PrivatePaymentBackend,
     H::Digest: Eq,
 {
 }
 
-impl<C, P, H, B> Block<C, P, H, B>
+impl<C, P, H> Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     /// Creates a new block from already-decoded transactions.
-    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H, B>>) -> Self {
+    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
             body: body.into_iter().map(LazySignedTransaction::new).collect(),
@@ -246,24 +238,22 @@ where
     }
 }
 
-impl<C, P, H, B> EncodeSize for Block<C, P, H, B>
+impl<C, P, H> EncodeSize for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     fn encode_size(&self) -> usize {
         self.header.encode_size() + self.body.encode_size()
     }
 }
 
-impl<C, P, H, B> Write for Block<C, P, H, B>
+impl<C, P, H> Write for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
@@ -271,12 +261,11 @@ where
     }
 }
 
-impl<C, P, H, B> Read for Block<C, P, H, B>
+impl<C, P, H> Read for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     type Cfg = BlockCfg;
 
@@ -289,12 +278,11 @@ where
     }
 }
 
-impl<C, P, H, B> Sealable for Block<C, P, H, B>
+impl<C, P, H> Sealable for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     type SealDigest = H::Digest;
 
@@ -308,12 +296,11 @@ where
     }
 }
 
-impl<C, P, H, B> Heightable for Sealed<Block<C, P, H, B>, H>
+impl<C, P, H> Heightable for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     fn height(&self) -> Height {
         Height::new(self.header.height)
@@ -331,12 +318,11 @@ where
     }
 }
 
-impl<C, P, H, B> ConsensusBlock for Sealed<Block<C, P, H, B>, H>
+impl<C, P, H> ConsensusBlock for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     fn parent(&self) -> Self::Digest {
         self.header.parent
@@ -354,12 +340,11 @@ where
     }
 }
 
-impl<C, P, H, B> CertifiableBlock for Sealed<Block<C, P, H, B>, H>
+impl<C, P, H> CertifiableBlock for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    B: PrivatePaymentBackend,
 {
     type Context = Context<C, P>;
 

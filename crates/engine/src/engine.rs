@@ -20,7 +20,6 @@ use commonware_consensus::{
         coding::{Marshaled, MarshaledConfig, shards, types::coding_config_for_participants},
         core::{Actor as MarshalActor, Variant as MarshalVariant},
         resolver::p2p as marshal_resolver,
-        store::{Blocks, Certificates},
     },
     simplex::{
         self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
@@ -39,6 +38,7 @@ use commonware_glue::stateful::{
     Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
+use commonware_macros::boxed;
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
@@ -46,7 +46,7 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
-    archive::{Identifier as ArchiveIdentifier, prunable, prunable::Archive as PrunableArchive},
+    archive::{prunable, prunable::Archive as PrunableArchive},
     journal::contiguous::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
@@ -60,9 +60,9 @@ use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::BlockCfg;
+use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
-use rand_core::CryptoRngCore;
+use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
     time::{Duration, Instant},
@@ -75,12 +75,10 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
-const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
@@ -88,6 +86,7 @@ const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
+const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
@@ -138,25 +137,25 @@ where
     pub transaction_resolver: (S, R),
 }
 
-/// Engine initialization parameters.
+/// Requested engine startup behavior.
 ///
-/// `O` is the type of an optional simplex activity observer (e.g. the
-/// indexer's certificate publisher). Pass `None::<NoopActivityReporter<P, V>>`
-/// when no external observer is wired in.
-pub enum StartupMode<F> {
+/// The engine resolves this request against its durable [`SyncPlan`]. A state-sync
+/// request only probes for a floor when the plan determines state sync is needed.
+pub enum StartupMode {
+    /// Recover consensus and application state from local storage.
     MarshalSync,
-    StateSync { finalization: F },
+    /// Request state sync from peers when required by the durable sync plan.
+    StateSync,
 }
 
-pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
+pub struct Config<E, C, M, B, V, St, I, H, O>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     H: Hasher,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
@@ -168,14 +167,27 @@ where
     pub share: Option<group::Share>,
     pub input: I,
     pub partition_prefix: String,
-    pub signature_strategy: SigT,
-    pub hash_strategy: HashT,
-    pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
+    pub strategy: St,
+    pub public_key_cache: PublicKeyCache,
+    pub startup: StartupMode,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
+    pub prunable_items_per_section: NonZero<u64>,
+    /// Capacity in bytes of the state QMDB page cache.
+    ///
+    /// Must hold the state journal's working set: 512 MiB thrashed once the
+    /// live account set passed ~2M (build/verify doubled on ~200k journal
+    /// cache misses/s/node).
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the page cache for everything else (block and
+    /// certificate archives, transaction history, simplex journal). Separate
+    /// from the state cache so backfill and replay scans cannot evict its
+    /// working set.
+    pub other_page_cache_bytes: usize,
+    pub shard_codec: CodecConfig,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -184,21 +196,20 @@ where
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, HashT>>,
+    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, St>>,
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, SigT, HashT, I, BV, O>
+pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
@@ -207,11 +218,11 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, HashT>,
-    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, HashT>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
-    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, HashT>,
+    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
+    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, St>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
+    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     #[expect(
         clippy::type_complexity,
@@ -229,28 +240,27 @@ where
         >,
         PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
         FixedEpocher,
-        HashT,
+        St,
     >,
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
-    #[expect(
-        clippy::type_complexity,
-        reason = "simplex actor type is inherently complex"
-    )]
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, SigT, HashT, I, BV, O>,
+    #[cfg(all(test, feature = "test-utils"))]
+    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V>>,
+    #[cfg(all(test, feature = "test-utils"))]
+    genesis_commitment: Commitment,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
 }
 
-impl<E, C, M, B, H, V, L, SigT, HashT, I, BV, O> Engine<E, C, M, B, H, V, L, SigT, HashT, I, BV, O>
+impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
@@ -260,9 +270,19 @@ where
         self.marshal_mailbox.clone()
     }
 
+    #[cfg(all(test, feature = "test-utils"))]
+    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V>> {
+        self.startup_sync_floor.clone()
+    }
+
+    #[cfg(all(test, feature = "test-utils"))]
+    pub(crate) const fn genesis_commitment(&self) -> Commitment {
+        self.genesis_commitment
+    }
+
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, HashT> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, St> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -274,22 +294,25 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H, HashT>> + Send + 'static {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, St>> + Send + 'static {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
 
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<E, C, M, B, V, SigT, HashT, I, H, O>) -> Self {
+    #[boxed]
+    pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            NonZero::new(config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("page cache must hold at least one page"),
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            NonZero::new(config.state_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
@@ -299,7 +322,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
+            StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
                 qmdb_resolver::standard::Config {
                     peer_provider: config.manager.clone(),
@@ -316,7 +339,7 @@ where
                 },
             );
         let (transaction_resolver, transaction_sync_resolver) =
-            TransactionResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
+            TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
                 qmdb_resolver::compact::Config {
                     peer_provider: config.manager.clone(),
@@ -341,32 +364,26 @@ where
             coding_config,
         ));
 
+        let prunable_items_per_section = config.prunable_items_per_section;
         let (finalizations_by_height, finalized_blocks) = futures::join!(
             init_finalizations_archive::<E, H, C::PublicKey, V>(
                 &context,
                 &page_cache,
                 &config.partition_prefix,
+                prunable_items_per_section,
             ),
             init_finalized_blocks_archive::<E, H, C::PublicKey>(
                 &context,
                 &page_cache,
                 &config.partition_prefix,
                 &config.block_codec,
+                prunable_items_per_section,
             ),
         );
-        let recovered_floor =
-            if let Some(height) = Certificates::last_index(&finalizations_by_height) {
-                finalizations_by_height
-                    .get(ArchiveIdentifier::Index(height.get()))
-                    .await
-                    .expect("failed to read recovered finalization floor")
-            } else {
-                None
-            };
         let transaction_db_config = transaction_db_config(
             &config.partition_prefix,
             &page_cache,
-            config.hash_strategy.clone(),
+            config.strategy.clone(),
         );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
@@ -376,81 +393,48 @@ where
                 stateful_partition_prefix.clone(),
             )
             .await;
-        let (genesis_state_target, genesis_transactions_target, marshal_start, simplex_floor) =
-            if let Some(finalization) = recovered_floor {
-                let block_digest =
-                    <EngineVariant<H, C::PublicKey> as MarshalVariant>::commitment_to_inner(
-                        finalization.proposal.payload,
-                    );
-                let stored_block = finalized_blocks
-                    .get(ArchiveIdentifier::Key(&block_digest))
-                    .await
-                    .expect("failed to read recovered finalization floor block")
-                    .expect("recovered finalization floor block must exist");
-                let floor_block = <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(
-                    stored_block.into(),
-                );
-                let (state_target, transaction_target) = block_targets(&floor_block);
 
-                (
-                    state_target,
-                    transaction_target,
-                    marshal::Start::Floor(finalization.clone()),
-                    SimplexFloor::Finalized(finalization),
-                )
-            } else {
-                let genesis_state_db = StateDb::<E, H, HashT>::init(
-                    context.child("genesis_state"),
-                    state_db_config(
-                        &config.partition_prefix,
-                        &storage_page_cache,
-                        config.hash_strategy.clone(),
-                    ),
-                )
+        // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
+        // stays floorless so marshal restores its acknowledged progress; only a requested or
+        // interrupted state sync discovers a new floor.
+        let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
+        if startup_plan.should_state_sync(state_sync_requested) {
+            let finalization = config
+                .probe
+                .as_ref()
+                .expect("state sync requires a probe mailbox")
+                .subscribe()
                 .await
-                .expect("state db must initialize for genesis target");
-                let genesis_state_target =
-                    <StateDb<E, H, HashT> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
-                let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
-                    context.child("genesis_transactions"),
-                    transaction_db_config.clone(),
-                )
-                .await
-                .expect("transaction history db must initialize for genesis target");
-                let genesis_transactions_target =
-                    <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
-                        &genesis_transaction_db,
-                    )
-                    .await;
-                let genesis_block =
-                    constantinople_application::consensus::genesis_block_with_parent(
-                        &mut H::default(),
-                        config.genesis_leader.clone(),
-                        (commonware_consensus::types::View::zero(), genesis_parent),
-                        0,
-                        genesis_state_target.clone(),
-                        genesis_transactions_target.clone(),
-                    );
-                let coded_block =
-                    EngineCodedBlock::new(genesis_block, coding_config, &config.hash_strategy);
-                let commitment = coded_block.commitment();
-                let simplex_floor = match &config.startup {
-                    StartupMode::StateSync { finalization } if startup_plan.may_state_sync() => {
-                        startup_plan = startup_plan.with_floor(finalization.clone());
-                        SimplexFloor::Finalized(finalization.clone())
-                    }
-                    StartupMode::MarshalSync | StartupMode::StateSync { .. } => {
-                        SimplexFloor::Genesis(commitment)
-                    }
-                };
+                .expect("probe actor exited before selecting a state-sync floor");
+            startup_plan = startup_plan.with_floor(finalization);
+        }
 
-                (
-                    genesis_state_target,
-                    genesis_transactions_target,
-                    startup_plan.marshal_start(coded_block),
-                    simplex_floor,
-                )
-            };
+        // The canonical genesis is a pure function of configuration: the leader, the
+        // participant-derived coding config, and the canonical empty-database roots.
+        let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
+            &mut H::default(),
+            config.genesis_leader.clone(),
+            (commonware_consensus::types::View::zero(), genesis_parent),
+            0,
+            <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+            <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+        );
+        let coded_genesis = EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
+        let application_genesis =
+            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
+        let (application_state_target, application_transactions_target) =
+            block_targets(&application_genesis);
+
+        #[cfg(all(test, feature = "test-utils"))]
+        let startup_sync_floor = startup_plan.floor().cloned();
+        // Simplex adopts the peer floor only for state sync. Otherwise it independently replays
+        // its journal from canonical genesis while marshal restores application progress.
+        let genesis_commitment = coded_genesis.commitment();
+        let simplex_floor = startup_plan.floor().map_or_else(
+            || SimplexFloor::Genesis(genesis_commitment),
+            |finalization| SimplexFloor::Finalized(finalization.clone()),
+        );
+        let marshal_start = startup_plan.marshal_start(coded_genesis);
 
         let (marshal, marshal_mailbox, _) = MarshalActor::init(
             context.child("marshal"),
@@ -463,7 +447,7 @@ where
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
                 view_retention_timeout: ACTIVITY_TIMEOUT,
-                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+                prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
                 key_write_buffer: WRITE_BUFFER,
@@ -471,7 +455,7 @@ where
                 block_codec_config: config.block_codec.clone(),
                 max_repair: MAX_REPAIR,
                 max_pending_acks: MAX_PENDING_ACKS,
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
             },
         )
         .await;
@@ -484,11 +468,9 @@ where
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
-                },
+                shard_codec_cfg: config.shard_codec.clone(),
                 block_codec_cfg: config.block_codec.clone(),
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
@@ -497,13 +479,13 @@ where
         );
         let application = Application::new(
             context.child("application"),
-            config.signature_strategy,
-            config.hash_strategy.clone(),
+            config.strategy.clone(),
             config.genesis_leader.clone(),
             genesis_parent,
             config.transaction_namespace,
-            genesis_state_target,
-            genesis_transactions_target,
+            config.public_key_cache,
+            application_state_target,
+            application_transactions_target,
             config.finalized_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::init(
@@ -514,7 +496,7 @@ where
                     state_db_config(
                         &config.partition_prefix,
                         &storage_page_cache,
-                        config.hash_strategy.clone(),
+                        config.strategy.clone(),
                     ),
                     transaction_db_config,
                 ),
@@ -535,7 +517,7 @@ where
                 marshal: marshal_mailbox.clone(),
                 shards: shard_mailbox.clone(),
                 scheme_provider: provider,
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
                 epocher,
             },
         );
@@ -560,7 +542,7 @@ where
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
-                strategy: config.hash_strategy,
+                strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
                 epoch: Epoch::zero(),
@@ -593,6 +575,10 @@ where
             marshal,
             #[cfg(all(test, feature = "test-utils"))]
             marshal_mailbox,
+            #[cfg(all(test, feature = "test-utils"))]
+            startup_sync_floor,
+            #[cfg(all(test, feature = "test-utils"))]
+            genesis_commitment,
             simplex,
         }
     }
@@ -715,9 +701,10 @@ async fn init_finalizations_archive<E, H, P, V>(
     context: &E,
     page_cache: &CacheRef,
     partition_prefix: &str,
+    items_per_section: NonZero<u64>,
 ) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -731,7 +718,7 @@ where
             key_page_cache: page_cache.clone(),
             value_partition: format!("{partition_prefix}-finalizations-by-height-value"),
             compression: FREEZER_VALUE_COMPRESSION,
-            items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+            items_per_section,
             codec_config: ThresholdScheme::<P, V>::certificate_codec_config_unbounded(),
             replay_buffer: REPLAY_BUFFER,
             key_write_buffer: WRITE_BUFFER,
@@ -749,9 +736,10 @@ async fn init_finalized_blocks_archive<E, H, P>(
     page_cache: &CacheRef,
     partition_prefix: &str,
     block_codec: &BlockCfg,
+    items_per_section: NonZero<u64>,
 ) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
 {
@@ -764,7 +752,7 @@ where
             key_page_cache: page_cache.clone(),
             value_partition: format!("{partition_prefix}-finalized-blocks-value"),
             compression: FREEZER_VALUE_COMPRESSION,
-            items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+            items_per_section,
             codec_config: block_codec.clone(),
             replay_buffer: REPLAY_BUFFER,
             key_write_buffer: WRITE_BUFFER,
@@ -801,6 +789,7 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
+        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
     }
 }
 

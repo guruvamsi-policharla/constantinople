@@ -4,6 +4,7 @@
 //! validators. It serves the account-state operation log under `/state` and
 //! transaction-hash history under `/transactions`.
 
+use ahash::AHashMap;
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use commonware_codec::FixedSize;
@@ -11,8 +12,8 @@ use commonware_cryptography::sha256::Sha256;
 use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
-use constantinople_indexer::publisher::qmdb::{state_qmdb_client, transactions_qmdb_client};
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_indexer::namespaces::{state_qmdb_client, transactions_qmdb_client};
+use constantinople_primitives::{AccountKey, StateAccount};
 use exoware_qmdb::{
     KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
     unordered_operation_log_connect_stack,
@@ -20,7 +21,6 @@ use exoware_qmdb::{
 use exoware_sdk::StoreClient;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -28,7 +28,10 @@ use std::{
 };
 use tracing::info;
 
-type ChainAccount = Account;
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+type ChainAccount = StateAccount;
 type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateClient =
     UnorderedClient<mmr::Family, Sha256, AccountKey, AccountValue, FixedEncoding<AccountValue>>;
@@ -83,7 +86,7 @@ fn load_deployer_config(path: &Path) -> DeployerConfig {
     serde_yaml::from_str(&raw).expect("failed to parse qmdb-indexer config")
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &HashMap<&str, std::net::IpAddr>) -> String {
+fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
     };
@@ -113,7 +116,7 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
             .hosts
             .iter()
             .map(|host| (host.name.as_str(), host.ip))
-            .collect::<HashMap<_, _>>();
+            .collect::<AHashMap<_, _>>();
         let store_url = resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name);
         return (store_url, cli.host, config.port);
     }
@@ -128,11 +131,8 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
 
 fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let base = StoreClient::new(store_url);
-    let state = Arc::new(StateClient::from_client(state_qmdb_client(&base)?, ()));
-    let transactions = Arc::new(TransactionClient::from_client(
-        transactions_qmdb_client(&base)?,
-        (),
-    ));
+    let state = Arc::new(StateClient::new(state_qmdb_client(&base)?, ()));
+    let transactions = Arc::new(TransactionClient::new(transactions_qmdb_client(&base)?, ()));
 
     Ok(Router::new()
         .route("/health", get(health))

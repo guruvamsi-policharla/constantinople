@@ -1,11 +1,12 @@
 //! Account model for the Constantinople chain.
 
 use crate::{
-    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, TransactionPublicKey,
+    ChainPrivatePaymentBackend, PrivateAccount, PrivatePaymentBackend, StatePrivatePaymentBackend,
+    TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
-use bytes::{Buf, BufMut, Bytes};
-use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use bytes::{Buf, BufMut};
+use commonware_codec::{Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
@@ -13,10 +14,14 @@ use core::ops::Deref;
 use derive_more::{Debug, Display};
 
 /// Default starting balance for accounts that have not been written yet.
-pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
+pub const DEFAULT_ACCOUNT_BALANCE: u64 = 1000;
 
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
+
+// Account keys keep the legacy Ed25519 public-key width. Secp256r1 accounts
+// are hashed into this same fixed-width state key.
+const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
 
 /// Fixed-width account identifier derived from a transaction public key.
 ///
@@ -24,16 +29,25 @@ pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 /// [`AccountKey`] does not validate or decompress the curve point. This keeps
 /// state-database replay, indexing, and lookup on cheap byte comparisons while
 /// preserving the legacy Ed25519 account format.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
+#[fixed_array(infallible)]
 pub struct AccountKey {
-    bytes: Bytes,
+    bytes: [u8; ACCOUNT_KEY_SIZE],
 }
 
 impl AccountKey {
     /// Creates an account key from a decoded public key.
     pub fn from_public_key(public_key: &TransactionPublicKey) -> Self {
-        Self::from_public_key_bytes(public_key.as_ref())
-            .expect("decoded transaction public key bytes must derive an account key")
+        match public_key {
+            TransactionPublicKey::Ed25519 { encoded } => {
+                Self::try_from(&encoded[1..1 + Self::SIZE])
+                    .expect("ed25519 account-key slice has account-key length")
+            }
+            TransactionPublicKey::Secp256r1 { encoded } => {
+                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
+                    .expect("sha256 digest has account-key length")
+            }
+        }
     }
 
     /// Creates an account key from encoded transaction public-key bytes.
@@ -43,33 +57,27 @@ impl AccountKey {
         }
 
         match bytes[0] {
-            ED25519_SCHEME => Some(Self {
-                bytes: Bytes::copy_from_slice(&bytes[1..1 + Self::SIZE]),
-            }),
-            SECP256R1_SCHEME => Some(Self {
-                bytes: Bytes::copy_from_slice(sha256::Sha256::hash(bytes).as_ref()),
-            }),
+            ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
+            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
             _ => None,
         }
     }
 
-    /// Creates an account key from canonical account-key bytes.
-    pub fn from_bytes(bytes: Bytes) -> Option<Self> {
-        if bytes.len() != Self::SIZE {
-            return None;
-        }
-
-        Some(Self { bytes })
+    /// First eight account-key bytes as a little-endian routing prefix.
+    #[inline]
+    pub fn prefix(&self) -> u64 {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&self.bytes[..8]);
+        u64::from_le_bytes(prefix)
     }
 }
 
 impl FixedSize for AccountKey {
-    const SIZE: usize = ed25519::PublicKey::SIZE;
+    const SIZE: usize = ACCOUNT_KEY_SIZE;
 }
 
 impl Write for AccountKey {
     fn write(&self, buf: &mut impl BufMut) {
-        debug_assert_eq!(self.bytes.len(), Self::SIZE);
         buf.put_slice(&self.bytes);
     }
 }
@@ -82,9 +90,9 @@ impl Read for AccountKey {
             return Err(CodecError::EndOfBuffer);
         }
 
-        Ok(Self {
-            bytes: buf.copy_to_bytes(Self::SIZE),
-        })
+        let mut bytes = [0u8; ACCOUNT_KEY_SIZE];
+        buf.copy_to_slice(&mut bytes);
+        Ok(Self { bytes })
     }
 }
 
@@ -174,38 +182,13 @@ impl Read for Nonce {
 }
 
 /// An account, as represented in the state of the chain.
+///
+/// The associated-type bounds on the private-payment backend live on the
+/// [`PrivatePaymentBackend`] supertrait, so `B: PrivatePaymentBackend` is the
+/// only bound needed here.
 #[derive(Debug, Display, Clone, PartialEq, Eq, Hash)]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
-pub struct Account<B: PrivatePaymentBackend = ChainPrivatePaymentBackend>
-where
-    B::Params: Send + Sync + 'static,
-    B::Commitment:
-        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
-    B::FundProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::TransferProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::BurnProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-{
+pub struct Account<B: PrivatePaymentBackend = ChainPrivatePaymentBackend> {
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
@@ -215,37 +198,76 @@ where
     pub private: PrivateAccount<B>,
 }
 
-impl<B> Default for Account<B>
-where
-    B: PrivatePaymentBackend,
-    B::Params: Send + Sync + 'static,
-    B::Commitment:
-        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
-    B::FundProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::TransferProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::BurnProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-{
+/// Account representation used by local state-database storage.
+pub type StateAccount = Account<StatePrivatePaymentBackend>;
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn to_state_account(account: Account) -> StateAccount {
+    account
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(all(
+    not(feature = "privacy-backend-zkpari"),
+    feature = "privacy-backend-mock"
+))]
+pub fn from_state_account(account: StateAccount) -> Account {
+    account
+}
+
+/// Convert an execution account into the local state-database representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn to_state_account(account: Account) -> StateAccount {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedUnchecked(commitment.0)
+    }
+
+    StateAccount {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
+}
+
+/// Convert a local state-database account into the execution representation.
+#[cfg(feature = "privacy-backend-zkpari")]
+pub const fn from_state_account(account: StateAccount) -> Account {
+    use commonware_privacy::zkpari::payments::{
+        PaymentCommitment,
+        codec::{UncompressedChecked, UncompressedUnchecked},
+    };
+
+    const fn convert(
+        commitment: UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>>,
+    ) -> UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> {
+        UncompressedChecked(commitment.0)
+    }
+
+    Account {
+        balance: account.balance,
+        nonce: account.nonce,
+        private: PrivateAccount {
+            current: convert(account.private.current),
+            pending: convert(account.private.pending),
+        },
+    }
+}
+
+impl<B: PrivatePaymentBackend> Default for Account<B> {
     fn default() -> Self {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
@@ -255,71 +277,11 @@ where
     }
 }
 
-impl<B> FixedSize for Account<B>
-where
-    B: PrivatePaymentBackend,
-    B::Params: Send + Sync + 'static,
-    B::Commitment:
-        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
-    B::FundProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::TransferProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::BurnProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-{
+impl<B: PrivatePaymentBackend> FixedSize for Account<B> {
     const SIZE: usize = u64::SIZE + Nonce::SIZE + PrivateAccount::<B>::SIZE;
 }
 
-impl<B> Write for Account<B>
-where
-    B: PrivatePaymentBackend,
-    B::Params: Send + Sync + 'static,
-    B::Commitment:
-        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
-    B::FundProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::TransferProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::BurnProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-{
+impl<B: PrivatePaymentBackend> Write for Account<B> {
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
@@ -327,37 +289,7 @@ where
     }
 }
 
-impl<B> Read for Account<B>
-where
-    B: PrivatePaymentBackend,
-    B::Params: Send + Sync + 'static,
-    B::Commitment:
-        FixedSize + Read<Cfg = ()> + Write + core::fmt::Debug + core::hash::Hash + Send + Sync,
-    B::FundProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::TransferProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-    B::BurnProof: FixedSize
-        + Read<Cfg = ()>
-        + Write
-        + Clone
-        + core::fmt::Debug
-        + core::hash::Hash
-        + Send
-        + Sync,
-{
+impl<B: PrivatePaymentBackend> Read for Account<B> {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
@@ -415,7 +347,6 @@ fn consume_current_nonce(base: u64, bitmap: u64) -> Option<Nonce> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MockPrivatePaymentBackend;
     use commonware_codec::{DecodeExt, FixedSize};
     use commonware_cryptography::{
         Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
@@ -456,30 +387,28 @@ mod tests {
 
     #[test]
     fn account_codec_roundtrip() {
-        let account = Account::<MockPrivatePaymentBackend> {
+        let account: Account = Account {
             balance: 42,
             nonce: Nonce::new(7, 3),
             private: PrivateAccount::default(),
         };
 
-        let mut buf = Vec::with_capacity(Account::<MockPrivatePaymentBackend>::SIZE);
+        let mut buf = Vec::with_capacity(<Account>::SIZE);
         account.write(&mut buf);
-        assert_eq!(buf.len(), Account::<MockPrivatePaymentBackend>::SIZE);
+        assert_eq!(buf.len(), <Account>::SIZE);
 
-        let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
+        let decoded = <Account>::decode(&mut &buf[..]).expect("decoding should succeed");
         assert_eq!(decoded, account);
     }
 
     #[test]
     fn account_default_starts_funded() {
-        assert_eq!(
-            Account::default(),
-            Account::<MockPrivatePaymentBackend> {
-                balance: DEFAULT_ACCOUNT_BALANCE,
-                nonce: Nonce::default(),
-                private: PrivateAccount::default(),
-            }
-        );
+        let expected: Account = Account {
+            balance: DEFAULT_ACCOUNT_BALANCE,
+            nonce: Nonce::default(),
+            private: PrivateAccount::default(),
+        };
+        assert_eq!(<Account>::default(), expected);
     }
 
     #[test]

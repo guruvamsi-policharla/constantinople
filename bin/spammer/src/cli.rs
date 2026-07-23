@@ -1,6 +1,6 @@
 //! CLI definition.
 
-use crate::config::{PrivateProofMode, Workload};
+pub use crate::config::{PrivateProofMode, Workload};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Parser)]
@@ -13,6 +13,15 @@ pub struct Cli {
     /// Path to the deployer-generated hosts file.
     #[arg(long)]
     pub hosts: Option<PathBuf>,
+
+    /// Port for the Prometheus metrics endpoint.
+    ///
+    /// Defaults to the deployer's scrape port when running with `--hosts`
+    /// (a dedicated instance); otherwise metrics are served only when a
+    /// port is given, so ad-hoc runs cannot collide with co-located
+    /// validators' metrics ports.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
 
     /// Relayer base URL for transaction submission.
     #[arg(long)]
@@ -42,10 +51,6 @@ pub struct Cli {
     #[arg(long, default_value_t = 1000)]
     pub seed_offset: u64,
 
-    /// Number of async runtime worker threads.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKER_THREADS)]
-    pub worker_threads: usize,
-
     /// Number of rayon threads for parallel signing.
     #[arg(long, default_value_t = crate::config::DEFAULT_RAYON_THREADS)]
     pub rayon_threads: usize,
@@ -57,19 +62,27 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
 
-    /// Transaction workload to submit.
+    /// Transaction mix to generate.
     #[arg(long, value_enum, default_value_t = Workload::Public)]
     pub workload: Workload,
 
-    /// Independent private global-ring groups per relayer submitter.
-    ///
-    /// Only used for private workload. `--accounts` is the size of each group.
-    #[arg(long, default_value_t = crate::config::DEFAULT_PRIVATE_GROUPS)]
-    pub private_groups: usize,
-
-    /// Private transfer proof generation mode.
+    /// Proof mode for private transfers (only used when `--workload private`).
     #[arg(long, value_enum, default_value_t = PrivateProofMode::Real)]
     pub private_proof_mode: PrivateProofMode,
+
+    /// Number of private operations per submitted batch (only used when
+    /// `--workload private`).
+    #[arg(long, default_value_t = 64)]
+    pub private_batch: usize,
+
+    /// Number of concurrent private lanes (only used when `--workload private`).
+    ///
+    /// Each lane drives a disjoint slice of accounts and keeps one batch in
+    /// flight, so more lanes mean more batches finalizing per block. A single
+    /// lane lands one batch per finalization round-trip, leaving intervening
+    /// blocks empty.
+    #[arg(long, default_value_t = 8)]
+    pub private_lanes: usize,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
@@ -85,7 +98,6 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use crate::config::{PrivateProofMode, Workload};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -106,10 +118,6 @@ mod tests {
         );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
-        assert_eq!(cli.workload, Workload::Public);
-        assert_eq!(cli.private_groups, crate::config::DEFAULT_PRIVATE_GROUPS);
-        assert_eq!(cli.private_proof_mode, PrivateProofMode::Real);
-        assert_eq!(cli.worker_threads, crate::config::DEFAULT_WORKER_THREADS);
     }
 
     #[test]
@@ -169,62 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_worker_threads() {
-        let cli = Cli::try_parse_from([
-            "constantinople-spammer",
-            "--relayer-url",
-            "http://127.0.0.1:8084",
-            "--worker-threads",
-            "6",
-        ])
-        .expect("relayer invocation should parse");
-
-        assert_eq!(cli.worker_threads, 6);
-    }
-
-    #[test]
-    fn parses_private_workload() {
-        let cli = Cli::try_parse_from([
-            "constantinople-spammer",
-            "--relayer-url",
-            "http://127.0.0.1:8084",
-            "--workload",
-            "private",
-        ])
-        .expect("relayer invocation should parse");
-
-        assert_eq!(cli.workload, Workload::Private);
-    }
-
-    #[test]
-    fn parses_private_groups() {
-        let cli = Cli::try_parse_from([
-            "constantinople-spammer",
-            "--relayer-url",
-            "http://127.0.0.1:8084",
-            "--private-groups",
-            "4",
-        ])
-        .expect("relayer invocation should parse");
-
-        assert_eq!(cli.private_groups, 4);
-    }
-
-    #[test]
-    fn parses_private_proof_mode() {
-        let cli = Cli::try_parse_from([
-            "constantinople-spammer",
-            "--relayer-url",
-            "http://127.0.0.1:8084",
-            "--private-proof-mode",
-            "simulated",
-        ])
-        .expect("relayer invocation should parse");
-
-        assert_eq!(cli.private_proof_mode, PrivateProofMode::Simulated);
-    }
-
-    #[test]
     fn rejects_accounts_jitter_above_one() {
         let error = Cli::try_parse_from([
             "constantinople-spammer",
@@ -236,6 +188,39 @@ mod tests {
         .expect_err("jitter above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn defaults_to_public_workload() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.workload, super::Workload::Public);
+        assert_eq!(cli.private_proof_mode, super::PrivateProofMode::Real);
+    }
+
+    #[test]
+    fn parses_private_workload_flags() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--workload",
+            "private",
+            "--private-proof-mode",
+            "simulated",
+            "--private-batch",
+            "32",
+        ])
+        .expect("private invocation should parse");
+
+        assert_eq!(cli.workload, super::Workload::Private);
+        assert_eq!(cli.private_proof_mode, super::PrivateProofMode::Simulated);
+        assert_eq!(cli.private_batch, 32);
     }
 
     #[test]

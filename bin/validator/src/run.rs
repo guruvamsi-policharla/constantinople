@@ -8,6 +8,7 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
+use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter,
     simplex::elector::RoundRobin,
@@ -25,10 +26,11 @@ use commonware_glue::stateful::{
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
+use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
@@ -54,9 +56,13 @@ use constantinople_engine::{
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher,
-    publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    publisher::{
+        StoreCommitMetrics,
+        qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    },
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
+use constantinople_primitives::PublicKeyCache;
 use std::{
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -80,13 +86,14 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
 };
+const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
-const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
@@ -175,15 +182,20 @@ struct LazyPublisher {
     context: RuntimeContext,
     store_url: String,
     buffer: usize,
+    commit_metrics: StoreCommitMetrics,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
     fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
+        // Registered once here: `connect` is retried on failure and must not
+        // re-register.
+        let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
             store_url,
             buffer,
+            commit_metrics,
             publisher: Mutex::new(None),
         }
     }
@@ -198,6 +210,7 @@ impl LazyPublisher {
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
+                self.commit_metrics.clone(),
             )
             .await
             {
@@ -286,7 +299,7 @@ fn recovered_finalized_upload_cursor(
 
 impl FinalizedUploadProducer {
     async fn enqueue(
-        &self,
+        self,
         context: RuntimeContext,
         block: &EngineBlock<Sha256, PublicKey>,
         databases: &EngineDatabases,
@@ -512,6 +525,7 @@ async fn ack_finalized_queue_entry(
     }
 }
 
+#[boxed]
 async fn start_queued_upload(
     active: &mut JoinSet<(u64, u64)>,
     publisher: Arc<LazyPublisher>,
@@ -570,8 +584,11 @@ async fn maybe_build_indexer(
         chain_indexer_url = %cfg.chain_indexer_url,
         "starting full indexer uploaders",
     );
-    let (cert_reporter, cert_join) =
-        EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
+    let (cert_reporter, cert_join) = EngineCertReporter::connect(
+        &cfg.chain_indexer_url,
+        cfg.upload_buffer,
+        StoreCommitMetrics::new(&context.child("simplex_upload")),
+    );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,
@@ -646,19 +663,11 @@ fn indexer_finalized_hook(
     let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        let publisher = publisher.clone();
-        let finalized_producer = finalized_producer.clone();
-        let block = block.clone();
-        let databases = databases.clone();
-        Box::pin(async move {
-            finalized_producer
-                .enqueue(
-                    publisher.context.child("finalized_queue"),
-                    &block,
-                    &databases,
-                )
-                .await;
-        })
+        Box::pin(finalized_producer.clone().enqueue(
+            publisher.context.child("finalized_queue"),
+            block,
+            databases,
+        ))
     }))
 }
 
@@ -682,7 +691,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         http_listen,
         metrics_listen,
         max_propose_bytes,
+        max_shard_bytes,
         max_pool_bytes,
+        state_page_cache_bytes,
+        other_page_cache_bytes,
+        public_key_cache_size,
         otel,
         json_logs,
         deployer_managed,
@@ -727,12 +740,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let signature_strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create signature verification strategy");
-        let hash_strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create hashing strategy");
+        let strategy = context.strategy(NZUsize!(rayon_threads));
+        let public_key_cache = PublicKeyCache::new(
+            context.child("public_key_cache"),
+            NonZeroUsize::new(public_key_cache_size)
+                .expect("public_key_cache_size must be non-zero"),
+        );
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
@@ -792,7 +805,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let (probe, probe_mailbox) = Probe::new(ProbeConfig {
             context: context.child("probe"),
             provider,
-            strategy: signature_strategy.clone(),
+            strategy: strategy.clone(),
             capacity: NZUsize!(32),
             blocker: oracle.clone(),
             minimum_epoch: Epoch::zero(),
@@ -819,8 +832,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
-                signature_strategy: signature_strategy.clone(),
-                hash_strategy: hash_strategy.clone(),
+                strategy: strategy.clone(),
+                public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
             mempool_receiver,
@@ -845,6 +858,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 relayer: relayer_config,
                 account_reader: account_reader.clone(),
                 view_clock,
+                strategy: strategy.clone(),
+                max_batch_bytes: max_propose_bytes,
             }))
         } else {
             info!("secondary node: skipping mempool webserver");
@@ -854,19 +869,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let startup = match startup {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
-            StartupModeConfig::StateSync => {
-                let finalization = probe_mailbox
-                    .subscribe()
-                    .await
-                    .expect("probe actor exited before selecting a state-sync floor");
-                StartupMode::StateSync { finalization }
-            }
+            StartupModeConfig::StateSync => StartupMode::StateSync,
         };
         let startup_mode = match &startup {
             StartupMode::MarshalSync => "marshal_sync",
-            StartupMode::StateSync { .. } => "state_sync",
+            StartupMode::StateSync => "state_sync",
         };
-        info!(startup_mode, "selected validator startup mode");
+        info!(startup_mode, "requested validator startup mode");
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
         // loaded config and returns `None` for primaries or validators that
@@ -891,7 +900,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             MinSig,
             RoundRobin<Sha256>,
             Rayon,
-            Rayon,
             _,
             Batch,
             SimplexObserver,
@@ -906,14 +914,20 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 share: decoded.share,
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
-                signature_strategy,
-                hash_strategy,
+                strategy,
+                public_key_cache,
                 startup,
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
+                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+                state_page_cache_bytes,
+                other_page_cache_bytes,
+                shard_codec: CodecConfig {
+                    maximum_shard_size: max_shard_bytes,
+                },
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
@@ -1019,12 +1033,11 @@ mod tests {
     };
     use commonware_utils::{non_empty_range, sequence::FixedBytes};
     use constantinople_primitives::{
-        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
+        AccountKey, Block, Header, Sealable, SignedTransaction, StateAccount,
     };
     use std::{future::pending, time::Duration};
 
-    type TestAccount = Account;
-    type TestAccountValue = FixedBytes<{ TestAccount::SIZE }>;
+    type TestAccountValue = FixedBytes<{ StateAccount::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 

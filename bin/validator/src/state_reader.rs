@@ -3,16 +3,16 @@
 
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use constantinople_engine::types::StateSyncDb;
 use constantinople_mempool::webserver::AccountReader;
-use constantinople_primitives::{Account, AccountKey, TransactionPublicKey};
+use constantinople_primitives::{Account, AccountKey, TransactionPublicKey, from_state_account};
 use futures::future::{BoxFuture, FutureExt};
 
 /// Forwards [`AccountReader::get`] to the attached state database.
 pub struct StateDbReader<E, H, T>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     H: Hasher,
     T: Strategy,
 {
@@ -21,7 +21,7 @@ where
 
 impl<E, H, T> StateDbReader<E, H, T>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     H: Hasher,
     T: Strategy,
 {
@@ -32,7 +32,7 @@ where
 
 impl<E, H, T> AccountReader for StateDbReader<E, H, T>
 where
-    E: Storage + Clock + Metrics + Send + Sync + 'static,
+    E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     H: Hasher,
     T: Strategy,
 {
@@ -43,6 +43,7 @@ where
                 .await
                 .ok()
                 .flatten()
+                .map(from_state_account)
         }
         .boxed()
     }

@@ -1,6 +1,7 @@
 //! SQL row encoding shared by the combined publisher.
 
 use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
+use bytes::Bytes;
 use exoware_sql::CellValue;
 
 /// One row destined for a SQL metadata table.
@@ -28,7 +29,7 @@ pub(crate) struct BlockMetaRow {
 pub(crate) struct TxMetaRow {
     pub digest: [u8; 32],
     pub qmdb_location: u64,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 /// Transaction activity role stored in `tx_activity`.
@@ -100,7 +101,7 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
         values: vec![
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::UInt64(tx.qmdb_location),
-            CellValue::Utf8(hex_lower(&tx.body)),
+            CellValue::Binary(tx.body.to_vec()),
         ],
     }
 }
@@ -134,14 +135,4 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.qmdb_location),
         ],
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

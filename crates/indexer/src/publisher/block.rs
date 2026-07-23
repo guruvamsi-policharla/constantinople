@@ -7,8 +7,8 @@ use crate::publisher::{
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
-use bytes::BytesMut;
-use commonware_codec::{FixedSize, Write as _};
+use bytes::Bytes;
+use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{AccountKey, LazySignedTransaction, Payload, TransactionPublicKey};
@@ -25,7 +25,7 @@ pub(crate) struct IndexedBlockRows<D: Digest> {
 struct IndexedTransaction<D: Digest> {
     block_index: usize,
     digest: D,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     sender: AccountKey,
     to: [u8; AccountKey::SIZE],
     value: u64,
@@ -159,9 +159,9 @@ where
         return None;
     };
     let tx = signed.value();
-    let mut sender_bytes = BytesMut::with_capacity(TransactionPublicKey::SIZE);
-    tx.sender_lazy().write(&mut sender_bytes);
-    let Some(sender) = AccountKey::from_public_key_bytes(&sender_bytes) else {
+    let Some(sender) =
+        AccountKey::from_public_key_bytes(&signed_bytes[..TransactionPublicKey::SIZE])
+    else {
         warn!(
             height,
             block_index, "indexer: sender public key bytes cannot derive an account key"
@@ -169,10 +169,10 @@ where
         return None;
     };
     let (to_account, value) = match &tx.payload {
-        Payload::PublicTransfer { to, value } => (to.clone(), value.get()),
-        Payload::PrivateTransfer { to, .. } => (to.clone(), 0),
+        Payload::PublicTransfer { to, value } => (*to, value.get()),
+        Payload::PrivateTransfer { to, .. } => (*to, 0),
         Payload::PrivateFund { .. } | Payload::PrivateBurn { .. } | Payload::PrivateRollover => {
-            (sender.clone(), 0)
+            (sender, 0)
         }
     };
     let mut to = [0u8; AccountKey::SIZE];
@@ -181,7 +181,7 @@ where
     Some(IndexedTransaction {
         block_index,
         digest: *signed.message_digest(),
-        bytes: signed_bytes.to_vec(),
+        bytes: signed_bytes,
         sender,
         to,
         value,
@@ -193,7 +193,7 @@ where
 mod tests {
     use super::*;
     use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
-    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _};
+    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View, coding::Commitment},
@@ -302,20 +302,10 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        let Some(CellValue::Utf8(body_hex)) = meta.values.get(2) else {
-            panic!("tx_meta body should be hex");
+        let Some(CellValue::Binary(body)) = meta.values.get(2) else {
+            panic!("tx_meta body should be binary");
         };
-        assert_eq!(body_hex, &hex_lower(expected_body));
-    }
-
-    fn hex_lower(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        out
+        assert_eq!(body.as_slice(), expected_body);
     }
 
     fn test_header(

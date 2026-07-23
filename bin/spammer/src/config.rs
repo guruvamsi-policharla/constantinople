@@ -1,37 +1,38 @@
 //! Configuration loading and relayer URL resolution.
 
+use ahash::AHashMap;
 use commonware_deployer::aws::Hosts;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 /// Default number of fully signed local batches kept ready per submitter.
 pub const DEFAULT_PRESIGNED_BATCHES: usize = 16;
-/// Default number of async runtime worker threads.
-pub const DEFAULT_WORKER_THREADS: usize = 2;
 /// Default number of rayon threads for parallel signing.
 pub const DEFAULT_RAYON_THREADS: usize = 2;
-/// Default number of private account groups per relayer submitter.
-pub const DEFAULT_PRIVATE_GROUPS: usize = 1;
+/// Default private operations per submitted batch.
+pub const DEFAULT_PRIVATE_BATCH: usize = 64;
+/// Default number of concurrent private lanes.
+pub const DEFAULT_PRIVATE_LANES: usize = 8;
 
-/// Transaction workload emitted by the spammer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+/// Which transaction mix the spammer generates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Workload {
-    /// Public ring transfers.
+    /// Ring of public transfers (the original behavior).
     #[default]
     Public,
-    /// Private payment cycle: fund, rollover, transfer, rollover, burn.
+    /// Private payments: each account cycles fund -> rollover -> transfer.
     Private,
 }
 
-/// Proof generation mode for private transfers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+/// How private transfer proofs are produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivateProofMode {
-    /// Generate real backend proofs.
+    /// Real proofs from the configured backend.
     #[default]
     Real,
-    /// Use backend simulator hooks when compiled in and supported.
+    /// Simulated proofs via the trapdoor (requires the simulator feature).
     Simulated,
 }
 
@@ -41,12 +42,21 @@ pub struct SpammerConfig {
     pub accounts: u32,
     pub value: u64,
     pub seed_offset: u64,
-    /// Number of async runtime worker threads.
-    #[serde(default = "default_worker_threads")]
-    pub worker_threads: usize,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
+    /// Transaction mix to submit.
+    #[serde(default)]
+    pub workload: Workload,
+    /// Proof mode for private transfers.
+    #[serde(default)]
+    pub private_proof_mode: PrivateProofMode,
+    /// Private operations per submitted batch.
+    #[serde(default = "default_private_batch")]
+    pub private_batch: usize,
+    /// Concurrent private lanes.
+    #[serde(default = "default_private_lanes")]
+    pub private_lanes: usize,
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
@@ -68,33 +78,22 @@ pub struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs.
     #[serde(default)]
     pub accounts_jitter: f64,
-    /// Transaction workload to submit.
-    #[serde(default)]
-    pub workload: Workload,
-    /// Independent private global-ring groups per relayer submitter.
-    ///
-    /// Only used for private workload. `accounts` is the size of each group.
-    #[serde(default = "default_private_groups")]
-    pub private_groups: usize,
-    /// Private transfer proof generation mode.
-    #[serde(default)]
-    pub private_proof_mode: PrivateProofMode,
+}
+
+const fn default_private_batch() -> usize {
+    DEFAULT_PRIVATE_BATCH
+}
+
+const fn default_private_lanes() -> usize {
+    DEFAULT_PRIVATE_LANES
 }
 
 const fn default_presigned_batches() -> usize {
     DEFAULT_PRESIGNED_BATCHES
 }
 
-const fn default_worker_threads() -> usize {
-    DEFAULT_WORKER_THREADS
-}
-
 const fn default_rayon_threads() -> usize {
     DEFAULT_RAYON_THREADS
-}
-
-const fn default_private_groups() -> usize {
-    DEFAULT_PRIVATE_GROUPS
 }
 
 /// Loads a [`SpammerConfig`] from a YAML file.
@@ -114,7 +113,7 @@ pub fn resolve_named_http_url(url: &str, hosts_path: Option<&Path>) -> String {
         .hosts
         .iter()
         .map(|host| (host.name.as_str(), host.ip))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
@@ -143,7 +142,6 @@ mod tests {
             accounts: 20,
             value: 5,
             seed_offset: 2000,
-            worker_threads: 3,
             rayon_threads: 6,
             http_port: 9090,
             relayer_url: "http://relayer:8080".to_string(),
@@ -152,15 +150,15 @@ mod tests {
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
             workload: Workload::Private,
-            private_groups: 4,
             private_proof_mode: PrivateProofMode::Simulated,
+            private_batch: 256,
+            private_lanes: 16,
         };
         let yaml = serde_yaml::to_string(&config).expect("serialize");
         let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(parsed.accounts, config.accounts);
         assert_eq!(parsed.value, config.value);
         assert_eq!(parsed.seed_offset, config.seed_offset);
-        assert_eq!(parsed.worker_threads, config.worker_threads);
         assert_eq!(parsed.rayon_threads, config.rayon_threads);
         assert_eq!(parsed.http_port, config.http_port);
         assert_eq!(parsed.relayer_url, config.relayer_url);
@@ -169,8 +167,21 @@ mod tests {
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
         assert_eq!(parsed.workload, config.workload);
-        assert_eq!(parsed.private_groups, config.private_groups);
         assert_eq!(parsed.private_proof_mode, config.private_proof_mode);
+        assert_eq!(parsed.private_batch, config.private_batch);
+        assert_eq!(parsed.private_lanes, config.private_lanes);
+    }
+
+    /// A spammer.yaml written by `deploy` must deserialize with the snake_case
+    /// workload/proof-mode strings the deploy crate emits.
+    #[test]
+    fn deploy_yaml_workload_strings_parse() {
+        let yaml = "accounts: 10\nvalue: 1\nseed_offset: 1000\nhttp_port: 8080\nrelayer_url: http://r:8080\nworkload: private\nprivate_proof_mode: simulated\nprivate_batch: 128\nprivate_lanes: 12\n";
+        let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
+        assert_eq!(parsed.workload, Workload::Private);
+        assert_eq!(parsed.private_proof_mode, PrivateProofMode::Simulated);
+        assert_eq!(parsed.private_batch, 128);
+        assert_eq!(parsed.private_lanes, 12);
     }
 
     /// Older configs that predate newer optional fields must still parse.
@@ -178,13 +189,9 @@ mod tests {
     fn config_yaml_defaults_optional_fields_when_absent() {
         let yaml = "accounts: 10\nvalue: 1\nseed_offset: 1000\nhttp_port: 8080\nrelayer_url: http://127.0.0.1:8084\n";
         let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
-        assert_eq!(parsed.worker_threads, DEFAULT_WORKER_THREADS);
         assert_eq!(parsed.rayon_threads, DEFAULT_RAYON_THREADS);
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
-        assert_eq!(parsed.workload, Workload::Public);
-        assert_eq!(parsed.private_groups, DEFAULT_PRIVATE_GROUPS);
-        assert_eq!(parsed.private_proof_mode, PrivateProofMode::Real);
     }
 
     #[test]

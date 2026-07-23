@@ -5,38 +5,95 @@
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use commonware_runtime::{
+    Metrics as RuntimeMetrics,
+    telemetry::metrics::{Counter, MetricsExt as _},
 };
+use constantinople_mempool::webserver::SubmitError;
+use std::{sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
-/// Shared counters for progress reporting.
+struct Metrics {
+    submitted_batches: Counter,
+    submitted_transactions: Counter,
+    finalized_transactions: Counter,
+    filtered_transactions: Counter,
+    dropped_transactions: Counter,
+    submit_errors: Counter,
+}
+
+impl Metrics {
+    fn init(context: &impl RuntimeMetrics) -> Self {
+        Self {
+            submitted_batches: context
+                .counter("submitted_batches", "Submitted transaction batches"),
+            submitted_transactions: context
+                .counter("submitted_transactions", "Submitted transactions"),
+            finalized_transactions: context
+                .counter("finalized_transactions", "Finalized transactions"),
+            filtered_transactions: context
+                .counter("filtered_transactions", "Filtered transactions"),
+            dropped_transactions: context.counter("dropped_transactions", "Dropped transactions"),
+            submit_errors: context.counter("submit_errors", "Relayer submit errors"),
+        }
+    }
+}
+
+/// Prometheus counters shared across submitters, exported via the metrics endpoint and read back
+/// by [`Stats::totals`] for the periodic progress log.
 pub struct Stats {
-    pub finalized: AtomicU64,
-    pub filtered: AtomicU64,
-    pub dropped: AtomicU64,
-    pub errors: AtomicU64,
+    metrics: Metrics,
+}
+
+#[derive(Clone, Copy)]
+pub struct Totals {
+    pub finalized: u64,
+    pub filtered: u64,
+    pub dropped: u64,
+    pub errors: u64,
 }
 
 impl Stats {
-    pub const fn new() -> Self {
+    pub fn new(context: impl RuntimeMetrics) -> Self {
         Self {
-            finalized: AtomicU64::new(0),
-            filtered: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
+            metrics: Metrics::init(&context),
         }
+    }
+
+    pub fn totals(&self) -> Totals {
+        Totals {
+            finalized: self.metrics.finalized_transactions.get(),
+            filtered: self.metrics.filtered_transactions.get(),
+            dropped: self.metrics.dropped_transactions.get(),
+            errors: self.metrics.submit_errors.get(),
+        }
+    }
+
+    fn record_submitted(&self, count: u64) {
+        self.metrics.submitted_batches.inc();
+        self.metrics.submitted_transactions.inc_by(count);
+    }
+
+    fn record_finalized(&self, count: u64) {
+        self.metrics.finalized_transactions.inc_by(count);
+    }
+
+    fn record_filtered(&self, count: u64) {
+        self.metrics.filtered_transactions.inc_by(count);
+    }
+
+    fn record_dropped(&self, count: u64) {
+        self.metrics.dropped_transactions.inc_by(count);
+    }
+
+    fn record_error(&self) {
+        self.metrics.submit_errors.inc();
     }
 }
 
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Submits batches through a relayer and records each batch outcome.
-#[derive(Clone)]
 pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,
@@ -53,41 +110,30 @@ enum RelayerBatchStatus {
     },
     PartiallyFinalized {
         height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
+        included: Vec<u64>,
+        filtered: u64,
     },
     Dropped,
 }
 
-/// Outcome returned after one relayer submission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which transactions in a submitted private batch finalized.
 pub enum SubmitOutcome {
-    /// Every transaction in the submitted batch finalized.
-    Finalized { height: u64, included: Vec<String> },
-    /// Some transactions finalized and the rest were filtered.
-    PartiallyFinalized {
-        height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
-    },
-    /// No transactions from the submitted batch finalized.
-    Dropped,
-    /// The relayer rejected the submission or the request failed.
-    Error,
+    /// Every transaction in the batch finalized.
+    AllFinalized,
+    /// Only the transactions at these batch indices finalized.
+    Partial(std::collections::HashSet<u64>),
+    /// Nothing finalized (dropped or submit error) — retry with fresh proofs.
+    None,
 }
 
 impl SubmitOutcome {
-    pub fn included(&self) -> &[String] {
+    /// Whether the transaction at `index` in the submitted batch finalized.
+    pub fn finalized(&self, index: u64) -> bool {
         match self {
-            Self::Finalized { included, .. } | Self::PartiallyFinalized { included, .. } => {
-                included
-            }
-            Self::Dropped | Self::Error => &[],
+            Self::AllFinalized => true,
+            Self::Partial(included) => included.contains(&index),
+            Self::None => false,
         }
-    }
-
-    pub const fn is_fully_finalized(&self) -> bool {
-        matches!(self, Self::Finalized { .. })
     }
 }
 
@@ -109,69 +155,90 @@ impl RelayerSubmitter {
 
     /// Submits a signed batch once. Failed or dropped batches are abandoned so
     /// the next outer loop iteration uses a fresh nonce set.
-    pub async fn submit(&self, batch: Vec<Tx>) -> SubmitOutcome {
+    pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
-        let batch_digests = batch
-            .iter()
-            .map(|tx| tx.message_digest().to_string())
-            .collect::<Vec<_>>();
         let body = batch.encode();
+        self.stats.record_submitted(count);
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
-                self.stats.finalized.fetch_add(count, Ordering::Relaxed);
+                self.stats.record_finalized(count);
                 debug!(height, count, "relayed batch finalized");
-                SubmitOutcome::Finalized {
-                    height,
-                    included: batch_digests,
-                }
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
                 height,
                 included,
                 filtered,
             }) => {
-                self.stats
-                    .finalized
-                    .fetch_add(included.len() as u64, Ordering::Relaxed);
-                self.stats
-                    .filtered
-                    .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                self.stats.record_finalized(included.len() as u64);
+                self.stats.record_filtered(filtered);
                 info!(
                     height,
                     included = included.len(),
-                    filtered = filtered.len(),
+                    filtered,
                     "relayed batch partially finalized, advancing"
                 );
-                SubmitOutcome::PartiallyFinalized {
-                    height,
-                    included,
-                    filtered,
-                }
             }
             Ok(RelayerBatchStatus::Dropped) => {
-                self.stats.dropped.fetch_add(count, Ordering::Relaxed);
+                self.stats.record_dropped(count);
                 debug!(count, "relayed batch dropped, advancing");
-                SubmitOutcome::Dropped
             }
             Err(error) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_error();
                 warn!(
                     error = %error,
                     backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
-                SubmitOutcome::Error
             }
         }
     }
 
-    async fn submit_encoded(
-        &self,
-        body: bytes::Bytes,
-    ) -> Result<RelayerBatchStatus, constantinople_mempool::webserver::client::SubmitError> {
-        use constantinople_mempool::webserver::client::SubmitError;
+    /// Submits a private batch and reports which transactions finalized.
+    ///
+    /// The relayer response is definitive (the call blocks until the batch is
+    /// finalized, partially finalized, or dropped), so the caller can advance
+    /// only the finalized accounts' state and retry the rest with fresh proofs.
+    pub async fn submit_private(&self, batch: &[Tx]) -> SubmitOutcome {
+        let count = batch.len() as u64;
+        let body = batch.encode();
+        self.stats.record_submitted(count);
+        match self.submit_encoded(body).await {
+            Ok(RelayerBatchStatus::Finalized { height }) => {
+                self.stats.record_finalized(count);
+                debug!(height, count, "private batch finalized");
+                SubmitOutcome::AllFinalized
+            }
+            Ok(RelayerBatchStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) => {
+                self.stats.record_finalized(included.len() as u64);
+                self.stats.record_filtered(filtered);
+                info!(
+                    height,
+                    included = included.len(),
+                    filtered,
+                    "private batch partially finalized"
+                );
+                SubmitOutcome::Partial(included.into_iter().collect())
+            }
+            Ok(RelayerBatchStatus::Dropped) => {
+                self.stats.record_dropped(count);
+                debug!(count, "private batch dropped, retrying");
+                SubmitOutcome::None
+            }
+            Err(error) => {
+                self.stats.record_error();
+                warn!(error = %error, "private submit error, retrying");
+                tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                SubmitOutcome::None
+            }
+        }
+    }
 
+    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<RelayerBatchStatus, SubmitError> {
         let mut request = self
             .http
             .post(format!("{}/transactions", self.url))
@@ -201,12 +268,16 @@ impl RelayerSubmitter {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelayerSubmitter, Stats, SubmitOutcome};
+    use super::{RelayerSubmitter, Stats};
     use crate::{
         accounts::generate_accounts,
         signer::{Tx, sign_batch},
     };
     use commonware_parallel::Sequential;
+    use commonware_runtime::{
+        Metrics as RuntimeMetrics, Name, Supervisor,
+        telemetry::metrics::{Metric, Registered, Registration},
+    };
     use std::{
         num::NonZeroU64,
         sync::{
@@ -222,65 +293,89 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_batch_advances_without_retrying() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
         let batch = test_batch();
         let count = batch.len() as u64;
 
-        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
             .expect("dropped batch should not be retried");
 
-        assert_eq!(outcome, SubmitOutcome::Dropped);
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), count);
+        assert_eq!(stats.totals().dropped, count);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn submit_error_advances_without_retrying() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
-        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
             .expect("submit error should not be retried");
 
-        assert_eq!(outcome, SubmitOutcome::Error);
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.totals().errors, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let batch = test_batch();
-        let included = batch[0].message_digest().to_string();
-        let filtered = batch[1].message_digest().to_string();
-        let body = format!(
-            r#"{{"status":"partially_finalized","height":7,"included":["{included}"],"filtered":["{filtered}"]}}"#
-        );
+        let body = r#"{"status":"partially_finalized","height":7,"included":[0],"filtered":1}"#
+            .to_string();
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
-        let outcome = tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
             .expect("filtered transactions should not be retried");
 
-        assert_eq!(
-            outcome,
-            SubmitOutcome::PartiallyFinalized {
-                height: 7,
-                included: vec![included],
-                filtered: vec![filtered],
-            }
-        );
-        assert_eq!(stats.finalized.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.filtered.load(Ordering::Relaxed), 1);
+        let totals = stats.totals();
+        assert_eq!(totals.finalized, 1);
+        assert_eq!(totals.filtered, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct TestMetrics;
+
+    impl Supervisor for TestMetrics {
+        fn name(&self) -> Name {
+            Name::default()
+        }
+
+        fn child(&self, _label: &'static str) -> Self {
+            Self
+        }
+
+        fn with_attribute(self, _key: &'static str, _value: impl std::fmt::Display) -> Self {
+            self
+        }
+    }
+
+    impl RuntimeMetrics for TestMetrics {
+        fn register<N: Into<String>, H: Into<String>, M: Metric>(
+            &self,
+            _name: N,
+            _help: H,
+            metric: M,
+        ) -> Registered<M> {
+            Registered::with_registration(metric, Registration::from(()))
+        }
+
+        fn encode(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn test_stats() -> Arc<Stats> {
+        Arc::new(Stats::new(TestMetrics))
     }
 
     fn test_batch() -> Vec<Tx> {

@@ -1,7 +1,7 @@
 [package]
 name = "constantinople-validator"
 description = "Constantinople validator binary"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -24,6 +24,7 @@ constantinople-application.workspace = true
 commonware-actor.workspace = true
 commonware-p2p.workspace = true
 commonware-glue.workspace = true
+commonware-coding.workspace = true
 commonware-codec.workspace = true
 commonware-formatting.workspace = true
 commonware-utils.workspace = true
@@ -33,9 +34,10 @@ commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-storage.workspace = true
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
+ahash.workspace = true
 axum.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
@@ -45,10 +47,10 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
-rand_core.workspace = true
 serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 # Other

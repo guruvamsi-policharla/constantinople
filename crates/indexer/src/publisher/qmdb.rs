@@ -4,13 +4,16 @@ use super::{
     block::{IndexedBlockRows, encode_indexed_block_rows_at},
     sql::{AccountMetaRow, encode_account_meta_row},
 };
-use crate::sql_schema::build_meta_schema;
+use crate::{
+    namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
+    sql_schema::build_meta_schema,
+};
 use commonware_codec::{
     Codec, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
 };
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{
     merkle::{Location, mmr},
     qmdb::{
@@ -25,38 +28,31 @@ use commonware_storage::{
 use commonware_utils::sequence::FixedBytes;
 use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use constantinople_primitives::{AccountKey, BlockCfg, StateAccount};
 use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
 };
-use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
+use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{
     collections::VecDeque,
     marker::PhantomData,
     num::NonZeroU64,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
-    time::sleep,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
-/// Store namespace for QMDB account-state rows.
-pub const STATE_QMDB_PREFIX_VALUE: u16 = 0x8;
-/// Store namespace for QMDB transaction-hash rows.
-pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u16 = 0x9;
-/// Number of high-order Store key bits used for QMDB operation-log namespaces.
-pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 /// Durable queued uploads are self-contained and comparatively cheap to admit.
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
 type QmdbFamily = mmr::Family;
-type ChainAccount = Account;
+type ChainAccount = StateAccount;
 type AccountValue = FixedBytes<{ ChainAccount::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
 type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<ChainAccount>>;
@@ -120,11 +116,11 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    block: EngineBlock<H, P>,
+    block: Arc<EngineBlock<H, P>>,
     finalized_ts_micros: i64,
     state_start: u64,
     transaction_start: u64,
-    state_delta: Vec<StateOperation>,
+    state_delta: Arc<Vec<StateOperation>>,
 }
 
 impl<H, P> QueuedFinalizedUpload<H, P>
@@ -153,8 +149,8 @@ where
             .expect("queued finalized upload stores a validated transaction cursor")
     }
 
-    pub const fn block(&self) -> &EngineBlock<H, P> {
-        &self.block
+    pub fn block(&self) -> Arc<EngineBlock<H, P>> {
+        Arc::clone(&self.block)
     }
 }
 
@@ -201,11 +197,11 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
-            block: EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?,
+            block: Arc::new(EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?),
             finalized_ts_micros: i64::read(buf)?,
             state_start: u64::read(buf)?,
             transaction_start: u64::read(buf)?,
-            state_delta: Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?,
+            state_delta: Arc::new(Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?),
         })
     }
 }
@@ -258,7 +254,7 @@ where
 {
     height: u64,
     block_rows: IndexedBlockRows<H::Digest>,
-    state_delta: Vec<StateOperation>,
+    state_delta: Arc<Vec<StateOperation>>,
     account_rows: Vec<super::SqlRow>,
     transaction_ops: Vec<TransactionOperation<H>>,
     completion: oneshot::Sender<()>,
@@ -318,6 +314,7 @@ where
 {
     commits: &'a mut JoinSet<CommittedQmdbBatch>,
     commit_client: &'a StoreClient,
+    commit_metrics: &'a super::StoreCommitMetrics,
     state_writer: &'a Arc<StateWriter<H>>,
     transaction_writer: &'a Arc<TransactionWriter<H>>,
 }
@@ -354,10 +351,12 @@ where
     P: PublicKey + Send + Sync + 'static,
 {
     /// Construct writers over the two QMDB Store namespaces.
+    #[commonware_macros::boxed]
     pub async fn connect<Cx>(
         context: Cx,
         store_url: &str,
         buffer: usize,
+        commit_metrics: super::StoreCommitMetrics,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
@@ -365,7 +364,7 @@ where
         let commit_client = StoreClient::new(store_url);
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
-        let sql_writer = build_meta_schema(commit_client.clone())
+        let sql_writer = build_meta_schema(sql_meta_client(&commit_client)?)
             .map_err(PublishError::SqlSchema)?
             .batch_writer();
         let state = recover_state_writer_state::<H>(state_client.clone()).await?;
@@ -386,6 +385,7 @@ where
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_context,
             commit_client.clone(),
+            commit_metrics,
             sql_writer,
             state_writer.clone(),
             transaction_writer.clone(),
@@ -447,14 +447,14 @@ where
     ) -> Result<QueuedFinalizedUpload<H, P>, PublishError>
     where
         Cx: Spawner,
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
         S: Strategy + Send + Sync + 'static,
     {
         let state_end = block.header.state_range.end();
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
         transaction_upload_end(transaction_writer_next, block)?;
-        let block = block.clone();
-        let state_block = block.clone();
+        let block = Arc::new(block.clone());
+        let state_block = Arc::clone(&block);
         let state_db = databases.0.clone();
         let state_delta = context
             .child("state_delta")
@@ -470,7 +470,7 @@ where
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
             transaction_start: transaction_writer_next,
-            state_delta,
+            state_delta: Arc::new(state_delta),
         })
     }
 
@@ -724,9 +724,11 @@ where
     })
 }
 
+#[expect(clippy::too_many_arguments, reason = "single spawn site in connect")]
 async fn run_qmdb_committer<Cx, H>(
     context: Cx,
     commit_client: StoreClient,
+    commit_metrics: super::StoreCommitMetrics,
     mut sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -758,6 +760,7 @@ async fn run_qmdb_committer<Cx, H>(
                 CommitPipeline {
                     commits: &mut commits,
                     commit_client: &commit_client,
+                    commit_metrics: &commit_metrics,
                     state_writer: &state_writer,
                     transaction_writer: &transaction_writer,
                 },
@@ -773,6 +776,7 @@ async fn run_qmdb_committer<Cx, H>(
                 context.child("watermarks"),
                 &mut pending_completions,
                 &commit_client,
+                &commit_metrics,
                 &state_writer,
                 &transaction_writer,
             )
@@ -796,6 +800,7 @@ async fn run_qmdb_committer<Cx, H>(
                             CommitPipeline {
                                 commits: &mut commits,
                                 commit_client: &commit_client,
+                                commit_metrics: &commit_metrics,
                                 state_writer: &state_writer,
                                 transaction_writer: &transaction_writer,
                             },
@@ -835,6 +840,7 @@ async fn run_qmdb_committer<Cx, H>(
                     context.child("watermarks"),
                     &mut pending_completions,
                     &commit_client,
+                    &commit_metrics,
                     &state_writer,
                     &transaction_writer,
                 )
@@ -873,6 +879,7 @@ where
         pipeline.commits,
         context.child("store_commit"),
         pipeline.commit_client.clone(),
+        pipeline.commit_metrics.clone(),
         batch,
     );
     sql_writer
@@ -1017,6 +1024,7 @@ fn spawn_commit<Cx>(
     commits: &mut JoinSet<CommittedQmdbBatch>,
     context: Cx,
     commit_client: StoreClient,
+    commit_metrics: super::StoreCommitMetrics,
     commit: QmdbCommitBatch,
 ) where
     Cx: Spawner,
@@ -1025,6 +1033,7 @@ fn spawn_commit<Cx>(
         let store_seq = commit_required_batch_blocking(
             context.child("finalized_upload"),
             commit_client,
+            commit_metrics,
             commit.store_batch,
         )
         .await;
@@ -1105,6 +1114,7 @@ where
 async fn flush_qmdb_watermarks<Cx, H>(
     context: Cx,
     commit_client: &StoreClient,
+    commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
 ) -> Option<u64>
@@ -1140,6 +1150,7 @@ where
     let seq = commit_required_batch_blocking(
         context.child("watermark_store_commit"),
         commit_client.clone(),
+        commit_metrics.clone(),
         batch,
     )
     .await;
@@ -1156,6 +1167,7 @@ async fn flush_and_complete_published_uploads<Cx, H>(
     context: Cx,
     pending: &mut VecDeque<PendingUploadCompletion>,
     commit_client: &StoreClient,
+    commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
 ) where
@@ -1175,8 +1187,14 @@ async fn flush_and_complete_published_uploads<Cx, H>(
         return;
     }
 
-    let watermark_seq =
-        flush_qmdb_watermarks(context, commit_client, state_writer, transaction_writer).await;
+    let watermark_seq = flush_qmdb_watermarks(
+        context,
+        commit_client,
+        commit_metrics,
+        state_writer,
+        transaction_writer,
+    )
+    .await;
     let completed = complete_published_uploads(pending, state_writer, transaction_writer).await;
     if completed > 0 || watermark_seq.is_some() {
         debug!(
@@ -1241,38 +1259,15 @@ fn prepare_sql_rows<'a>(
     Ok(writer.prepare_flush()?)
 }
 
-/// Store namespace prefix for account-state QMDB rows.
-pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, STATE_QMDB_PREFIX_VALUE)
-}
-
-/// Store namespace prefix for transaction-history QMDB rows.
-pub fn transactions_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, TRANSACTIONS_QMDB_PREFIX_VALUE)
-}
-
-/// Clone `client` into the account-state QMDB namespace.
-pub fn state_qmdb_client(client: &StoreClient) -> Result<StoreClient, PublishError> {
-    Ok(client.with_key_prefix(state_qmdb_prefix()?))
-}
-
-/// Clone `client` into the transaction-history QMDB namespace.
-pub fn transactions_qmdb_client(client: &StoreClient) -> Result<StoreClient, PublishError> {
-    Ok(client.with_key_prefix(transactions_qmdb_prefix()?))
-}
-
 async fn recover_state_writer_state<H>(
-    client: StoreClient,
+    client: PrefixedStoreClient,
 ) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
     let reader =
-        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_client(
-            client,
-            (),
-        );
+        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::new(client, ());
     recover_writer_state::<H, _, _>(
         reader.writer_location_watermark().await?,
         |watermark, max| {
@@ -1288,14 +1283,13 @@ where
 }
 
 async fn recover_transaction_writer_state<H>(
-    client: StoreClient,
+    client: PrefixedStoreClient,
 ) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
-    let reader =
-        KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::from_client(client, ());
+    let reader = KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::new(client, ());
     recover_writer_state::<H, _, _>(
         reader.writer_location_watermark().await?,
         |watermark, max| {
@@ -1352,7 +1346,7 @@ async fn build_state_delta<E, H, P, S>(
     state_db: &StateDatabase<E, H, commonware_storage::translator::EightCap, S>,
 ) -> Result<Vec<StateOperation>, PublishError>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     S: Strategy,
@@ -1435,7 +1429,7 @@ async fn load_state_ops<E, H, S>(
         QmdbFamily,
         E,
         AccountKey,
-        Account,
+        ChainAccount,
         H,
         commonware_storage::translator::EightCap,
         S,
@@ -1444,7 +1438,7 @@ async fn load_state_ops<E, H, S>(
     end: u64,
 ) -> Result<Vec<StateOperation>, PublishError>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -1474,7 +1468,7 @@ fn encode_account_operation(operation: LocalStateOperation) -> StateOperation {
     }
 }
 
-fn encode_account(account: Account) -> AccountValue {
+fn encode_account(account: ChainAccount) -> AccountValue {
     let bytes = account.encode();
     let mut out = [0u8; ChainAccount::SIZE];
     out.copy_from_slice(&bytes);
@@ -1554,36 +1548,22 @@ const fn next_writer_location(watermark: Option<Location<QmdbFamily>>) -> u64 {
     }
 }
 
-async fn commit_with_retry(client: &StoreClient, batch: &StoreWriteBatch) -> u64 {
-    let mut attempt = 0u32;
-    loop {
-        match batch.commit(client).await {
-            Ok(seq) => return seq,
-            Err(error) => {
-                attempt = attempt.saturating_add(1);
-                warn!(
-                    ?error,
-                    attempt,
-                    rows = batch.len(),
-                    "indexer finalized index upload failed, retrying"
-                );
-                sleep(retry_backoff(attempt)).await;
-            }
-        }
-    }
-}
-
-async fn commit_required_batch(client: StoreClient, batch: StoreWriteBatch) -> u64 {
+async fn commit_required_batch(
+    client: StoreClient,
+    metrics: super::StoreCommitMetrics,
+    batch: StoreWriteBatch,
+) -> u64 {
     assert!(
         !batch.is_empty(),
         "QMDB component batches must contain at least one row"
     );
-    commit_with_retry(&client, &batch).await
+    super::commit_with_retry(&client, &batch, "finalized index upload", &metrics).await
 }
 
 async fn commit_required_batch_blocking<Cx>(
     context: Cx,
     client: StoreClient,
+    metrics: super::StoreCommitMetrics,
     batch: StoreWriteBatch,
 ) -> u64
 where
@@ -1591,23 +1571,15 @@ where
 {
     context
         .shared(true)
-        .spawn(move |_| async move { commit_required_batch(client, batch).await })
+        .spawn(move |_| async move { commit_required_batch(client, metrics, batch).await })
         .await
         .expect("QMDB Store commit task exited")
-}
-
-fn retry_backoff(attempt: u32) -> Duration {
-    const INITIAL: Duration = Duration::from_millis(100);
-    const MAX: Duration = Duration::from_secs(2);
-    let factor = 1u32 << attempt.min(5);
-    INITIAL.saturating_mul(factor).min(MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
-    use bytes::Bytes;
     use commonware_consensus::{
         simplex::types::Context as SimplexContext,
         types::{Round, View, coding::Commitment},
@@ -1642,23 +1614,12 @@ mod tests {
     const TEST_PAGE_CACHE_CAPACITY: std::num::NonZero<usize> = NZUsize!(1024);
 
     #[test]
-    fn qmdb_operation_logs_use_distinct_store_namespaces() {
-        let state = state_qmdb_prefix().expect("state prefix");
-        let transactions = transactions_qmdb_prefix().expect("transaction prefix");
-
-        assert_eq!(state.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
-        assert_eq!(state.prefix(), STATE_QMDB_PREFIX_VALUE);
-        assert_eq!(transactions.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
-        assert_eq!(transactions.prefix(), TRANSACTIONS_QMDB_PREFIX_VALUE);
-        assert_ne!(state.prefix(), transactions.prefix());
-    }
-
-    #[test]
     fn sql_rows_stage_into_store_batch() {
         let client = StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
         let mut batch = StoreWriteBatch::new();
 
-        let schema = build_meta_schema(client).expect("schema");
+        let schema = build_meta_schema(sql_meta_client(&client).expect("sql metadata client"))
+            .expect("schema");
         let mut writer = schema.batch_writer();
         let rows = [
             super::super::SqlRow {
@@ -1678,7 +1639,7 @@ mod tests {
                 values: vec![
                     CellValue::FixedBinary(vec![3u8; 32]),
                     CellValue::UInt64(1),
-                    CellValue::Utf8("010203".to_string()),
+                    CellValue::Binary(vec![0x01, 0x02, 0x03]),
                 ],
             },
         ];
@@ -1699,21 +1660,22 @@ mod tests {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let client =
                 StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
-            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
+            let state_writer = Arc::new(StateWriter::<Sha256>::fresh(
                 state_qmdb_client(&client).expect("state client"),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::fresh(
                 transactions_qmdb_client(&client).expect("transaction client"),
             ));
-            let schema = build_meta_schema(client.clone()).expect("schema");
+            let schema = build_meta_schema(sql_meta_client(&client).expect("sql metadata client"))
+                .expect("schema");
             let sql_writer = schema.batch_writer();
 
             let seed = 1u8;
-            let key = AccountKey::from_bytes(Bytes::from(vec![seed; AccountKey::SIZE])).unwrap();
+            let key = AccountKey::from([seed; AccountKey::SIZE]);
             let state_ops = [
                 StateOperation::Update(UnorderedUpdate(
                     key,
-                    encode_account(Account {
+                    encode_account(ChainAccount {
                         balance: u64::from(seed),
                         nonce: Nonce::default(),
                         private: Default::default(),
@@ -1772,14 +1734,13 @@ mod tests {
     #[test]
     fn grouped_watermark_flush_completes_multiple_uploads() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
             let state_writer =
-                StateWriter::<Sha256>::empty(state_qmdb_client(&client).expect("state client"));
-            let transaction_writer = TransactionWriter::<Sha256>::empty(
+                StateWriter::<Sha256>::fresh(state_qmdb_client(&client).expect("state client"));
+            let transaction_writer = TransactionWriter::<Sha256>::fresh(
                 transactions_qmdb_client(&client).expect("transaction client"),
             );
 
@@ -1864,6 +1825,7 @@ mod tests {
                 context.child("grouped_watermark"),
                 &mut pending,
                 &client,
+                &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
             )
@@ -1886,18 +1848,18 @@ mod tests {
     #[test]
     fn out_of_order_store_commits_do_not_publish_past_prefix_holes() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
-            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
+            let state_writer = Arc::new(StateWriter::<Sha256>::fresh(
                 state_qmdb_client(&client).expect("state client"),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::fresh(
                 transactions_qmdb_client(&client).expect("transaction client"),
             ));
-            let schema = build_meta_schema(client.clone()).expect("schema");
+            let schema = build_meta_schema(sql_meta_client(&client).expect("sql metadata client"))
+                .expect("schema");
             let mut sql_writer = schema.batch_writer();
 
             let (first_completion, mut first_rx) = oneshot::channel();
@@ -1993,6 +1955,7 @@ mod tests {
                 context.child("watermarks"),
                 &mut pending,
                 &client,
+                &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
             )
@@ -2008,14 +1971,14 @@ mod tests {
     #[test]
     fn queued_upload_completes_through_publisher() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
                 &url,
                 2,
+                crate::publisher::StoreCommitMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2034,8 +1997,7 @@ mod tests {
     #[test]
     fn queued_upload_roots_match_application_roots() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
@@ -2043,6 +2005,7 @@ mod tests {
                 context.child("qmdb_publisher"),
                 &url,
                 2,
+                crate::publisher::StoreCommitMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2056,7 +2019,7 @@ mod tests {
                 vec![
                     (
                         account_key(1),
-                        Account {
+                        ChainAccount {
                             balance: 10,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2064,7 +2027,7 @@ mod tests {
                     ),
                     (
                         account_key(2),
-                        Account {
+                        ChainAccount {
                             balance: 20,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2091,7 +2054,7 @@ mod tests {
                 vec![
                     (
                         account_key(1),
-                        Account {
+                        ChainAccount {
                             balance: 9,
                             nonce: Nonce::new(1, 0),
                             private: Default::default(),
@@ -2099,7 +2062,7 @@ mod tests {
                     ),
                     (
                         account_key(3),
-                        Account {
+                        ChainAccount {
                             balance: 30,
                             nonce: Nonce::default(),
                             private: Default::default(),
@@ -2127,14 +2090,18 @@ mod tests {
     #[test]
     fn qmdb_publisher_shutdown_joins_background_workers() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let publisher = Publisher::<
                 commonware_cryptography::sha256::Sha256,
                 commonware_cryptography::ed25519::PublicKey,
-            >::connect(context.child("qmdb_publisher"), &url, 1)
+            >::connect(
+                context.child("qmdb_publisher"),
+                &url,
+                1,
+                crate::publisher::StoreCommitMetrics::new(&context),
+            )
             .await
             .expect("publisher connects");
 
@@ -2182,6 +2149,7 @@ mod tests {
                 write_buffer: TEST_WRITE_BUFFER,
             },
             translator: EightCap,
+            init_cache_size: Some(NZUsize!(1024)),
         }
     }
 
@@ -2207,11 +2175,11 @@ mod tests {
         databases: &Databases<E, Sha256, EightCap, Sequential>,
         parent: Option<&EngineBlock<Sha256, ed25519::PublicKey>>,
         height: u64,
-        state_updates: Vec<(AccountKey, Account)>,
+        state_updates: Vec<(AccountKey, ChainAccount)>,
         transactions: Vec<SignedTransaction<Sha256>>,
     ) -> EngineBlock<Sha256, ed25519::PublicKey>
     where
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     {
         let (state_batch, transaction_batch) = databases.new_batches().await;
         let state_batch = state_updates
@@ -2272,7 +2240,7 @@ mod tests {
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
     ) where
         Cx: Spawner,
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     {
         let (state_next, transaction_next) = publisher.next_locations().await;
         let upload = Publisher::build_queued_finalized_upload_with_context(
@@ -2292,24 +2260,16 @@ mod tests {
             .expect("queued upload accepted");
         assert!(completion.wait().await, "queued upload completed");
 
-        let state_reader = UnorderedClient::<
-            QmdbFamily,
-            Sha256,
-            AccountKey,
-            AccountValue,
-            StateEncoding,
-        >::from_client(
-            state_qmdb_client(client).expect("state client"), ()
-        );
-        let transaction_reader = KeylessClient::<
-            QmdbFamily,
-            Sha256,
-            Sha256Digest,
-            TransactionEncoding<Sha256>,
-        >::from_client(
-            transactions_qmdb_client(client).expect("transaction client"),
-            (),
-        );
+        let state_reader =
+            UnorderedClient::<QmdbFamily, Sha256, AccountKey, AccountValue, StateEncoding>::new(
+                state_qmdb_client(client).expect("state client"),
+                (),
+            );
+        let transaction_reader =
+            KeylessClient::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
+                transactions_qmdb_client(client).expect("transaction client"),
+                (),
+            );
         let state_tip = Location::new(block.header.state_range.end() - 1);
         let transaction_tip = Location::new(block.header.transactions_range.end() - 1);
 
@@ -2358,15 +2318,11 @@ mod tests {
         client: &StoreClient,
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
     ) {
-        let reader = KeylessClient::<
-            QmdbFamily,
-            Sha256,
-            Sha256Digest,
-            TransactionEncoding<Sha256>,
-        >::from_client(
-            transactions_qmdb_client(client).expect("transaction client"),
-            (),
-        );
+        let reader =
+            KeylessClient::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
+                transactions_qmdb_client(client).expect("transaction client"),
+                (),
+            );
         let rows = encode_indexed_block_rows_at(block, 0);
         let tx_count =
             u64::try_from(rows.transaction_digests.len()).expect("transaction count fits u64");
@@ -2408,7 +2364,7 @@ mod tests {
     }
 
     fn account_key(seed: u64) -> AccountKey {
-        AccountKey::from_bytes(Bytes::from(vec![seed as u8; AccountKey::SIZE])).unwrap()
+        AccountKey::from([seed as u8; AccountKey::SIZE])
     }
 
     fn signed_transaction(seed: u64, nonce: u64) -> SignedTransaction<Sha256> {
@@ -2452,11 +2408,11 @@ mod tests {
     }
 
     fn state_ops(seed: u8) -> Vec<StateOperation> {
-        let key = AccountKey::from_bytes(Bytes::from(vec![seed; AccountKey::SIZE])).unwrap();
+        let key = AccountKey::from([seed; AccountKey::SIZE]);
         vec![
             StateOperation::Update(UnorderedUpdate(
                 key,
-                encode_account(Account {
+                encode_account(ChainAccount {
                     balance: u64::from(seed),
                     nonce: Nonce::default(),
                     private: Default::default(),
@@ -2491,11 +2447,11 @@ mod tests {
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
             .seal(&mut Sha256::default());
-        let account_key = AccountKey::from_bytes(Bytes::from(vec![1u8; AccountKey::SIZE])).unwrap();
+        let account_key = AccountKey::from([1u8; AccountKey::SIZE]);
         let state_delta = vec![
             StateOperation::Update(UnorderedUpdate(
                 account_key,
-                encode_account(Account {
+                encode_account(ChainAccount {
                     balance: 1,
                     nonce: Nonce::default(),
                     private: Default::default(),
@@ -2505,11 +2461,11 @@ mod tests {
         ];
 
         QueuedFinalizedUpload {
-            block,
+            block: Arc::new(block),
             finalized_ts_micros: 1_000,
             state_start: 0,
             transaction_start: 0,
-            state_delta,
+            state_delta: Arc::new(state_delta),
         }
     }
 }

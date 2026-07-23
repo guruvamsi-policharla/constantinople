@@ -1,5 +1,6 @@
 //! YAML-serializable validator configuration.
 
+use ahash::AHashMap;
 use commonware_codec::{Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
@@ -14,7 +15,7 @@ use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -32,12 +33,24 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    1024 * 1024
+}
+
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+pub(crate) const fn default_page_cache_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
 pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
+}
+
+pub(crate) const fn default_public_key_cache_size() -> usize {
+    100_000
 }
 
 /// Indexer wiring for a secondary validator.
@@ -52,7 +65,9 @@ pub(crate) const fn default_relayer_retry_views() -> u64 {
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
+    /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// Number of blocks buffered before upload.
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
 }
@@ -67,16 +82,23 @@ pub enum StartupModeConfig {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorConfig {
+    /// Hex-encoded ed25519 private key.
     pub private_key: String,
+    /// Hex-encoded DKG output (threshold public material).
     pub dkg_output: String,
     /// Hex-encoded DKG share for this validator. Empty string `""` indicates
     /// a secondary (non-voting) validator that holds no share.
     pub dkg_share: String,
+    /// Startup sync mode.
     #[serde(default)]
     pub startup: StartupModeConfig,
+    /// p2p listen port.
     pub listen_port: u16,
+    /// Hex-encoded ed25519 public key of the genesis leader.
     pub genesis_leader: String,
+    /// Storage partition prefix for this validator.
     pub partition_prefix: String,
+    /// Number of primary validators (DKG participant count).
     pub num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
@@ -85,25 +107,41 @@ pub struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     pub secondary_validators: Vec<String>,
+    /// Logging verbosity.
     pub log_level: String,
+    /// Tokio worker threads.
     pub worker_threads: usize,
+    /// Rayon threads for parallel verification.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
+    /// HTTP service port.
     pub http_port: u16,
+    /// Prometheus metrics port.
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Maximum bytes proposed per block.
     #[serde(default = "default_max_propose_bytes")]
     pub max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    #[serde(default = "default_max_shard_bytes")]
+    pub max_shard_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    #[serde(default = "default_page_cache_bytes")]
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    #[serde(default = "default_page_cache_bytes")]
+    pub other_page_cache_bytes: usize,
+    /// Capacity of the decompressed public key cache.
+    #[serde(default = "default_public_key_cache_size")]
+    pub public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
     pub traces: f64,
-    /// Optional OTLP HTTP traces endpoint. Local configs set this directly;
-    /// deployer configs usually derive it from the monitoring host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub otel_endpoint: Option<String>,
+    /// Bootstrapper peers used for initial p2p discovery.
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -116,69 +154,110 @@ pub struct ValidatorConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerConfig {
+    /// Views to retry a submission before giving up.
     #[serde(default = "default_relayer_retry_views")]
     pub max_retry_views: u64,
+    /// Per-leader relayer endpoints.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerLeaderConfig {
+    /// Hex-encoded ed25519 public key of the target leader.
     pub public_key: String,
+    /// Relayer URL for submitting to this leader.
     pub url: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NamedBootstrapperEntry {
+    /// Hex-encoded ed25519 public key of the bootstrapper.
     pub public_key: String,
+    /// Host name used to resolve the bootstrapper's address.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PeerEntry {
+    /// Host name (hex-encoded public key).
     name: String,
+    /// p2p socket address.
     p2p: String,
+    /// HTTP socket address.
     http: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PeersFile {
+    /// Primary validator peers.
     validators: Vec<PeerEntry>,
+    /// Secondary (non-voting) validator peers.
     #[serde(default)]
     secondaries: Vec<PeerEntry>,
 }
 
 /// Decoded key material and network info ready for use by the engine.
 pub struct DecodedConfig {
+    /// This validator's ed25519 private key.
     pub signer: ed25519::PrivateKey,
+    /// This validator's ed25519 public key.
     pub public_key: ed25519::PublicKey,
+    /// Decoded DKG output (threshold public material).
     pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
     /// DKG share for this validator. `None` for secondary (non-voting) validators.
     pub share: Option<Share>,
+    /// Genesis leader public key.
     pub genesis_leader: ed25519::PublicKey,
+    /// Local p2p bind address.
     pub listen_bind: SocketAddr,
+    /// Advertised p2p address other peers dial.
     pub listen_advertise: SocketAddr,
     /// Primary (voting) validators in DKG order.
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
+    /// Bootstrapper peers with resolved addresses.
     pub bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    /// Storage partition prefix for this validator.
     pub partition_prefix: String,
 }
 
 pub struct LoadedConfig {
+    /// Decoded key material and network info.
     pub decoded: DecodedConfig,
+    /// Startup sync mode.
     pub startup: StartupModeConfig,
+    /// Logging verbosity.
     pub log_level: String,
+    /// Tokio worker threads.
     pub worker_threads: usize,
+    /// Rayon threads for parallel verification.
     pub rayon_threads: usize,
+    /// HTTP service bind address.
     pub http_listen: SocketAddr,
+    /// Prometheus metrics bind address.
     pub metrics_listen: SocketAddr,
+    /// Maximum bytes proposed per block.
     pub max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    pub max_shard_bytes: usize,
     pub max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    pub other_page_cache_bytes: usize,
+    /// Capacity of the decompressed public key cache.
+    pub public_key_cache_size: usize,
+    /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
     pub otel: Option<(String, f64)>,
+    /// Whether logs are emitted as JSON.
     pub json_logs: bool,
+    /// Whether this node is managed by the deployer.
     pub deployer_managed: bool,
+    /// Optional indexer wiring (secondaries only).
     pub indexer: Option<IndexerConfig>,
+    /// Optional relayer wiring (secondaries only).
     pub relayer: Option<RelayerConfig>,
 }
 
@@ -229,7 +308,7 @@ fn parse_socket(name: &str, socket: &str) -> SocketAddr {
         .unwrap_or_else(|_| panic!("failed to parse {name} socket"))
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &HashMap<&str, std::net::IpAddr>) -> String {
+fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
     };
@@ -298,7 +377,11 @@ fn decode_with_network(
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
+        state_page_cache_bytes: config.state_page_cache_bytes,
+        other_page_cache_bytes: config.other_page_cache_bytes,
+        max_shard_bytes: config.max_shard_bytes,
         max_pool_bytes: config.max_pool_bytes,
+        public_key_cache_size: config.public_key_cache_size,
         otel,
         json_logs,
         deployer_managed: json_logs,
@@ -354,7 +437,7 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
             let name = peer.name.clone();
             (name, peer)
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     let self_peer = peers_by_name
         .get(&self_name)
@@ -375,15 +458,13 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
         })
         .collect();
 
-    let otel = local_otel(&config);
-
     decode_with_network(
         config,
         public_listen,
         primary_participants,
         secondary_participants,
         bootstrappers,
-        otel,
+        None,
         false,
     )
 }
@@ -406,7 +487,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .hosts
         .iter()
         .map(|host| (host.name.as_str(), host.ip))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     if let Some(indexer) = config.indexer.as_mut() {
         indexer.chain_indexer_url =
@@ -437,11 +518,10 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .collect();
 
     let otel = (config.traces > 0.0).then(|| {
-        let endpoint = config
-            .otel_endpoint
-            .clone()
-            .unwrap_or_else(|| format!("http://{}:4318/v1/traces", hosts.monitoring.private));
-        (endpoint, config.traces)
+        (
+            format!("http://{}:4318/v1/traces", hosts.monitoring.private),
+            config.traces,
+        )
     });
 
     decode_with_network(
@@ -455,21 +535,12 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
     )
 }
 
-fn local_otel(config: &ValidatorConfig) -> Option<(String, f64)> {
-    (config.traces > 0.0).then(|| {
-        let endpoint = config
-            .otel_endpoint
-            .clone()
-            .unwrap_or_else(|| "http://127.0.0.1:4318/v1/traces".to_string());
-        (endpoint, config.traces)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_upload_buffer,
+        default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, default_upload_buffer,
         load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
@@ -589,9 +660,12 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                other_page_cache_bytes: default_page_cache_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                otel_endpoint: None,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -623,9 +697,12 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                other_page_cache_bytes: default_page_cache_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                otel_endpoint: None,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -655,6 +732,7 @@ mod tests {
             vec![bootstrapper_entry(peer_key)],
         );
         config.max_propose_bytes = 1_234_567;
+        config.max_shard_bytes = 2_345_678;
         config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
@@ -686,6 +764,7 @@ mod tests {
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_shard_bytes, 2_345_678);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
@@ -722,6 +801,7 @@ mod tests {
             vec![bootstrapper_entry(peer_key)],
         );
         config.max_propose_bytes = 1_234_567;
+        config.max_shard_bytes = 2_345_678;
         config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
@@ -754,6 +834,7 @@ hosts:
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_shard_bytes, 2_345_678);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
@@ -974,54 +1055,6 @@ hosts:
         let loaded = load_local_config(&peers_path, &config_path);
 
         assert_eq!(loaded.startup, StartupModeConfig::StateSync);
-
-        let _ = fs::remove_file(config_path);
-        let _ = fs::remove_file(peers_path);
-    }
-
-    #[test]
-    fn local_config_enables_otel_traces() {
-        let cluster = Cluster::new(2, 0);
-        let self_key = &cluster.primary_keys[0];
-        let peer_key = &cluster.primary_keys[1];
-        let config_path = temp_path("validator-config", ".yaml");
-        let peers_path = temp_path("validator-peers", ".yaml");
-
-        let mut config = cluster.primary_config(
-            0,
-            StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(peer_key)],
-        );
-        config.traces = 1.0;
-        config.otel_endpoint = Some("http://127.0.0.1:4318/v1/traces".to_string());
-        fs::write(
-            &config_path,
-            serde_yaml::to_string(&config).expect("config should serialize"),
-        )
-        .expect("config should write");
-        fs::write(
-            &peers_path,
-            format!(
-                r#"validators:
-  - name: "{self_name}"
-    p2p: "127.0.0.1:9000"
-    http: "127.0.0.1:8080"
-  - name: "{peer_name}"
-    p2p: "127.0.0.1:9001"
-    http: "127.0.0.1:8081"
-"#,
-                self_name = hex(&self_key.encode()),
-                peer_name = hex(&peer_key.encode()),
-            ),
-        )
-        .expect("peers should write");
-
-        let loaded = load_local_config(&peers_path, &config_path);
-
-        assert_eq!(
-            loaded.otel,
-            Some(("http://127.0.0.1:4318/v1/traces".to_string(), 1.0))
-        );
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);

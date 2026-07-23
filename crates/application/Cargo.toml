@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-application"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -15,32 +15,33 @@ workspace = true
 # Workspace
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
-private-payments.workspace = true
 
 # Commonware
 commonware-glue.workspace = true
 commonware-codec.workspace = true
+commonware-macros.workspace = true
 commonware-utils.workspace = true
 commonware-runtime.workspace = true
 commonware-storage.workspace = true
 commonware-parallel.workspace = true
+commonware-privacy.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
-rand.workspace = true
+rand = { workspace = true, features = ["thread_rng"] }
 bytes.workspace = true
 futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
-rand_core.workspace = true
 prometheus-client.workspace = true
-hashbrown = { workspace = true, features = ["default-hasher"] }
+ahash.workspace = true
 
 [dev-dependencies]
 # Workspace
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
+commonware-actor.workspace = true
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
@@ -49,7 +50,20 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 # Other
 rand.workspace = true
 criterion.workspace = true
+mimalloc.workspace = true
 
 [[bench]]
 name = "executor"
+harness = false
+
+[[bench]]
+name = "compute"
+harness = false
+
+[[bench]]
+name = "selective"
+harness = false
+
+[[bench]]
+name = "finalize"
 harness = false

@@ -67,6 +67,28 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
+Add `--spammer-workload private` to instead generate private payments (each
+account cycles fund -> rollover -> transfer). Use `--spammer-private-proof-mode
+simulated` to run the whole cluster (validators, indexer, and spammer) on the
+**zkpari** BN254 backend, with the spammer using the simulator trapdoor to
+generate transfer proofs cheaply — the generated commands add the
+`privacy-backend-zkpari`/`privacy-backend-simulator` features automatically. The
+default (`real`) keeps the fast mock backend:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --relayer --output-dir ./local \
+  --spammer --spammer-workload private \
+  local --base-port 3000 --base-http-port 8080
+```
+
+The private spammer runs `--spammer-private-lanes` (default `8`) concurrent
+lanes per validator, each over a disjoint slice of accounts. The deployer
+multiplies this by `--validators` before starting the spammer. A single lane
+only lands one batch per finalization round-trip, leaving the blocks in between
+empty; more lanes keep more batches in flight so every block is populated.
+Raise it if you still see gaps.
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
@@ -86,17 +108,6 @@ locally per submitter. The spammer still submits only one batch at a time to eac
 `spammer_accounts * relayer_submitters`.
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
-Add `--spammer-worker-threads N` (default `2`) to set the spammer's async
-runtime worker thread count.
-Add `--spammer-workload private` to submit a private-payment workload using
-the chain backend. Each account funds most of its starting balance, keeps a
-small public reserve for recovery, explicitly rolls funded or incoming private
-balance over, then submits private transfers until its current private balance
-is exhausted.
-Add `--spammer-private-proof-mode simulated` for local/private testnets that
-should use the backend's trapdoor simulator instead of generating real private
-transfer proofs. The generated local command automatically builds
-`constantinople-spammer` with `--features private-payment-simulator`.
 
 You can also run the spammer manually against an existing local cluster:
 
@@ -208,25 +219,6 @@ mprocs ...   # paste the line printed by `generate`
 
 Then open <http://localhost:5173> in your browser to watch transactions
 arrive in real time.
-
-### Local OTLP Traces
-
-Local validator configs can export tracing spans over OTLP HTTP. Start an
-OpenTelemetry-compatible collector such as Tempo on `127.0.0.1:4318`, then add
-`--traces` to the local target:
-
-```sh
-cargo run --bin constantinople-deploy -- generate \
-  --validators 4 --indexer --relayer \
-  --output-dir ./local \
-  --spammer \
-  local \
-  --traces 1.0 \
-  --otel-endpoint http://127.0.0.1:4318/v1/traces
-```
-
-`--traces` is a sampling rate in `0.0..=1.0`; `0.0` disables OTLP export. The
-endpoint defaults to `http://127.0.0.1:4318/v1/traces`.
 
 To recover explorer verification material from an existing generated node
 config:

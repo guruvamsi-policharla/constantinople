@@ -1,4 +1,5 @@
 [workspace.package]
+version = "2026.7.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -35,52 +36,53 @@ missing-const-for-fn = "warn"
 use-self = "warn"
 option-if-let-else = "warn"
 redundant-clone = "warn"
+large_futures = "warn"
 
 [workspace.dependencies]
 # Workspace
 constantinople-engine = { path = "crates/engine" }
 constantinople-indexer = { path = "crates/indexer" }
 constantinople-mempool = { path = "crates/mempool" }
-private-payments = { path = "../private-payments/crates/payments" }
-private-payments-mock = { path = "../private-payments/crates/mock", features = ["commonware-codec"] }
-zkpari = { path = "../private-payments/crates/zkpari", features = ["commonware-codec"] }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
+commonware-actor = "2026.7.0"
+commonware-p2p = "2026.7.0"
+commonware-glue = "2026.7.0"
+commonware-math = "2026.7.0"
+commonware-codec = "2026.7.0"
+commonware-formatting = "2026.7.0"
+commonware-utils = "2026.7.0"
+commonware-coding = "2026.7.0"
+commonware-macros = "2026.7.0"
+commonware-runtime = "2026.7.0"
+commonware-storage = "2026.7.0"
+commonware-deployer = "2026.7.0"
+commonware-parallel = "2026.7.0"
+commonware-resolver = "2026.7.0"
+commonware-broadcast = "2026.7.0"
+commonware-consensus = "2026.7.0"
+commonware-cryptography = { version = "2026.7.0", default-features = false }
+commonware-privacy = { path = "../monorepo/privacy", default-features = false }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
+exoware-sdk = "2026.7.1"
+exoware-server = "2026.7.1"
+exoware-qmdb = "2026.7.1"
+exoware-simplex = "2026.7.1"
+exoware-simulator = "2026.7.1"
+exoware-sql = "2026.7.1"
 datafusion = "52"
 
 # Other
+ark-bn254 = { version = "0.6.0", default-features = false }
 axum = "0.8"
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
-ark-bn254 = { version = "^0.6.0", default-features = false, features = ["curve"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }
-rand = { version = "0.8.5", default-features = false }
+hashbrown = { version = "0.17.0", default-features = false }
+rand = { version = "0.10.2", default-features = false }
+rand_core = "0.10.1"
 bytes = { version = "1.11.1", default-features = false }
 criterion = "0.7.0"
 rayon = "1.10"
@@ -91,15 +93,29 @@ rstest = "0.26.0"
 futures = { version = "0.3.31", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
-hashbrown = { version = "0.17.0", default-features = false }
-rand_core = "0.6.4"
-reqwest = { version = "0.12", default-features = false }
+ahash = "0.8.12"
+reqwest = { version = "0.13.4", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
 serde_yaml = "0.9"
+mimalloc = "0.1.52"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+
+# `commonware-privacy` is consumed as a path dependency from the sibling
+# `../monorepo` checkout (branch gv-privacy-2026.7, based on the v2026.7.0
+# release). The leaf crates it pulls in as path dependencies must be patched to
+# the same checkout so the workspace sees exactly one copy of each; the
+# checkout matches the published 2026.7.0 crates, so the patched sources are
+# version-identical to the registry ones. Docker/remote builds mount that
+# checkout — see docker/justfile.
+[patch.crates-io]
+commonware-codec = { path = "../monorepo/codec" }
+commonware-codec-macros = { path = "../monorepo/codec/macros" }
+commonware-macros = { path = "../monorepo/macros" }
+commonware-macros-impl = { path = "../monorepo/macros/impl" }
+commonware-parallel = { path = "../monorepo/parallel" }
 
 [profile.samply]
 inherits = "release"

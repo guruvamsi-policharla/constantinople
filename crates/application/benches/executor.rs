@@ -1,6 +1,6 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
-use constantinople_application::executor::{self, State};
+use constantinople_application::executor::{self, PreparedOperation, PrivateVerifications, State};
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
@@ -9,42 +9,69 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::{SeedableRng, rngs::StdRng};
 use std::hint::black_box;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
+type Transfers = Vec<PreparedOperation>;
 
 const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
+
+/// Senders per transaction in the contended fixture (each sender signs this many).
+const SHARED_FANOUT: usize = 8;
 
 fn executor(c: &mut Criterion) {
     let mut group = c.benchmark_group("executor");
 
     for &transaction_count in TRANSACTION_COUNTS {
         group.throughput(Throughput::Elements(transaction_count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("execution", transaction_count),
-            &transaction_count,
-            |bencher, &transaction_count| {
-                let (state, transactions) = build_fixture(transaction_count);
-                let transfers = transactions
-                    .iter()
-                    .map(executor::prepare_transfer)
-                    .collect::<Option<Vec<_>>>()
-                    .expect("bench transactions should prepare");
-                bencher.iter(|| {
-                    black_box(
-                        executor::execute(black_box(&state), black_box(&transfers))
-                            .expect("bench transfers should execute")
-                            .len(),
-                    )
-                });
-            },
-        );
+
+        // Unique senders and recipients (every account touched once).
+        let (state, transfers) = build_unique_fixture(transaction_count);
+        bench_compute(&mut group, "unique", transaction_count, &state, &transfers);
+
+        // Contended accounts: each sender signs several transactions to shared
+        // recipients, so senders and recipients overlap across the batch.
+        let (state, transfers) = build_shared_fixture(transaction_count);
+        bench_compute(&mut group, "shared", transaction_count, &state, &transfers);
     }
 
     group.finish();
 }
 
-fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
+/// Benchmarks only the in-memory CPU cost of the current compute kernel on
+/// pre-loaded state. It does NOT measure the load, which is the part this
+/// change restructures, so it is not a benchmark of the pipeline. For the real
+/// load + compute measurement against a QMDB, run the `compute` bench target.
+fn bench_compute(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    fixture: &str,
+    transaction_count: usize,
+    state: &State,
+    transfers: &Transfers,
+) {
+    group.bench_with_input(
+        BenchmarkId::new(fixture, transaction_count),
+        &transaction_count,
+        |bencher, _| {
+            bencher.iter(|| {
+                black_box(
+                    executor::compute(
+                        black_box(state),
+                        black_box(transfers),
+                        &mut PrivateVerifications::new(),
+                    )
+                    .expect("bench transfers should execute")
+                    .len(),
+                )
+            });
+        },
+    );
+}
+
+fn build_unique_fixture(transaction_count: usize) -> (State, Transfers) {
     let mut accounts = State::new();
     let mut transactions = Vec::with_capacity(transaction_count);
 
@@ -68,8 +95,54 @@ fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
         transactions.push(signer.sign(recipient, 1, 0));
     }
 
-    let valid = executor::propose(&accounts, transactions).valid;
-    (accounts, valid)
+    finalize_fixture(accounts, transactions)
+}
+
+fn build_shared_fixture(transaction_count: usize) -> (State, Transfers) {
+    let account_count = (transaction_count / SHARED_FANOUT).max(1);
+    let signers: Vec<TestSigner> = (0..account_count)
+        .map(|index| TestSigner::new(index as u64))
+        .collect();
+
+    let mut accounts = State::new();
+    for signer in &signers {
+        let public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
+        accounts.insert(
+            AccountKey::from_public_key(&public_key),
+            Account {
+                balance: transaction_count as u64,
+                nonce: Nonce::default(),
+                private: Default::default(),
+            },
+        );
+    }
+
+    let mut nonces = vec![0u64; account_count];
+    let mut transactions = Vec::with_capacity(transaction_count);
+    for index in 0..transaction_count {
+        let sender_index = index % account_count;
+        let recipient_index = (index * 7 + 3) % account_count;
+        let nonce = nonces[sender_index];
+        nonces[sender_index] += 1;
+        transactions.push(signers[sender_index].sign(
+            signers[recipient_index].public_key.clone(),
+            1,
+            nonce,
+        ));
+    }
+
+    finalize_fixture(accounts, transactions)
+}
+
+fn finalize_fixture(accounts: State, transactions: Vec<TestTransaction>) -> (State, Transfers) {
+    let transfers = transactions
+        .iter()
+        .map(executor::prepare_operation)
+        .collect::<Option<Vec<_>>>()
+        .expect("bench transactions should prepare");
+    executor::compute(&accounts, &transfers, &mut PrivateVerifications::new())
+        .expect("bench fixtures must be valid");
+    (accounts, transfers)
 }
 
 struct TestSigner {
@@ -79,7 +152,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new(index: u64) -> Self {
-        let key = ed25519::PrivateKey::random(&mut StdRng::seed_from_u64(index));
+        let key = ed25519::PrivateKey::random(StdRng::seed_from_u64(index));
         let public_key = key.public_key();
         Self { key, public_key }
     }

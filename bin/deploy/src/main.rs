@@ -16,7 +16,7 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
-use rand_core::OsRng;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -27,7 +27,14 @@ use std::{
 use tracing::Level;
 use tracing_subscriber::fmt;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const STORAGE_CLASS: &str = "gp3";
+/// Graviton4 instance type for the binary instances. Must stay on Graviton4 to
+/// match the `neoverse-v2` graviton build target in `docker/docker-bake.hcl`; a
+/// Graviton3 (c7g) type hits illegal instructions on startup.
+const DEFAULT_INSTANCE_TYPE: &str = "c8g.4xlarge";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
@@ -56,9 +63,8 @@ const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
-const DEFAULT_SPAMMER_WORKER_THREADS: usize = 2;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
-const DEFAULT_SPAMMER_PRIVATE_GROUPS: usize = 1;
+const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,43 +74,10 @@ pub(crate) enum StartupModeConfig {
     StateSync,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SpammerWorkload {
-    #[default]
-    Public,
-    Private,
-}
-
-impl SpammerWorkload {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Public => "public",
-            Self::Private => "private",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SpammerPrivateProofMode {
-    #[default]
-    Real,
-    Simulated,
-}
-
-impl SpammerPrivateProofMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Simulated => "simulated",
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
 struct Cli {
+    /// Subcommand to run.
     #[command(subcommand)]
     command: Command,
 }
@@ -122,8 +95,65 @@ struct SimplexVerificationMaterialArgs {
     config: PathBuf,
 }
 
+/// Transaction mix the generated spammer runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerWorkload {
+    #[default]
+    Public,
+    Private,
+}
+
+impl SpammerWorkload {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// Proof mode for the generated spammer's private transfers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpammerProofMode {
+    #[default]
+    Real,
+    Simulated,
+}
+
+impl SpammerProofMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Simulated => "simulated",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct GenerateArgs {
+    /// Number of primary (voting) validators.
     #[arg(long)]
     validators: u32,
     /// Include the full indexer secondary and shared indexer services.
@@ -132,16 +162,49 @@ pub(crate) struct GenerateArgs {
     /// Include a transaction relayer secondary.
     #[arg(long, default_value_t = false)]
     relayer: bool,
+    /// Directory to write the generated deployment into.
     #[arg(long)]
     output_dir: PathBuf,
+    /// Logging verbosity (e.g. info, debug, trace).
     #[arg(long, default_value = "info")]
     log_level: String,
+    /// Tokio worker threads per validator runtime.
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
+    /// Rayon threads per validator for parallel verification.
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Capacity of each node's decompressed public key cache.
+    #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
+    public_key_cache_size: usize,
+    /// Maximum bytes proposed per block (also the maximum accepted
+    /// submission batch size).
+    #[arg(long = "max-propose-bytes", default_value_t = default_max_propose_bytes())]
+    max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
+    max_pool_bytes: usize,
+    /// Capacity in bytes of each validator's state QMDB page cache. Must
+    /// hold the state journal's working set: 512 MiB thrashed once the live
+    /// account set passed ~2M and build/verify doubled on cache misses.
+    #[arg(long = "state-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    state_page_cache_bytes: usize,
+    /// Capacity in bytes of each validator's non-state page cache
+    /// (archives, transaction history, journal).
+    #[arg(long = "other-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    other_page_cache_bytes: usize,
+    /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+    /// Maximum decoded consensus shard payload bytes accepted from peers.
+    ///
+    /// Defaults to a bound derived from `--max-propose-bytes` and the
+    /// validator count: blocks split into `floor((validators - 1) / 3) + 1`
+    /// data shards, so small clusters produce much larger shards than large
+    /// ones. Explicit values below the derived bound are rejected — peers
+    /// would drop every shard of a full block and consensus would wedge.
+    #[arg(long = "max-shard-bytes")]
+    max_shard_bytes: Option<usize>,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
@@ -155,9 +218,6 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
-    /// Number of async runtime worker threads for the spammer.
-    #[arg(long, default_value_t = DEFAULT_SPAMMER_WORKER_THREADS)]
-    spammer_worker_threads: usize,
     /// Number of rayon threads for spammer parallel signing.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
     spammer_rayon_threads: usize,
@@ -170,27 +230,32 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
-    /// Transaction workload emitted by the spammer.
+    /// Transaction mix the spammer generates.
     #[arg(long, value_enum, default_value_t = SpammerWorkload::Public)]
     spammer_workload: SpammerWorkload,
-    /// Independent private global-ring groups per spammer submitter.
+    /// Proof mode for the spammer's private transfers.
+    #[arg(long, value_enum, default_value_t = SpammerProofMode::Real)]
+    spammer_private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch (private workload only).
+    #[arg(long, default_value_t = 64)]
+    spammer_private_batch: usize,
+    /// Concurrent private lanes per primary validator.
     ///
-    /// Only used with `--spammer-workload private`; `--spammer-accounts` is
-    /// the size of each group.
-    #[arg(long, default_value_t = DEFAULT_SPAMMER_PRIVATE_GROUPS)]
-    spammer_private_groups: usize,
-    /// Private transfer proof generation mode for the spammer.
-    ///
-    /// `simulated` is for local/private testnets only and requires building the
-    /// spammer with the private-payment simulator feature.
-    #[arg(long, value_enum, default_value_t = SpammerPrivateProofMode::Real)]
-    spammer_private_proof_mode: SpammerPrivateProofMode,
+    /// The deployer multiplies this by `--validators` before writing the
+    /// spammer config so private workload pressure scales with cluster size.
+    #[arg(long, default_value_t = 8)]
+    spammer_private_lanes: usize,
 
+    /// Deployment target (local or remote).
     #[command(subcommand)]
     target: GenerateTarget,
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "constructed once per invocation, so the size imbalance is harmless"
+)]
 enum GenerateTarget {
     Local(LocalArgs),
     Remote(RemoteArgs),
@@ -198,15 +263,22 @@ enum GenerateTarget {
 
 #[derive(Debug, Args)]
 pub(crate) struct LocalArgs {
+    /// Base p2p listen port; each validator is offset from this.
     #[arg(long, default_value_t = 9000)]
     base_port: u16,
+    /// Base HTTP port; each validator is offset from this.
     #[arg(long, default_value_t = 8080)]
     base_http_port: u16,
+    /// Base metrics port; each validator is offset from this.
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
     /// Local `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the local `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Local `metadata-indexer` read-service port.
     /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
@@ -214,22 +286,30 @@ pub(crate) struct LocalArgs {
     /// Local `qmdb-indexer` read-service port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
-    /// Trace sampling rate (0.0..=1.0) for local validator OTLP uploads.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_sampling_rate)]
-    traces: f64,
-    /// OTLP HTTP traces endpoint used when `--traces` is non-zero.
-    #[arg(long, default_value = "http://127.0.0.1:4318/v1/traces")]
-    otel_endpoint: String,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct RemoteArgs {
+    /// AWS regions to spread validators across (comma-separated).
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for validators, relayer, indexers, and
+    /// spammer. Defaults to a Graviton4 type to match the `neoverse-v2` graviton
+    /// build; do not use Graviton3 (c7g) — those binaries fault on startup.
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     instance_type: String,
+    /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
+    /// Provisioned IOPS for validator gp3 volumes (EBS default when unset).
+    #[arg(long = "storage-iops")]
+    storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for validator gp3 volumes (EBS default
+    /// when unset). Validators write ~4x the raw block per view; the gp3
+    /// default of 125 MiB/s throttles the cluster before either the NIC or
+    /// consensus does.
+    #[arg(long = "storage-throughput")]
+    storage_throughput: Option<i32>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
@@ -239,27 +319,38 @@ pub(crate) struct RemoteArgs {
     /// Provisioned IOPS for the shared chain-indexer io2 volume.
     #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
     chain_indexer_storage_iops: i32,
-    #[arg(long)]
+    /// Graviton4 (c8g) instance type for the monitoring host (Grafana/Prometheus).
+    #[arg(long, default_value = DEFAULT_INSTANCE_TYPE)]
     monitoring_instance_type: String,
+    /// Monitoring instance EBS volume size in GiB.
     #[arg(long)]
     monitoring_storage_size: i32,
+    /// Grafana dashboard JSON to provision on the monitoring instance.
     #[arg(long)]
     dashboard: PathBuf,
+    /// Validator p2p listen port.
     #[arg(long, default_value_t = 9000)]
     listen_port: u16,
+    /// Validator HTTP port.
     #[arg(long, default_value_t = 8080)]
     http_port: u16,
+    /// CIDR ranges allowed to reach the validator HTTP port (comma-separated).
     #[arg(long = "http-cidr", value_delimiter = ',')]
     http_cidrs: Vec<String>,
     /// Shared `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the shared `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Shared `metadata-indexer` query/stream port.
     #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
     /// Shared `qmdb-indexer` query facade port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
+    /// Enable validator CPU profiling.
     #[arg(long, default_value_t = false)]
     profiling: bool,
     /// Trace sampling rate (0.0..=1.0) for validator uploads to the monitoring
@@ -277,15 +368,16 @@ pub(crate) struct RemoteArgs {
 /// Spammer configuration, written as YAML by deploy and read by the spammer binary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SpammerConfig {
+    /// Number of spam accounts per submitter.
     pub accounts: u32,
+    /// Transfer value per spam transaction.
     pub value: u64,
+    /// Seed offset for spam account keys.
     pub seed_offset: u64,
-    /// Number of async runtime worker threads.
-    #[serde(default = "default_spammer_worker_threads")]
-    pub worker_threads: usize,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
+    /// Local HTTP port the spammer serves on.
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
@@ -307,26 +399,40 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
-    /// Transaction workload to submit.
+    /// Transaction mix to submit.
     #[serde(default)]
     pub workload: SpammerWorkload,
-    /// Independent private global-ring groups per relayer submitter.
-    #[serde(default = "default_spammer_private_groups")]
-    pub private_groups: usize,
-    /// Private transfer proof generation mode.
+    /// Proof mode for private transfers.
     #[serde(default)]
-    pub private_proof_mode: SpammerPrivateProofMode,
+    pub private_proof_mode: SpammerProofMode,
+    /// Private operations per submitted batch.
+    #[serde(default = "default_spammer_private_batch")]
+    pub private_batch: usize,
+    /// Concurrent private lanes.
+    #[serde(default = "default_spammer_private_lanes")]
+    pub private_lanes: usize,
+}
+
+const fn default_spammer_private_batch() -> usize {
+    64
+}
+
+const fn default_spammer_private_lanes() -> usize {
+    8
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerConfig {
+    /// Per-leader relayer endpoints.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerLeaderConfig {
+    /// Hex-encoded ed25519 public key of the target leader.
     pub public_key: String,
+    /// Relayer URL for submitting to this leader.
     pub url: String,
 }
 
@@ -352,21 +458,30 @@ fn parse_sampling_rate(value: &str) -> Result<f64, String> {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedBootstrapperEntry {
+    /// Hex-encoded ed25519 public key of the bootstrapper.
     public_key: String,
+    /// Host name used to resolve the bootstrapper's address.
     name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ValidatorConfig {
+    /// Hex-encoded ed25519 private key.
     private_key: String,
+    /// Hex-encoded DKG output (threshold public material).
     dkg_output: String,
     /// Hex-encoded DKG share for this validator. Empty string `""` indicates
     /// a secondary (non-voting) validator that holds no share.
     dkg_share: String,
+    /// Startup sync mode.
     startup: StartupModeConfig,
+    /// p2p listen port.
     listen_port: u16,
+    /// Hex-encoded ed25519 public key of the genesis leader.
     genesis_leader: String,
+    /// Storage partition prefix for this validator.
     partition_prefix: String,
+    /// Number of primary validators (DKG participant count).
     num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
@@ -375,20 +490,33 @@ pub(crate) struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     secondary_validators: Vec<String>,
+    /// Logging verbosity.
     log_level: String,
+    /// Tokio worker threads.
     worker_threads: usize,
+    /// Rayon threads for parallel verification.
     rayon_threads: usize,
+    /// HTTP service port.
     http_port: u16,
+    /// Prometheus metrics port.
     metrics_port: u16,
+    /// Maximum bytes proposed per block.
     max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    max_shard_bytes: usize,
     max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    other_page_cache_bytes: usize,
+    /// Capacity of the decompressed public key cache.
+    #[serde(default = "default_public_key_cache_size")]
+    public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
-    /// Optional OTLP HTTP traces endpoint. Local deploys set this directly;
-    /// remote deploys derive the endpoint from `hosts.yaml` monitoring.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    otel_endpoint: Option<String>,
+    /// Bootstrapper peers used for initial p2p discovery.
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.
@@ -408,55 +536,81 @@ pub(crate) struct ValidatorConfig {
 /// operation logs, and simplex artifacts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
+    /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// Number of blocks buffered before upload.
     pub upload_buffer: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChainIndexerConfig {
+    /// Store port the chain-indexer listens on.
     pub port: u16,
+    /// Directory for chain-indexer data.
     pub data_dir: PathBuf,
+    /// RocksDB parallelism (background compaction/flush jobs). Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataIndexerConfig {
+    /// Read-service port the metadata-indexer listens on.
     pub port: u16,
+    /// URL of the chain-indexer store to read from.
     pub chain_indexer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct QmdbIndexerConfig {
+    /// Query facade port the qmdb-indexer listens on.
     pub port: u16,
+    /// URL of the chain-indexer store to read from.
     pub chain_indexer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PeerEntry {
+    /// Host name (hex-encoded public key).
     name: String,
+    /// p2p socket address.
     p2p: String,
+    /// HTTP socket address.
     http: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PeersConfig {
+    /// Primary validator peers.
     pub validators: Vec<PeerEntry>,
+    /// Secondary (non-voting) validator peers.
     #[serde(default)]
     pub secondaries: Vec<PeerEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SimplexMaterialConfig {
+    /// Hex-encoded DKG output.
     dkg_output: String,
+    /// Number of primary validators.
     num_validators: u32,
 }
 
 pub(crate) struct ClusterMaterial {
+    /// Primary (voting) validator private keys.
     pub signers: Vec<ed25519::PrivateKey>,
+    /// Primary (voting) validator public keys, in DKG order.
     pub public_keys: Vec<ed25519::PublicKey>,
+    /// Secondary (non-voting) validator private keys.
     pub secondary_signers: Vec<ed25519::PrivateKey>,
+    /// Secondary (non-voting) validator public keys.
     pub secondary_public_keys: Vec<ed25519::PublicKey>,
+    /// DKG output over the primary validators.
     pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
+    /// DKG share per primary validator.
     pub shares: BTreeMap<ed25519::PublicKey, Share>,
+    /// Hex-encoded genesis leader public key.
     pub genesis_leader: String,
 }
 
@@ -488,16 +642,8 @@ const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
 }
 
-const fn default_spammer_worker_threads() -> usize {
-    DEFAULT_SPAMMER_WORKER_THREADS
-}
-
 const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
-}
-
-const fn default_spammer_private_groups() -> usize {
-    DEFAULT_SPAMMER_PRIVATE_GROUPS
 }
 
 fn main() {
@@ -577,6 +723,26 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
+    if let Some(max_shard_bytes) = args.max_shard_bytes {
+        let bound = derived_shard_bound(args.max_propose_bytes, args.validators);
+        assert!(
+            max_shard_bytes >= bound,
+            "--max-shard-bytes {max_shard_bytes} cannot carry a full \
+             --max-propose-bytes {} block: {} validators split blocks into \
+             {} data shards, so peers need to accept shards up to {bound} \
+             bytes (raise --max-shard-bytes or lower --max-propose-bytes)",
+            args.max_propose_bytes,
+            args.validators,
+            (args.validators.saturating_sub(1) as usize) / 3 + 1,
+        );
+    }
+}
+
+pub(crate) fn total_spammer_private_lanes(args: &GenerateArgs) -> usize {
+    let validators = usize::try_from(args.validators).expect("validator count fits usize");
+    args.spammer_private_lanes
+        .checked_mul(validators)
+        .expect("--spammer-private-lanes * --validators must fit usize")
 }
 
 pub(crate) fn generate_local_cluster_material(
@@ -600,21 +766,22 @@ pub(crate) fn generate_remote_cluster_material(
     validators: u32,
     secondaries: u32,
 ) -> ClusterMaterial {
+    let mut rng = UnwrapErr(SysRng);
     let mut signers = (0..validators)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     signers.sort_by_key(Signer::public_key);
     let mut secondary_signers = (0..secondaries)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     secondary_signers.sort_by_key(Signer::public_key);
-    build_cluster_material(signers, secondary_signers, &mut OsRng)
+    build_cluster_material(signers, secondary_signers, &mut rng)
 }
 
 fn build_cluster_material(
     signers: Vec<ed25519::PrivateKey>,
     secondary_signers: Vec<ed25519::PrivateKey>,
-    rng: &mut impl rand_core::CryptoRngCore,
+    rng: &mut impl rand::CryptoRng,
 ) -> ClusterMaterial {
     let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
     let secondary_public_keys = secondary_signers
@@ -689,8 +856,39 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+pub(crate) const fn default_max_shard_bytes() -> usize {
+    1024 * 1024
+}
+
+/// Largest shard a full proposal can produce for this cluster size, with
+/// 25% headroom for chunk proofs and framing.
+///
+/// Mirrors the marshal's coding config: blocks split into
+/// `max_faults + 1 = floor((validators - 1) / 3) + 1` data shards.
+pub(crate) const fn derived_shard_bound(max_propose_bytes: usize, validators: u32) -> usize {
+    let minimum_shards = (validators.saturating_sub(1) as usize) / 3 + 1;
+    (max_propose_bytes.div_ceil(minimum_shards)) * 5 / 4
+}
+
+/// The shard limit written to node configs: the explicit `--max-shard-bytes`
+/// when given, otherwise the derived bound (but never below the historical
+/// 1 MiB default, which large clusters already run with).
+pub(crate) fn resolved_max_shard_bytes(args: &GenerateArgs) -> usize {
+    args.max_shard_bytes.unwrap_or_else(|| {
+        derived_shard_bound(args.max_propose_bytes, args.validators).max(default_max_shard_bytes())
+    })
+}
+
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_page_cache_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
+pub(crate) const fn default_public_key_cache_size() -> usize {
+    DEFAULT_PUBLIC_KEY_CACHE_SIZE
 }
 
 pub(crate) fn generate_deployer_tag() -> String {
@@ -705,9 +903,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, SpammerPrivateProofMode,
-        SpammerWorkload, generate_local_cluster_material,
-        simplex_verification_material_from_config, write_simplex_verification_material,
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        generate_local_cluster_material, simplex_verification_material_from_config,
+        write_simplex_verification_material,
     };
     use clap::Parser;
     use commonware_codec::Encode;
@@ -799,34 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn local_parses_otel_tracing_config() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "local",
-            "--traces",
-            "1.0",
-            "--otel-endpoint",
-            "http://127.0.0.1:4318/v1/traces",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        let GenerateTarget::Local(local) = generate.target else {
-            panic!("expected local target");
-        };
-        assert_eq!(local.traces, 1.0);
-        assert_eq!(local.otel_endpoint, "http://127.0.0.1:4318/v1/traces");
-    }
-
-    #[test]
     fn rejects_traces_sampling_rate_above_one() {
         let error = Cli::try_parse_from([
             "constantinople-deploy",
@@ -856,6 +1026,105 @@ mod tests {
         .expect_err("sampling rate above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn parses_max_propose_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-propose-bytes",
+            "1150000",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_propose_bytes, 1_150_000);
+    }
+
+    #[test]
+    fn parses_max_shard_bytes() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--max-shard-bytes",
+            "2097152",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.max_shard_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn derives_shard_bound_from_cluster_size() {
+        // 4 validators -> 2 data shards: an 8 MiB block needs ~5 MiB shards.
+        assert_eq!(
+            super::derived_shard_bound(8 * 1024 * 1024, 4),
+            8 * 1024 * 1024 / 2 * 5 / 4
+        );
+        // 50 validators -> 17 data shards: well under the 1 MiB floor.
+        assert!(super::derived_shard_bound(8 * 1024 * 1024, 50) < super::default_max_shard_bytes());
+    }
+
+    #[test]
+    fn derived_shard_limit_never_drops_below_historical_default() {
+        let mut args = generate_args_for_bounds(50);
+        args.max_shard_bytes = None;
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::default_max_shard_bytes()
+        );
+
+        let args = generate_args_for_bounds(4);
+        assert_eq!(
+            super::resolved_max_shard_bytes(&args),
+            super::derived_shard_bound(args.max_propose_bytes, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot carry a full")]
+    fn rejects_shard_limit_too_small_for_full_blocks() {
+        let mut args = generate_args_for_bounds(4);
+        // The historical 1 MiB default cannot carry 8 MiB blocks at 4
+        // validators; explicit values must fail at generate time instead of
+        // wedging consensus at the first full block.
+        args.max_shard_bytes = Some(super::default_max_shard_bytes());
+        super::validate_generate_args(&args);
+    }
+
+    fn generate_args_for_bounds(validators: u32) -> super::GenerateArgs {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            &validators.to_string(),
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        *generate
     }
 
     #[test]
@@ -903,75 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_spammer_workload() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-workload",
-            "private",
-            "local",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        assert_eq!(generate.spammer_workload, SpammerWorkload::Private);
-    }
-
-    #[test]
-    fn parses_spammer_private_groups() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-private-groups",
-            "4",
-            "local",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        assert_eq!(generate.spammer_private_groups, 4);
-    }
-
-    #[test]
-    fn parses_spammer_private_proof_mode() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-private-proof-mode",
-            "simulated",
-            "local",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        assert_eq!(
-            generate.spammer_private_proof_mode,
-            SpammerPrivateProofMode::Simulated
-        );
-    }
-
-    #[test]
     fn parses_spammer_rayon_threads() {
         let cli = Cli::try_parse_from([
             "constantinople-deploy",
@@ -991,28 +1191,6 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
-    }
-
-    #[test]
-    fn parses_spammer_worker_threads() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--output-dir",
-            "out",
-            "--spammer-worker-threads",
-            "6",
-            "local",
-        ])
-        .expect("local invocation should parse");
-
-        let Command::Generate(generate) = cli.command else {
-            panic!("expected generate command");
-        };
-        let generate = *generate;
-        assert_eq!(generate.spammer_worker_threads, 6);
     }
 
     #[test]

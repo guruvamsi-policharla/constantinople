@@ -2,7 +2,7 @@
 
 use crate::TransactionSource;
 use commonware_actor::Feedback;
-use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
+use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
 use constantinople_primitives::{Header, VerifiedTransaction};
@@ -50,10 +50,12 @@ where
     H: Hasher + Send + 'static,
     H::Digest: Send,
 {
+    // The byte budget is ignored: static batches are returned as queued.
     fn propose(
         &mut self,
         _parent: &Header<C, H::Digest, P>,
-        _context: &Context<C, P>,
+        _round: Round,
+        _filled: usize,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
         ready(self.proposals.pop_front().unwrap_or_default())
     }
@@ -84,11 +86,13 @@ mod tests {
         types::{Epoch, Round, View},
     };
     use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{
         Header, Transaction, TransactionPublicKey, VerifiedTransaction,
     };
     use core::num::NonZeroU64;
+    use rand::{SeedableRng, rngs::StdRng};
 
     const NAMESPACE: &[u8] = b"mempool-test";
 
@@ -105,9 +109,6 @@ mod tests {
     }
 
     fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
-        use commonware_math::algebra::Random;
-        use rand::{SeedableRng, rngs::StdRng};
-
         let mut rng = StdRng::from_seed([3; 32]);
         let leader = ed25519::PrivateKey::random(&mut rng).public_key();
         Context {
@@ -119,9 +120,6 @@ mod tests {
 
     #[test]
     fn static_source_drains_batches_in_order() {
-        use commonware_math::algebra::Random;
-        use rand::{SeedableRng, rngs::StdRng};
-
         let mut rng = StdRng::from_seed([9; 32]);
         let key = ed25519::PrivateKey::random(&mut rng);
         let tx1 = sign_tx(&key, 0);
@@ -141,9 +139,10 @@ mod tests {
             transactions_range: non_empty_range!(0, 1),
         };
 
-        let first = futures::executor::block_on(source.propose(&parent, &test_context()));
-        let second = futures::executor::block_on(source.propose(&parent, &test_context()));
-        let third = futures::executor::block_on(source.propose(&parent, &test_context()));
+        let round = Round::new(Epoch::zero(), View::zero());
+        let first = futures::executor::block_on(source.propose(&parent, round, 0));
+        let second = futures::executor::block_on(source.propose(&parent, round, 0));
+        let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].value().nonce, tx1.value().nonce);

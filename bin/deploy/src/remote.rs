@@ -7,10 +7,10 @@ use crate::{
     QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
+    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    total_spammer_private_lanes, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -123,6 +123,13 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         ?binaries,
         "build deployment binaries into the output directory before creating the remote deployment"
     );
+    if args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated {
+        info!(
+            validator_and_indexer_features = "constantinople-primitives/privacy-backend-zkpari",
+            spammer_features = "constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator",
+            "simulated proof mode runs the cluster on zkpari: build the validator (and indexer) binaries with the zkpari feature and the spammer with zkpari + simulator"
+        );
+    }
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -165,10 +172,13 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            state_page_cache_bytes: args.state_page_cache_bytes,
+            other_page_cache_bytes: args.other_page_cache_bytes,
+            public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: remote.traces,
-            otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
             relayer: None,
@@ -219,10 +229,13 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            state_page_cache_bytes: args.state_page_cache_bytes,
+            other_page_cache_bytes: args.other_page_cache_bytes,
+            public_key_cache_size: args.public_key_cache_size,
+            max_shard_bytes: crate::resolved_max_shard_bytes(args),
             traces: remote.traces,
-            otel_endpoint: None,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| remote_indexer_config(remote.chain_indexer_port)),
@@ -272,7 +285,6 @@ fn remote_spammer_config(
         accounts: args.spammer_accounts,
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
-        worker_threads: args.spammer_worker_threads,
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
@@ -281,8 +293,9 @@ fn remote_spammer_config(
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
         workload: args.spammer_workload,
-        private_groups: args.spammer_private_groups,
         private_proof_mode: args.spammer_private_proof_mode,
+        private_batch: args.spammer_private_batch,
+        private_lanes: total_spammer_private_lanes(args),
     }
 }
 
@@ -296,6 +309,7 @@ fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<Chai
     indexer_enabled(args).then(|| ChainIndexerConfig {
         port: remote.chain_indexer_port,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
+        db_parallelism: remote.chain_indexer_db_parallelism,
     })
 }
 
@@ -337,8 +351,8 @@ fn build_deployer_config(
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
             config: validator.config_name.clone(),
             profiling: remote.profiling,
@@ -363,8 +377,8 @@ fn build_deployer_config(
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
             config: secondary.config_name.clone(),
             profiling: remote.profiling,
@@ -485,14 +499,18 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, build_validators, port_configs,
+        remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, generate_local_cluster_material,
+        default_max_pool_bytes, default_max_propose_bytes, default_max_shard_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, generate_local_cluster_material,
         total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
@@ -508,27 +526,32 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            public_key_cache_size: default_public_key_cache_size(),
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
+            state_page_cache_bytes: default_page_cache_bytes(),
+            other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            max_shard_bytes: None,
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
-            spammer_worker_threads: crate::DEFAULT_SPAMMER_WORKER_THREADS,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             spammer_workload: crate::SpammerWorkload::Public,
-            spammer_private_groups: crate::DEFAULT_SPAMMER_PRIVATE_GROUPS,
-            spammer_private_proof_mode: crate::SpammerPrivateProofMode::Real,
+            spammer_private_proof_mode: crate::SpammerProofMode::Real,
+            spammer_private_batch: 64,
+            spammer_private_lanes: 8,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
                 base_metrics_port: 9090,
                 chain_indexer_port: 8090,
+                chain_indexer_db_parallelism: None,
                 metadata_indexer_port: 8091,
                 qmdb_indexer_port: 8092,
-                traces: 0.0,
-                otel_endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
             }),
         }
     }
@@ -538,6 +561,8 @@ mod tests {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
+            storage_iops: None,
+            storage_throughput: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
             chain_indexer_storage_iops: DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -548,6 +573,7 @@ mod tests {
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             chain_indexer_port: 8090,
+            chain_indexer_db_parallelism: None,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
             profiling: true,
@@ -555,6 +581,30 @@ mod tests {
             spammer_instance_type: None,
             spammer_storage_size: 25,
         }
+    }
+
+    #[test]
+    fn remote_validators_use_generated_max_propose_bytes() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        args.max_propose_bytes = 1_150_000;
+        args.max_shard_bytes = Some(2_097_152);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(&args, &remote, Path::new("/tmp"), &material);
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
+
+        assert!(
+            validators
+                .iter()
+                .chain(secondaries.iter())
+                .all(|validator| {
+                    validator.config.max_propose_bytes == 1_150_000
+                        && validator.config.max_shard_bytes == 2_097_152
+                })
+        );
     }
 
     fn validator(index: u32) -> super::GeneratedValidator {
@@ -579,9 +629,12 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                max_shard_bytes: default_max_shard_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                other_page_cache_bytes: default_page_cache_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                otel_endpoint: None,
                 bootstrappers: Vec::new(),
                 indexer: None,
                 relayer: None,
@@ -679,19 +732,11 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
-        assert_eq!(
-            relayed.worker_threads,
-            crate::DEFAULT_SPAMMER_WORKER_THREADS
-        );
+        assert_eq!(relayed.private_lanes, args.validators as usize * 8);
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
-        );
-        assert_eq!(relayed.workload, crate::SpammerWorkload::Public);
-        assert_eq!(
-            relayed.private_groups,
-            crate::DEFAULT_SPAMMER_PRIVATE_GROUPS
         );
     }
 
