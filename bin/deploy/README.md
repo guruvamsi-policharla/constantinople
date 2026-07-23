@@ -93,8 +93,11 @@ Raise it if you still see gaps.
 
 The private knobs are coupled: each lane keeps one `--spammer-private-batch`
 batch in flight, a batch takes at most one operation per source account, and
-sustained TPS is roughly *transactions in flight ÷ finalization round-trip*.
-Instead of balancing `--spammer-private-lanes`, `--spammer-private-batch`, and
+lanes pin to leaders — so a lane lands one batch per *leader rotation*
+(`validators x view-time`; ~4s at 50 validators and ~80ms views). Sustained
+TPS is roughly *transactions in flight ÷ rotation seconds*: hitting 50K TPS
+on a 50-validator cluster takes ~200K in flight, not 50K. Instead of
+balancing `--spammer-private-lanes`, `--spammer-private-batch`, and
 `--spammer-accounts` by hand, state the in-flight count directly:
 
 ```sh
