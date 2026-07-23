@@ -760,11 +760,13 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
 }
 
 /// Conservative encoded size of one private transaction on the zkpari
-/// backend (a transfer: 32 B output commitment + 192 B transfer proof plus
-/// key/nonce/signature ≈ 365 B; funds are smaller). Deliberately not the
-/// compile-time `Transaction::MAX_SIZE`: the deploy binary builds against the
-/// mock backend, which would understate what a zkpari cluster sees.
-const PRIVATE_TX_BYTES: usize = 512;
+/// backend. Points ride the wire uncompressed (64 B G1): a transfer is a
+/// 64 B output commitment + 320 B transfer proof (two range proofs of
+/// 2 G1 + 1 Fr each) plus key/nonce/signature = 523 B, measured at 526 B/tx
+/// in finalized blocks. Deliberately not the compile-time
+/// `Transaction::MAX_SIZE`: the deploy binary builds against the mock
+/// backend, which would understate what a zkpari cluster sees.
+const PRIVATE_TX_BYTES: usize = 576;
 
 /// Source accounts provisioned per in-flight transaction slot when
 /// `--spammer-accounts` is derived. Lanes skip exhausted or mid-retry sources
