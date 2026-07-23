@@ -306,7 +306,7 @@ pub async fn run_private(
         // path); fall back to the relayer's default routing when none are given.
         let target = (!relayer_targets.is_empty())
             .then(|| relayer_targets[lane % relayer_targets.len()].clone());
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), lane, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         lane_handles.push(tokio::spawn(run_lane(
             submitter,
             count as u32,

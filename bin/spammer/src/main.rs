@@ -219,7 +219,7 @@ async fn run_relayer_mode(
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
         let batches = spawn_presigner(
             strategy,
