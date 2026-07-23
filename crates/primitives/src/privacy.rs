@@ -9,6 +9,10 @@ use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_privacy::payments::{Backend, Commitment};
 use std::sync::OnceLock;
 
+/// ZK-Pari BN254 backend as decoded from the wire.
+///
+/// Points ride the wire uncompressed (64 B G1) and are curve-checked at
+/// decode; state storage re-encodes them via [`StatePrivatePaymentBackend`].
 #[cfg(feature = "privacy-backend-zkpari")]
 pub type ZkPariBn254Backend =
     commonware_privacy::zkpari::payments::codec::UncompressedCheckedBn254Backend;
@@ -101,38 +105,8 @@ pub trait PrivatePaymentBackend:
                        + Sync,
     >
 {
-    /// Low-cardinality backend name for tracing.
-    const NAME: &'static str;
-
     /// Verifier/prover parameters used by chain execution.
     fn params() -> &'static Self::Params;
-}
-
-/// Conversion from a decoded transaction backend into the backend used by
-/// internal execution/state.
-pub trait PrivatePaymentExecutionBackend: PrivatePaymentBackend {
-    /// Backend used after transaction decoding has performed any needed checks.
-    type ExecutionBackend: PrivatePaymentBackend;
-
-    /// Convert a transaction commitment into the execution representation.
-    fn to_execution_commitment(
-        commitment: Self::Commitment,
-    ) -> <Self::ExecutionBackend as Backend>::Commitment;
-
-    /// Convert a transaction fund proof into the execution representation.
-    fn to_execution_fund_proof(
-        proof: Self::FundProof,
-    ) -> <Self::ExecutionBackend as Backend>::FundProof;
-
-    /// Convert a transaction transfer proof into the execution representation.
-    fn to_execution_transfer_proof(
-        proof: Self::TransferProof,
-    ) -> <Self::ExecutionBackend as Backend>::TransferProof;
-
-    /// Convert a transaction burn proof into the execution representation.
-    fn to_execution_burn_proof(
-        proof: Self::BurnProof,
-    ) -> <Self::ExecutionBackend as Backend>::BurnProof;
 }
 
 /// Simulator trapdoor access for trusted benchmarking and load generation.
@@ -212,8 +186,6 @@ impl<B: PrivatePaymentBackend> Read for PrivateAccount<B> {
 
 #[cfg(feature = "privacy-backend-mock")]
 impl PrivatePaymentBackend for commonware_privacy::mocks::MockBackend {
-    const NAME: &'static str = "mock";
-
     fn params() -> &'static Self::Params {
         static PARAMS: OnceLock<()> = OnceLock::new();
         PARAMS.get_or_init(|| ())
@@ -231,31 +203,8 @@ impl PrivatePaymentSimulatorBackend for commonware_privacy::mocks::MockBackend {
     }
 }
 
-#[cfg(feature = "privacy-backend-mock")]
-impl PrivatePaymentExecutionBackend for commonware_privacy::mocks::MockBackend {
-    type ExecutionBackend = Self;
-
-    fn to_execution_commitment(commitment: Self::Commitment) -> Self::Commitment {
-        commitment
-    }
-
-    fn to_execution_fund_proof(proof: Self::FundProof) -> Self::FundProof {
-        proof
-    }
-
-    fn to_execution_transfer_proof(proof: Self::TransferProof) -> Self::TransferProof {
-        proof
-    }
-
-    fn to_execution_burn_proof(proof: Self::BurnProof) -> Self::BurnProof {
-        proof
-    }
-}
-
 #[cfg(feature = "privacy-backend-zkpari")]
 impl PrivatePaymentBackend for ZkPariBn254Backend {
-    const NAME: &'static str = "zkpari-bn254";
-
     fn params() -> &'static Self::Params {
         static PARAMS: OnceLock<<ZkPariBn254Backend as Backend>::Params> = OnceLock::new();
         PARAMS.get_or_init(|| {
@@ -281,38 +230,7 @@ impl PrivatePaymentSimulatorBackend for ZkPariBn254Backend {
 }
 
 #[cfg(feature = "privacy-backend-zkpari")]
-impl PrivatePaymentExecutionBackend for ZkPariBn254Backend {
-    type ExecutionBackend = StatePrivatePaymentBackend;
-
-    fn to_execution_commitment(
-        commitment: Self::Commitment,
-    ) -> <Self::ExecutionBackend as Backend>::Commitment {
-        to_state_commitment(commitment)
-    }
-
-    fn to_execution_fund_proof(
-        proof: Self::FundProof,
-    ) -> <Self::ExecutionBackend as Backend>::FundProof {
-        to_state_fund_proof(proof)
-    }
-
-    fn to_execution_transfer_proof(
-        proof: Self::TransferProof,
-    ) -> <Self::ExecutionBackend as Backend>::TransferProof {
-        to_state_transfer_proof(proof)
-    }
-
-    fn to_execution_burn_proof(
-        proof: Self::BurnProof,
-    ) -> <Self::ExecutionBackend as Backend>::BurnProof {
-        to_state_burn_proof(proof)
-    }
-}
-
-#[cfg(feature = "privacy-backend-zkpari")]
 impl PrivatePaymentBackend for StatePrivatePaymentBackend {
-    const NAME: &'static str = "zkpari-bn254-state";
-
     fn params() -> &'static Self::Params {
         static PARAMS: OnceLock<<StatePrivatePaymentBackend as Backend>::Params> = OnceLock::new();
         PARAMS.get_or_init(|| {
@@ -380,6 +298,9 @@ pub const fn to_state_commitment(
 }
 
 /// Convert a transaction-checked fund proof into the internal state form.
+///
+/// Identity: zkpari fund proofs are `()` (the funded value is public, so the
+/// commitment is verified by recomputation), leaving nothing to convert.
 #[cfg(feature = "privacy-backend-zkpari")]
 pub const fn to_state_fund_proof(
     proof: <ChainPrivatePaymentBackend as Backend>::FundProof,
