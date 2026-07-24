@@ -215,13 +215,13 @@ pub fn from_state_account(account: StateAccount) -> Account {
 pub const fn from_state_account(account: StateAccount) -> Account {
     use commonware_privacy::zkpari::payments::{
         PaymentCommitment,
-        codec::{UncompressedChecked, UncompressedUnchecked},
+        codec::{CompressedChecked, UncompressedUnchecked},
     };
 
     const fn convert(
         commitment: UncompressedUnchecked<PaymentCommitment<ark_bn254::Bn254>>,
-    ) -> UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> {
-        UncompressedChecked(commitment.0)
+    ) -> CompressedChecked<PaymentCommitment<ark_bn254::Bn254>> {
+        CompressedChecked(commitment.0)
     }
 
     Account {
