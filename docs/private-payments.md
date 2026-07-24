@@ -21,8 +21,8 @@ Four operations move value through them (`Payload` variants,
 |---|---|---|
 | `PrivateFund` | public balance → own `pending` | none — the funded value is public, the commitment is verified by recomputation (`FundProof = ()`) |
 | `PrivateRollover` | `pending` folded into `current` | none — homomorphic addition |
-| `PrivateTransfer` | `current` → recipient's `pending` | two 64-bit range proofs: the transferred amount and the sender's remaining balance (conservation) |
-| `PrivateBurn` | `current` → public balance (de-shield) | one range proof on the remaining balance |
+| `PrivateTransfer` | `current` → recipient's `pending` | one batched range proof covering both the transferred amount and the sender's remaining balance (conservation) |
+| `PrivateBurn` | `current` → public balance (de-shield) | the same batched proof with the second value slot zero-padded |
 
 The split between `pending` and `current` exists so a *recipient's* spendable
 commitment never changes underneath an in-flight proof: transfer proofs bind
@@ -66,8 +66,11 @@ decompression at verification). A transaction is
 | public transfer | tag + to(32) + value(8) | **147 B** |
 | private fund | tag + value(8) + commitment(64) | **179 B** |
 | private rollover | tag | **107 B** |
-| private transfer | tag + to(32) + amount commitment(64) + 2×160 B range proofs | **523 B** (measured 526 B/tx in blocks) |
-| private burn | tag + value(8) + 160 B range proof | **275 B** |
+| private transfer | tag + to(32) + amount commitment(64) + 224 B batched proof (3 G1 + 1 Fr) | **427 B** |
+| private burn | tag + value(8) + 224 B batched proof | **339 B** |
+
+(The measured 33K-TPS runs below predate the batched proof and ran the
+older two-proof format at 523 B/transfer, measured 526 B/tx in blocks.)
 
 Verification cost (measured on c8g.8xlarge, 28 rayon threads, batch
 verification): ~1.1 µs/tx signatures + ~3.1 µs/tx range proofs — CPU is not
@@ -128,10 +131,16 @@ reconstruction) plus a linear coding/verify tail:
 | 502,400 | 10,048 | 312 ms | 32.2K (latency for nothing) |
 
 Since throughput is byte-bound, TPS scales inversely with transaction size.
-The highest-leverage known follow-up is a **joint range proof** (one proof
-covering both 64-bit range checks instead of two): transfer txs drop
-523 → 363 B, a projected ~48K TPS with no added CPU. Not yet implemented in
-`commonware-privacy` (`TransferProof` is two independent proofs).
+The **batched range proof** (monorepo commit `20417e154`) realizes the
+biggest known lever: one proof range-checks both the amount and the
+remaining balance via two committed-input blocks (a fresh pair commitment
+plus a verifier-derived aggregate `v₁ + θ·v₂` over the ledger commitments),
+shrinking transfers 523 → 427 B — a projected **~41K TPS** at the measured
+byte ceiling — while also cutting verification (−22% single, −13% batched)
+and proving (−14%). Burns grow 275 → 339 B (they now carry the full batched
+proof), which is immaterial at burn volumes. Cluster note: the CRS/relation
+shape changed, so old and new binaries cannot verify each other's proofs —
+deploy fresh, never mixed.
 
 ## Known blockers and follow-ups
 

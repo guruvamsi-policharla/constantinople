@@ -404,8 +404,8 @@ mod tests {
         let sink = sink_key(999);
         let mut state = PrivateSpamState::new();
         let mut rng = StdRng::seed_from_u64(7);
-        // Drain in a handful of steps: each transfer builds two real range
-        // proofs, so a value-1 drain scales test time with the default
+        // Drain in a handful of steps: each transfer builds a real batched
+        // range proof, so a value-1 drain scales test time with the default
         // balance.
         let value = DEFAULT_ACCOUNT_BALANCE / 4;
 
