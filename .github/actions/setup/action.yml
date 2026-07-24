@@ -45,7 +45,7 @@ runs:
         if [ ! -d "${GITHUB_WORKSPACE}/../monorepo" ]; then
           git clone --filter=blob:none https://github.com/commonwarexyz/monorepo "${GITHUB_WORKSPACE}/../monorepo"
         fi
-        git -C "${GITHUB_WORKSPACE}/../monorepo" checkout 03f74856afc8f759a20f7fec36716e5f5d41976f
+        git -C "${GITHUB_WORKSPACE}/../monorepo" checkout 20417e154606e582f7119bb8b26c0dcbe9e46c40
     # Use /mnt for Cargo builds on Linux (has ~70GB vs ~14GB on /)
     - name: Relocate Cargo directories to /mnt on Linux
       if: runner.os == 'Linux'

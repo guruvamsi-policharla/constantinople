@@ -1075,8 +1075,11 @@ mod tests {
                 upload_buffer: 1,
             };
 
+            // Generous bound: the property is "does not block indefinitely on
+            // a dead publisher endpoint"; a tight bound flakes under full-suite
+            // CPU contention (zkpari CRS setup in sibling test processes).
             let handle = tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(30),
                 maybe_build_indexer(context, false, Some(indexer), "test"),
             )
             .await
