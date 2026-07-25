@@ -18,7 +18,7 @@ pub use privacy::{
 
 mod signed;
 pub use signed::{
-    LazySignedTransaction, Signable, Signed, materialize_transaction_chunks,
+    LazySignedTransaction, Signable, Signed, frame_signed_batch, materialize_transaction_chunks,
     preload_transaction_chunks, preload_transaction_slice, verify_transaction_batch,
     verify_transaction_chunks,
 };

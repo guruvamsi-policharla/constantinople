@@ -11,15 +11,15 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{DecodeExt, Encode, EncodeSize, FixedSize};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::{from_hex, hex};
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::sys_rng;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    Account, Nonce, PublicKeyCache, TransactionPublicKey, TransactionSignature,
+    VerifiedTransaction, frame_signed_batch, verify_transaction_chunks,
 };
 use std::{fmt::Display, sync::Arc};
 use tokio::sync::Semaphore;
@@ -260,28 +260,21 @@ where
             txs = tracing::field::Empty,
         )
         .entered();
-        let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
+        // Frame the batch into deferred transactions without decoding any
+        // payload: the compressed-point decompression this defers is the
+        // dominant ingress cost, and `verify_transaction_chunks` below runs
+        // it across the strategy pool instead of serially here.
+        let signed_lazy = frame_signed_batch::<H, _>(&body, max_transactions)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        decode.record("txs", signed.len().traced());
+        decode.record("txs", signed_lazy.len().traced());
         drop(decode);
-
-        let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
-        if total_bytes > max_batch_bytes {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
 
         let verify = info_span!(
             parent: &parent,
             "mempool.ingress.verify",
-            txs = signed.len().traced(),
-            bytes = total_bytes.traced(),
+            txs = signed_lazy.len().traced(),
         )
         .entered();
-        let signed_lazy = signed
-            .into_iter()
-            .map(LazySignedTransaction::new)
-            .collect::<Vec<_>>();
         let transactions = verify_transaction_chunks::<H, _, _>(
             namespace,
             &mut sys_rng(),
@@ -290,6 +283,10 @@ where
             &strategy,
         )
         .ok_or(StatusCode::BAD_REQUEST)?;
+        let total_bytes: usize = transactions.iter().map(EncodeSize::encode_size).sum();
+        if total_bytes > max_batch_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         drop(verify);
 
         let digests = transactions
@@ -414,7 +411,7 @@ mod tests {
     use super::{
         super::{AccountReader, TxStatus, mailbox::Message},
         Account, AccountReaderCell, AppState, MAX_CONCURRENT_INGRESS, Nonce, PublicKeyCache,
-        Semaphore, SignedTransaction, TransactionPublicKey, hex, router,
+        Semaphore, TransactionPublicKey, hex, router,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -426,7 +423,8 @@ mod tests {
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
     use constantinople_primitives::{
-        ChainPrivatePaymentBackend, Payload, PrivateAccount, PrivatePaymentBackend, Transaction,
+        ChainPrivatePaymentBackend, Payload, PrivateAccount, PrivatePaymentBackend,
+        SignedTransaction, Transaction,
     };
     use core::num::NonZeroU64;
     use futures::future::{BoxFuture, FutureExt as _};
