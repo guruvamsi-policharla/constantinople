@@ -517,6 +517,9 @@ where
             "application.execute.select",
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
+            // Whether the optimistic batched verify failed and forced the
+            // per-proof fallback over the whole round.
+            fallback = tracing::field::Empty,
         );
         let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
             .spawn({
@@ -535,12 +538,23 @@ where
                             .iter()
                             .any(PreparedOperation::has_proof)
                             .then(|| selector.checkpoint());
-                        let (mut applied, verifications) = selector.apply(&transfers);
-                        if !verifications.is_empty() && !verifications.verify_with_strategy(&s) {
-                            selector.restore(
-                                checkpoint.expect("proof-bearing round captured a checkpoint"),
-                            );
-                            applied = selector.apply_verifying(&transfers);
+                        let (mut applied, verifications) =
+                            info_span!("application.execute.select.apply")
+                                .in_scope(|| selector.apply(&transfers));
+                        let batch_ok = if verifications.is_empty() {
+                            true
+                        } else {
+                            info_span!("application.execute.select.verify")
+                                .in_scope(|| verifications.verify_with_strategy(&s))
+                        };
+                        span.record("fallback", !batch_ok);
+                        if !batch_ok {
+                            info_span!("application.execute.select.fallback").in_scope(|| {
+                                selector.restore(
+                                    checkpoint.expect("proof-bearing round captured a checkpoint"),
+                                );
+                                applied = selector.apply_verifying(&transfers);
+                            });
                         }
                         let mut flags = applied.into_iter();
                         let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
