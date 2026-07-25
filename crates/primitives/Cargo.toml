@@ -77,3 +77,7 @@ privacy-backend-zkpari = [
 privacy-backend-simulator = [
 	"commonware-privacy/simulator",
 ]
+
+[[bench]]
+name = "ingress_decode"
+harness = false
