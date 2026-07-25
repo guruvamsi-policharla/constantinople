@@ -201,10 +201,42 @@ where
             Self::PrivateFund { .. } | Self::PrivateBurn { .. } | Self::PrivateRollover => None,
         }
     }
+
+    /// The wire tag identifying this payload variant.
+    const fn tag(&self) -> u8 {
+        match self {
+            Self::PublicTransfer { .. } => PUBLIC_TRANSFER_TAG,
+            Self::PrivateFund { .. } => PRIVATE_FUND_TAG,
+            Self::PrivateTransfer { .. } => PRIVATE_TRANSFER_TAG,
+            Self::PrivateBurn { .. } => PRIVATE_BURN_TAG,
+            Self::PrivateRollover => PRIVATE_ROLLOVER_TAG,
+        }
+    }
 }
 
 const fn max_usize(left: usize, right: usize) -> usize {
     if left > right { left } else { right }
+}
+
+/// Encoded size (tag byte included) of a payload with the given wire tag, or
+/// `None` for an unrecognized tag.
+///
+/// Single source of truth for the tag-to-size mapping: both
+/// [`Payload::encode_size`] and batch framing
+/// ([`crate::frame_signed_batch`]) route through it so the two can never
+/// drift. Framing relies on every payload body being fixed-size given its
+/// tag (commitments and proofs are `FixedSize`), which is what lets a batch
+/// be split into per-transaction slices without decompressing any points.
+pub(crate) const fn payload_wire_size<B: PrivatePaymentBackend>(tag: u8) -> Option<usize> {
+    let body = match tag {
+        PUBLIC_TRANSFER_TAG => AccountKey::SIZE + u64::SIZE,
+        PRIVATE_FUND_TAG => u64::SIZE + B::Commitment::SIZE + B::FundProof::SIZE,
+        PRIVATE_TRANSFER_TAG => AccountKey::SIZE + B::Commitment::SIZE + B::TransferProof::SIZE,
+        PRIVATE_BURN_TAG => u64::SIZE + B::BurnProof::SIZE,
+        PRIVATE_ROLLOVER_TAG => 0,
+        _ => return None,
+    };
+    Some(u8::SIZE + body)
 }
 
 impl<B> Write for Payload<B>
@@ -249,16 +281,7 @@ where
     B: PrivatePaymentBackend,
 {
     fn encode_size(&self) -> usize {
-        u8::SIZE
-            + match self {
-                Self::PublicTransfer { .. } => AccountKey::SIZE + u64::SIZE,
-                Self::PrivateFund { .. } => u64::SIZE + B::Commitment::SIZE + B::FundProof::SIZE,
-                Self::PrivateTransfer { .. } => {
-                    AccountKey::SIZE + B::Commitment::SIZE + B::TransferProof::SIZE
-                }
-                Self::PrivateBurn { .. } => u64::SIZE + B::BurnProof::SIZE,
-                Self::PrivateRollover => 0,
-            }
+        payload_wire_size::<B>(self.tag()).expect("payload variant has a known tag")
     }
 }
 
