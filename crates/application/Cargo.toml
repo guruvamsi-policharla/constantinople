@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "finalize"
 harness = false
+
+[[bench]]
+name = "selective_private"
+harness = false
