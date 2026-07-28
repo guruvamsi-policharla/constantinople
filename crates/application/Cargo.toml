@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "selective_private"
 harness = false
+
+[[bench]]
+name = "leader_contention"
+harness = false
