@@ -549,6 +549,13 @@ where
                         };
                         span.record("fallback", !batch_ok);
                         if !batch_ok {
+                            // Visible without a trace backend: a proposer
+                            // whose optimistic batch keeps failing pays the
+                            // per-proof price on the build critical path.
+                            tracing::warn!(
+                                transfers = transfers.len(),
+                                "select: optimistic batch verify failed; per-proof fallback"
+                            );
                             info_span!("application.execute.select.fallback").in_scope(|| {
                                 selector.restore(
                                     checkpoint.expect("proof-bearing round captured a checkpoint"),
