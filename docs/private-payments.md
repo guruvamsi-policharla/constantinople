@@ -50,29 +50,24 @@ the sibling `../monorepo` checkout — see *Known blockers*):
 
 Backend selection is workspace-global (cargo feature unification through
 `constantinople-primitives`). Two type aliases split wire from storage:
-`ChainPrivatePaymentBackend` (compressed points, decompressed + checked at decode)
+`ChainPrivatePaymentBackend` (uncompressed points, curve-checked at decode)
 and `StatePrivatePaymentBackend` (unchecked — state bytes come from the
 authenticated local database, already checked at ingress). The free
 `to_state_*` functions in `privacy.rs` are the only conversion seam.
 
 ## Wire format and sizes (zkpari, as deployed)
 
-Points ride the wire **compressed** (32 B G1; decompression costs ~15-20 us
-per point but the consensus path materializes each block's transactions
-exactly once on the parallel strategy pool, so a 6K-tx block pays only
-~4-5 ms of pool time; the sole serial full-block decoder is the indexer's
-post-finalization publisher, which is allowed to lag). The earlier
-uncompressed format (64 B G1; chosen to avoid per-point
+Points ride the wire **uncompressed** (64 B G1; chosen to avoid per-point
 decompression at verification). A transaction is
 `sender_key(34) ‖ payload ‖ nonce(8) ‖ signature(64)`:
 
 | transaction | payload | total |
 |---|---|---|
 | public transfer | tag + to(32) + value(8) | **147 B** |
-| private fund | tag + value(8) + commitment(32) | **147 B** |
+| private fund | tag + value(8) + commitment(64) | **179 B** |
 | private rollover | tag | **107 B** |
-| private transfer | tag + to(32) + amount commitment(32) + 128 B batched proof (3 G1 + 1 Fr) | **299 B** |
-| private burn | tag + value(8) + 128 B batched proof | **243 B** |
+| private transfer | tag + to(32) + amount commitment(64) + 224 B batched proof (3 G1 + 1 Fr) | **427 B** |
+| private burn | tag + value(8) + 224 B batched proof | **339 B** |
 
 (The measured 33K-TPS runs below predate the batched proof and ran the
 older two-proof format at 523 B/transfer, measured 526 B/tx in blocks.)
@@ -140,14 +135,12 @@ The **batched range proof** (monorepo commit `20417e154`) realizes the
 biggest known lever: one proof range-checks both the amount and the
 remaining balance via two committed-input blocks (a fresh pair commitment
 plus a verifier-derived aggregate `v₁ + θ·v₂` over the ledger commitments),
-shrinking transfers 523 → 427 B (measured **40K TPS** at 300K in flight,
-July 24 run), and point compression then took the wire to **299 B** — a
-projected **~52K TPS** at the measured
+shrinking transfers 523 → 427 B — a projected **~41K TPS** at the measured
 byte ceiling — while also cutting verification (−22% single, −13% batched)
-and proving (−14%). Burns carry the full batched proof (243 B compressed
-wire), which is immaterial at burn volumes. Cluster note: both the
-CRS/relation change and the wire-compression change are incompatible with
-older binaries — deploy fresh, never mixed.
+and proving (−14%). Burns grow 275 → 339 B (they now carry the full batched
+proof), which is immaterial at burn volumes. Cluster note: the CRS/relation
+shape changed, so old and new binaries cannot verify each other's proofs —
+deploy fresh, never mixed.
 
 ## Known blockers and follow-ups
 

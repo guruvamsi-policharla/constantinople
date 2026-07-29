@@ -760,13 +760,13 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
 }
 
 /// Conservative encoded size of one private transaction on the zkpari
-/// backend. Points ride the wire compressed (32 B G1): a transfer is a
-/// 32 B output commitment + 128 B batched transfer proof (3 G1 + 1 Fr,
+/// backend. Points ride the wire uncompressed (64 B G1): a transfer is a
+/// 64 B output commitment + 224 B batched transfer proof (3 G1 + 1 Fr,
 /// range-checking amount and remaining balance in one proof) plus
-/// key/nonce/signature = 299 B. Deliberately not the compile-time
+/// key/nonce/signature = 427 B. Deliberately not the compile-time
 /// `Transaction::MAX_SIZE`: the deploy binary builds against the mock
 /// backend, which would understate what a zkpari cluster sees.
-const PRIVATE_TX_BYTES: usize = 320;
+const PRIVATE_TX_BYTES: usize = 480;
 
 /// Source accounts provisioned per in-flight transaction slot when
 /// `--spammer-accounts` is derived. Lanes skip exhausted or mid-retry sources
@@ -1460,8 +1460,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "above --max-propose-bytes")]
     fn rejects_batch_larger_than_a_proposal() {
-        // 30000 txs x 320 B > the default 8 MiB propose/submission limit.
-        let args = private_plan_args(1, &["--spammer-private-batch", "30000"]);
+        // 20000 txs x 512 B > the default 8 MiB propose/submission limit.
+        let args = private_plan_args(1, &["--spammer-private-batch", "20000"]);
         super::resolve_spammer_plan(&args);
     }
 

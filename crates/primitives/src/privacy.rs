@@ -11,17 +11,11 @@ use std::sync::OnceLock;
 
 /// ZK-Pari BN254 backend as decoded from the wire.
 ///
-/// Points ride the wire compressed (32 B G1) and are decompressed + checked
-/// at decode. Decompression costs ~15-20us per point, which is safe because
-/// the consensus path materializes transactions exactly once per block on
-/// the parallel strategy pool (`preload_transaction_slice` /
-/// `prepare_lazy`), deduplicated per transaction via `Arc<OnceLock>`; the
-/// leader reuses ingress-decoded transactions and never re-decodes. State
-/// storage re-encodes decoded points via [`StatePrivatePaymentBackend`], so
-/// local database reads never pay decompression.
+/// Points ride the wire uncompressed (64 B G1) and are curve-checked at
+/// decode; state storage re-encodes them via [`StatePrivatePaymentBackend`].
 #[cfg(feature = "privacy-backend-zkpari")]
 pub type ZkPariBn254Backend =
-    commonware_privacy::zkpari::payments::codec::CompressedCheckedBn254Backend;
+    commonware_privacy::zkpari::payments::codec::UncompressedCheckedBn254Backend;
 
 /// Backend used for local state-database account encoding.
 ///
@@ -296,10 +290,10 @@ pub const fn to_state_commitment(
 ) -> <StatePrivatePaymentBackend as Backend>::Commitment {
     use commonware_privacy::zkpari::payments::{
         PaymentCommitment,
-        codec::{CompressedChecked, UncompressedUnchecked},
+        codec::{UncompressedChecked, UncompressedUnchecked},
     };
 
-    let commitment: CompressedChecked<PaymentCommitment<ark_bn254::Bn254>> = commitment;
+    let commitment: UncompressedChecked<PaymentCommitment<ark_bn254::Bn254>> = commitment;
     UncompressedUnchecked(commitment.0)
 }
 
@@ -321,10 +315,10 @@ pub const fn to_state_transfer_proof(
 ) -> <StatePrivatePaymentBackend as Backend>::TransferProof {
     use commonware_privacy::zkpari::payments::{
         TransferProof,
-        codec::{CompressedChecked, UncompressedUnchecked},
+        codec::{UncompressedChecked, UncompressedUnchecked},
     };
 
-    let proof: CompressedChecked<TransferProof<ark_bn254::Bn254>> = proof;
+    let proof: UncompressedChecked<TransferProof<ark_bn254::Bn254>> = proof;
     UncompressedUnchecked(proof.0)
 }
 
@@ -334,11 +328,11 @@ pub const fn to_state_burn_proof(
     proof: <ChainPrivatePaymentBackend as Backend>::BurnProof,
 ) -> <StatePrivatePaymentBackend as Backend>::BurnProof {
     use commonware_privacy::zkpari::{
-        payments::codec::{CompressedChecked, UncompressedUnchecked},
+        payments::codec::{UncompressedChecked, UncompressedUnchecked},
         range::RangeProof,
     };
 
-    let proof: CompressedChecked<RangeProof<ark_bn254::Bn254>> = proof;
+    let proof: UncompressedChecked<RangeProof<ark_bn254::Bn254>> = proof;
     UncompressedUnchecked(proof.0)
 }
 
