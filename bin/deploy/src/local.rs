@@ -291,10 +291,20 @@ fn local_run_commands(
     // must agree on the proof/state encoding). The spammer additionally uses the
     // simulator trapdoor to generate transfer proofs cheaply.
     let zkpari = args.spammer_private_proof_mode == crate::SpammerProofMode::Simulated;
-    let cluster_features = if zkpari {
-        " --features constantinople-primitives/privacy-backend-zkpari"
+    // Every cluster binary that decodes transactions must agree on the wire
+    // format, so the same feature set is applied to validators, the indexer,
+    // and the spammer.
+    let mut cluster_flags: Vec<&str> = Vec::new();
+    if zkpari {
+        cluster_flags.push("constantinople-primitives/privacy-backend-zkpari");
+    }
+    if args.spammer_payload_pad_bytes > 0 {
+        cluster_flags.push("constantinople-primitives/bench-tx-padding");
+    }
+    let cluster_features = if cluster_flags.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(" --features {}", cluster_flags.join(","))
     };
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
@@ -388,12 +398,24 @@ fn local_run_commands(
             .expect("spammer metrics port overflow");
 
         // Simulated proof mode builds the spammer on the zkpari backend with the
-        // simulator trapdoor (matching the rest of the cluster).
-        let spammer_bin = if zkpari {
-            "cargo run --release --bin constantinople-spammer \
-             --features constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator"
+        // simulator trapdoor (matching the rest of the cluster); the padding
+        // benchmark adds its own feature so the spammer emits the padded wire
+        // format the validators expect.
+        let mut spammer_flags: Vec<&str> = Vec::new();
+        if zkpari {
+            spammer_flags.push("constantinople-primitives/privacy-backend-zkpari");
+            spammer_flags.push("constantinople-spammer/privacy-backend-simulator");
+        }
+        if args.spammer_payload_pad_bytes > 0 {
+            spammer_flags.push("constantinople-spammer/bench-tx-padding");
+        }
+        let spammer_bin = if spammer_flags.is_empty() {
+            "cargo run --release --bin constantinople-spammer".to_string()
         } else {
-            "cargo run --release --bin constantinople-spammer"
+            format!(
+                "cargo run --release --bin constantinople-spammer --features {}",
+                spammer_flags.join(",")
+            )
         };
         commands.push(format!(
             "{spammer_bin} -- \
@@ -408,7 +430,8 @@ fn local_run_commands(
              --workload {} \
              --private-proof-mode {} \
              --private-batch {} \
-             --private-lanes {}",
+             --private-lanes {} \
+             --payload-pad-bytes {}",
             plan.accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -419,6 +442,7 @@ fn local_run_commands(
             args.spammer_private_proof_mode.as_str(),
             plan.private_batch,
             plan.total_private_lanes,
+            args.spammer_payload_pad_bytes,
         ));
     }
 
@@ -472,6 +496,7 @@ mod tests {
             spammer_private_batch: None,
             spammer_private_lanes: None,
             spammer_target_inflight: None,
+            spammer_payload_pad_bytes: 0,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -590,6 +615,35 @@ mod tests {
         );
 
         assert!(commands[3].contains("--accounts-jitter 0.25"));
+    }
+
+    /// Benchmark padding must reach the spammer flag AND rebuild every
+    /// cluster binary with the padded wire format, or ingress decode rejects
+    /// the spammer's transactions.
+    #[test]
+    fn local_run_commands_propagate_payload_padding_everywhere() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_payload_pad_bytes = 4096;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let spammer = commands.last().expect("spammer command present");
+        assert!(spammer.contains("--payload-pad-bytes 4096"));
+        assert!(spammer.contains("constantinople-spammer/bench-tx-padding"));
+        // Every non-spammer binary decodes transactions and must carry the
+        // primitives feature.
+        for command in &commands[..commands.len() - 1] {
+            assert!(
+                command.contains("constantinople-primitives/bench-tx-padding"),
+                "cluster command missing padding feature: {command}"
+            );
+        }
     }
 
     #[test]

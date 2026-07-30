@@ -462,6 +462,18 @@ where
         // Nonce: fixed `u64`.
         advance_checked(&mut cursor, u64::SIZE)?;
 
+        // Benchmark padding: length-prefixed opaque bytes appended after the
+        // nonce. Present only in `bench-tx-padding` builds; skipping it here
+        // keeps framing aligned with the padded wire format.
+        #[cfg(feature = "bench-tx-padding")]
+        {
+            let pad_len = usize::read_cfg(
+                &mut cursor,
+                &RangeCfg::new(0..=crate::transaction::PADDING_MAX_ENCODED),
+            )?;
+            advance_checked(&mut cursor, pad_len)?;
+        }
+
         // Signature: variable, but decoded here only to measure its length
         // (no signature verification, no point decompression).
         TransactionSignature::read(&mut cursor)?;
@@ -865,6 +877,46 @@ mod test {
         for (lazy, expected) in framed.into_iter().zip(&batch) {
             // Each deferred slice must be the exact wire bytes of one
             // transaction and materialize back to the original.
+            assert_eq!(
+                lazy.encoded_signed_transaction().as_ref(),
+                expected.encode().as_ref()
+            );
+            let materialized = lazy.into_value().expect("framed transaction materializes");
+            assert_eq!(&materialized, expected);
+        }
+    }
+
+    /// Framing must read each transaction's own padding length prefix rather
+    /// than assume a fixed per-transaction stride: a batch whose transactions
+    /// carry *different* pad sizes must still split at the correct boundaries.
+    #[cfg(feature = "bench-tx-padding")]
+    #[test]
+    fn frame_signed_batch_handles_variable_padding() {
+        let mut rng = test_rng();
+        let ed = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(ed.public_key());
+
+        let pads = [0usize, 100, 4096];
+        let batch: Vec<SignedTransaction<sha256::Sha256>> = pads
+            .iter()
+            .enumerate()
+            .map(|(nonce, &pad)| {
+                Transaction::new(
+                    sender.clone(),
+                    sender.clone(),
+                    NonZeroU64::new(1).unwrap(),
+                    nonce as u64,
+                )
+                .with_padding(pad)
+                .seal_and_sign(&ed, NAMESPACE, &mut sha256::Sha256::default())
+            })
+            .collect();
+        let body = batch.encode();
+
+        let framed = super::frame_signed_batch::<sha256::Sha256, _>(&body, batch.len())
+            .expect("framing padded batch should succeed");
+        assert_eq!(framed.len(), batch.len());
+        for (lazy, expected) in framed.into_iter().zip(&batch) {
             assert_eq!(
                 lazy.encoded_signed_transaction().as_ref(),
                 expected.encode().as_ref()

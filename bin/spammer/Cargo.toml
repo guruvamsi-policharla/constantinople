@@ -48,6 +48,9 @@ privacy-backend-simulator = ["constantinople-primitives/privacy-backend-simulato
 # Run on the ZK-Pari BN254 backend (must match the cluster's backend; see the
 # feature-matrix notes in constantinople-primitives).
 privacy-backend-zkpari = ["constantinople-primitives/privacy-backend-zkpari"]
+# Benchmark-only: attach `--payload-pad-bytes` opaque padding to each
+# transaction to sweep block size independently of proof cost.
+bench-tx-padding = ["constantinople-primitives/bench-tx-padding"]
 
 [[bin]]
 name = "constantinople-spammer"

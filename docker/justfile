@@ -76,6 +76,11 @@ graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-index
 graviton-binaries-zkpari:
   just cluster-features="constantinople-primitives/privacy-backend-zkpari" spammer-features="constantinople-primitives/privacy-backend-zkpari,constantinople-spammer/privacy-backend-simulator" graviton-binaries
 
+# Build all ARM64 binaries on the mock backend with benchmark tx padding
+# (block-size dissemination sweeps; pair with `--spammer-payload-pad-bytes`).
+graviton-binaries-padded:
+  just cluster-features="constantinople-primitives/bench-tx-padding" spammer-features="constantinople-spammer/bench-tx-padding" graviton-binaries
+
 # Build the Intel/C8i Docker builder image
 build-intel-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl intel

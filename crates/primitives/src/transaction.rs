@@ -5,6 +5,8 @@ use crate::{
     TransactionPublicKey, TransactionSignature,
 };
 use bytes::{Buf, BufMut};
+#[cfg(feature = "bench-tx-padding")]
+use commonware_codec::RangeCfg;
 use commonware_codec::{
     Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
 };
@@ -333,9 +335,21 @@ where
     pub payload: Payload<B>,
     /// The sender nonce.
     pub nonce: u64,
+    /// Benchmark-only opaque padding, part of the signed body but ignored by
+    /// execution. Lets block byte-size be swept independently of proof cost.
+    #[cfg(feature = "bench-tx-padding")]
+    pub padding: bytes::Bytes,
     /// The digest type.
     pub _digest: core::marker::PhantomData<D>,
 }
+
+/// Maximum encoded contribution of the benchmark padding field (length prefix
+/// plus bytes); zero when the feature is off so the production `MAX_SIZE` is
+/// unchanged.
+#[cfg(feature = "bench-tx-padding")]
+pub(crate) const PADDING_MAX_ENCODED: usize = 5 + (1 << 20);
+#[cfg(not(feature = "bench-tx-padding"))]
+pub(crate) const PADDING_MAX_ENCODED: usize = 0;
 
 impl<D, B> Transaction<D, B>
 where
@@ -345,7 +359,8 @@ where
     /// Smallest encoded transaction.
     pub const MIN_SIZE: usize = TransactionPublicKey::SIZE + Payload::<B>::MIN_SIZE + u64::SIZE;
     /// Largest encoded transaction.
-    pub const MAX_SIZE: usize = TransactionPublicKey::SIZE + Payload::<B>::MAX_SIZE + u64::SIZE;
+    pub const MAX_SIZE: usize =
+        TransactionPublicKey::SIZE + Payload::<B>::MAX_SIZE + u64::SIZE + PADDING_MAX_ENCODED;
 
     /// Creates a new public transfer transaction.
     pub fn new(
@@ -370,8 +385,29 @@ where
             sender: Lazy::new(sender),
             payload,
             nonce,
+            #[cfg(feature = "bench-tx-padding")]
+            padding: bytes::Bytes::new(),
             _digest: core::marker::PhantomData,
         }
+    }
+
+    /// Attaches `bytes` zero bytes of execution-ignored padding (benchmark
+    /// only). Call before sealing/signing so the padding is covered by the
+    /// signature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes` exceeds the decode-side padding bound: a larger pad
+    /// would sign transactions the cluster then rejects at ingress.
+    #[cfg(feature = "bench-tx-padding")]
+    pub fn with_padding(mut self, bytes: usize) -> Self {
+        assert!(
+            bytes <= PADDING_MAX_ENCODED - 5,
+            "padding of {bytes} bytes exceeds the decodable maximum of {} bytes",
+            PADDING_MAX_ENCODED - 5,
+        );
+        self.padding = bytes::Bytes::from(vec![0u8; bytes]);
+        self
     }
 
     /// Returns the decoded sender public key.
@@ -421,6 +457,11 @@ where
         self.sender.write(buf);
         self.payload.write(buf);
         self.nonce.write(buf);
+        #[cfg(feature = "bench-tx-padding")]
+        {
+            self.padding.len().write(buf);
+            buf.put_slice(&self.padding);
+        }
     }
 }
 
@@ -430,7 +471,10 @@ where
     B: PrivatePaymentBackend,
 {
     fn encode_size(&self) -> usize {
-        TransactionPublicKey::SIZE + self.payload.encode_size() + u64::SIZE
+        let base = TransactionPublicKey::SIZE + self.payload.encode_size() + u64::SIZE;
+        #[cfg(feature = "bench-tx-padding")]
+        let base = base + self.padding.len().encode_size() + self.padding.len();
+        base
     }
 }
 
@@ -442,10 +486,23 @@ where
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
+        let sender = Lazy::<TransactionPublicKey>::read(buf)?;
+        let payload = Payload::read(buf)?;
+        let nonce = u64::read(buf)?;
+        #[cfg(feature = "bench-tx-padding")]
+        let padding = {
+            let len = usize::read_cfg(buf, &RangeCfg::new(0..=PADDING_MAX_ENCODED))?;
+            if buf.remaining() < len {
+                return Err(Error::EndOfBuffer);
+            }
+            buf.copy_to_bytes(len)
+        };
         Ok(Self {
-            sender: Lazy::<TransactionPublicKey>::read(buf)?,
-            payload: Payload::read(buf)?,
-            nonce: u64::read(buf)?,
+            sender,
+            payload,
+            nonce,
+            #[cfg(feature = "bench-tx-padding")]
+            padding,
             _digest: core::marker::PhantomData,
         })
     }
@@ -481,6 +538,8 @@ where
                     .expect("arbitrary non-zero value should construct"),
             },
             nonce: u.arbitrary()?,
+            #[cfg(feature = "bench-tx-padding")]
+            padding: bytes::Bytes::new(),
             _digest: core::marker::PhantomData,
         })
     }
@@ -671,6 +730,10 @@ mod test {
         AccountKey::from_public_key(&test_sender()).write(&mut buf);
         1u64.write(&mut buf);
         9u64.write(&mut buf);
+        // Under the padding feature the wire format appends a length-prefixed
+        // padding field after the nonce; an empty pad is a single zero varint.
+        #[cfg(feature = "bench-tx-padding")]
+        0usize.write(&mut buf);
 
         let decoded = Transaction::<sha256::Digest>::decode(&mut &buf[..])
             .expect("decoding should defer sender validation");
@@ -764,5 +827,42 @@ mod test {
                 "decoding a transaction truncated to {len} bytes must fail"
             );
         }
+    }
+
+    #[cfg(feature = "bench-tx-padding")]
+    #[test]
+    fn padded_transaction_roundtrips_and_reseals_consistently() {
+        let mut rng = StdRng::from_seed([99u8; 32]);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let tx = Transaction::<sha256::Digest>::from_payload(
+            sender.clone(),
+            Payload::PublicTransfer {
+                to: AccountKey::from_public_key(&sender),
+                value: NonZeroU64::new(5).expect("non-zero"),
+            },
+            7,
+        )
+        .with_padding(4096);
+        let signed = tx.seal_and_sign(&signer, NAMESPACE, &mut sha256::Sha256::default());
+
+        let encoded = signed.encode();
+        // Padding is carried on the wire.
+        assert!(encoded.len() >= 4096, "padding must inflate the wire size");
+
+        let decoded = SignedTransaction::<sha256::Sha256>::decode(&mut &encoded[..])
+            .expect("padded transaction decodes");
+        // Equality includes the sealed digest, so this only holds if the seal
+        // was recomputed identically over the padded body on decode.
+        assert_eq!(
+            decoded, signed,
+            "decoded padded transaction matches original"
+        );
+        assert_eq!(decoded.encode(), encoded, "re-encode is byte-identical");
+        assert_eq!(
+            decoded.value().padding.len(),
+            4096,
+            "padding survives the round trip"
+        );
     }
 }

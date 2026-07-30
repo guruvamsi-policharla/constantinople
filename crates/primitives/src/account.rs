@@ -206,7 +206,7 @@ pub type StateAccount = Account<StatePrivatePaymentBackend>;
     not(feature = "privacy-backend-zkpari"),
     feature = "privacy-backend-mock"
 ))]
-pub fn from_state_account(account: StateAccount) -> Account {
+pub const fn from_state_account(account: StateAccount) -> Account {
     account
 }
 

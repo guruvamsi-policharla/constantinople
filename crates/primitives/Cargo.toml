@@ -47,6 +47,11 @@ arbitrary = { workspace = true, features = ["derive"] }
 
 [features]
 default = ["privacy-backend-mock"]
+# Benchmark-only: carry an opaque, execution-ignored padding blob in each
+# transaction so block byte-size can be swept independently of proof cost
+# (measures dissemination scaling on the mock backend). Off by default;
+# production wire format is unchanged.
+bench-tx-padding = []
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",

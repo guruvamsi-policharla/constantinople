@@ -144,6 +144,25 @@ fn main() {
 
         let strategy = context.strategy(NZUsize!(rayon_threads));
 
+        // Benchmark-only: install per-transaction padding so block size can
+        // be swept independently of proof cost. Runs after telemetry init so
+        // the confirmation is visible; signing has not started yet. Compiled
+        // out entirely by default.
+        #[cfg(feature = "bench-tx-padding")]
+        {
+            let payload_pad_bytes = match &cli.config {
+                Some(config_path) => config::load_config(config_path).payload_pad_bytes,
+                None => cli.payload_pad_bytes,
+            };
+            if payload_pad_bytes > 0 {
+                info!(
+                    payload_pad_bytes,
+                    "bench-tx-padding: padding every transaction"
+                );
+            }
+            signer::set_payload_pad_bytes(payload_pad_bytes);
+        }
+
         let config = RelayerModeConfig {
             relayer_url,
             accounts_count,

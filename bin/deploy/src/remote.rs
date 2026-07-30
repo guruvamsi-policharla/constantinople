@@ -131,6 +131,15 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
             "simulated proof mode runs the cluster on zkpari: build the validator (and indexer) binaries with the zkpari feature and the spammer with zkpari + simulator"
         );
     }
+    if args.spammer_payload_pad_bytes > 0 {
+        info!(
+            payload_pad_bytes = args.spammer_payload_pad_bytes,
+            build_recipe = "just graviton-binaries-padded",
+            "benchmark padding changes the transaction wire format: every \
+             binary must be built with `bench-tx-padding` or ingress decode \
+             will reject the spammer's transactions"
+        );
+    }
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -298,6 +307,7 @@ fn remote_spammer_config(
         private_proof_mode: args.spammer_private_proof_mode,
         private_batch: plan.private_batch,
         private_lanes: plan.total_private_lanes,
+        payload_pad_bytes: args.spammer_payload_pad_bytes,
     }
 }
 
@@ -547,6 +557,7 @@ mod tests {
             spammer_private_batch: None,
             spammer_private_lanes: None,
             spammer_target_inflight: None,
+            spammer_payload_pad_bytes: 0,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,

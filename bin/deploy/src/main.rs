@@ -265,6 +265,15 @@ pub(crate) struct GenerateArgs {
     #[arg(long)]
     spammer_target_inflight: Option<usize>,
 
+    /// Benchmark-only: opaque padding bytes attached to every transaction, to
+    /// sweep block size independently of proof cost. When non-zero the
+    /// generated run commands build the validators and spammer with
+    /// `constantinople-primitives/bench-tx-padding` so the whole cluster agrees
+    /// on the padded wire format. Zero (the default) leaves the wire format and
+    /// build features unchanged.
+    #[arg(long, default_value_t = 0)]
+    spammer_payload_pad_bytes: usize,
+
     /// Deployment target (local or remote).
     #[command(subcommand)]
     target: GenerateTarget,
@@ -430,6 +439,10 @@ pub(crate) struct SpammerConfig {
     /// Concurrent private lanes.
     #[serde(default = "default_spammer_private_lanes")]
     pub private_lanes: usize,
+    /// Benchmark-only: opaque padding bytes per transaction (requires the
+    /// `bench-tx-padding` build feature; ignored by non-benchmark builds).
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub payload_pad_bytes: usize,
 }
 
 const fn default_spammer_private_batch() -> usize {
@@ -768,6 +781,17 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
 /// backend, which would understate what a zkpari cluster sees.
 const PRIVATE_TX_BYTES: usize = 320;
 
+/// Per-transaction wire size used for sizing, including any benchmark padding
+/// (`--spammer-payload-pad-bytes` plus its worst-case 5-byte length prefix).
+/// Equals [`PRIVATE_TX_BYTES`] when padding is off.
+const fn sized_private_tx_bytes(args: &GenerateArgs) -> usize {
+    if args.spammer_payload_pad_bytes == 0 {
+        PRIVATE_TX_BYTES
+    } else {
+        PRIVATE_TX_BYTES + 5 + args.spammer_payload_pad_bytes
+    }
+}
+
 /// Source accounts provisioned per in-flight transaction slot when
 /// `--spammer-accounts` is derived. Lanes skip exhausted or mid-retry sources
 /// when filling a batch, so they need spare accounts to keep batches full.
@@ -879,7 +903,7 @@ pub(crate) fn resolve_spammer_plan(args: &GenerateArgs) -> SpammerPlan {
     // One batch is also one relayer submission, which leaders bound by
     // `--max-propose-bytes`.
     let batch_bytes = batch
-        .checked_mul(PRIVATE_TX_BYTES)
+        .checked_mul(sized_private_tx_bytes(args))
         .expect("batch byte size fits usize");
     assert!(
         batch_bytes <= args.max_propose_bytes,
@@ -951,7 +975,7 @@ pub(crate) fn log_spammer_plan(args: &GenerateArgs) {
     // Lanes pin distinct leaders, so each leader's mempool sees roughly its
     // own lanes' share of the in-flight bytes.
     let validators = args.validators.max(1) as usize;
-    let per_leader_bytes = plan.inflight / validators * PRIVATE_TX_BYTES;
+    let per_leader_bytes = plan.inflight / validators * sized_private_tx_bytes(args);
     if per_leader_bytes > args.max_pool_bytes {
         tracing::warn!(
             per_leader_bytes,

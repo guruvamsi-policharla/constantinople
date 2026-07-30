@@ -83,6 +83,12 @@ pub struct Cli {
     /// blocks empty.
     #[arg(long, default_value_t = 8)]
     pub private_lanes: usize,
+
+    /// Benchmark-only: opaque padding bytes attached to every transaction, to
+    /// sweep block size independently of proof cost. Requires building with
+    /// `--features bench-tx-padding`; ignored otherwise.
+    #[arg(long, default_value_t = 0)]
+    pub payload_pad_bytes: usize,
 }
 
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {

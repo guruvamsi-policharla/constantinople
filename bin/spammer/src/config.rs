@@ -78,6 +78,11 @@ pub struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Benchmark-only: opaque padding bytes per transaction (sweeps block
+    /// size independently of proof cost). Requires the `bench-tx-padding`
+    /// build feature; ignored otherwise.
+    #[serde(default)]
+    pub payload_pad_bytes: usize,
 }
 
 const fn default_private_batch() -> usize {
@@ -153,6 +158,7 @@ mod tests {
             private_proof_mode: PrivateProofMode::Simulated,
             private_batch: 256,
             private_lanes: 16,
+            payload_pad_bytes: 0,
         };
         let yaml = serde_yaml::to_string(&config).expect("serialize");
         let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");

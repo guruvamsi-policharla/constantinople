@@ -17,6 +17,17 @@ pub fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
     AccountKey::from_public_key(&TransactionPublicKey::ed25519(public_key.clone()))
 }
 
+/// Benchmark-only per-transaction padding, set once at startup. Zero (and
+/// compiled out) unless `bench-tx-padding` is enabled.
+#[cfg(feature = "bench-tx-padding")]
+static PAYLOAD_PAD_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the per-transaction padding size used for dissemination benchmarks.
+#[cfg(feature = "bench-tx-padding")]
+pub fn set_payload_pad_bytes(bytes: usize) {
+    PAYLOAD_PAD_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Signs an arbitrary payload for a single sender.
 pub fn sign_payload(sender: &SpamAccount, payload: Payload, nonce: u64) -> Tx {
     let tx = Transaction::from_payload(
@@ -24,6 +35,8 @@ pub fn sign_payload(sender: &SpamAccount, payload: Payload, nonce: u64) -> Tx {
         payload,
         nonce,
     );
+    #[cfg(feature = "bench-tx-padding")]
+    let tx = tx.with_padding(PAYLOAD_PAD_BYTES.load(std::sync::atomic::Ordering::Relaxed));
     tx.seal_and_sign(
         &sender.private_key,
         TRANSACTION_NAMESPACE,
@@ -44,6 +57,8 @@ fn sign_one(
         value,
         nonce,
     );
+    #[cfg(feature = "bench-tx-padding")]
+    let tx = tx.with_padding(PAYLOAD_PAD_BYTES.load(std::sync::atomic::Ordering::Relaxed));
     tx.seal_and_sign(
         &sender.private_key,
         TRANSACTION_NAMESPACE,
