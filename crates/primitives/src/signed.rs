@@ -8,7 +8,8 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
+    ChainPrivatePaymentBackend, PrivatePaymentBackend, PublicKeyCache, Sealable, Sealed,
+    SignedTransaction, Transaction, TransactionBatchVerifier, TransactionPublicKey,
     TransactionSignature,
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -196,22 +197,25 @@ impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
 #[derive(Clone)]
-pub struct LazySignedTransaction<H>
+pub struct LazySignedTransaction<H, B = ChainPrivatePaymentBackend>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     pending: Option<Bytes>,
-    value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+    value: Arc<OnceLock<Option<SignedTransaction<H, B>>>>,
 }
 
-impl<H> LazySignedTransaction<H>
+impl<H, B> LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
-    const MAX_ENCODED_SIZE: usize = Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
+    const MAX_ENCODED_SIZE: usize =
+        Transaction::<H::Digest, B>::MAX_SIZE + TransactionSignature::MAX_SIZE;
 
     /// Creates a lazy transaction from an already decoded value.
-    pub fn new(value: SignedTransaction<H>) -> Self {
+    pub fn new(value: SignedTransaction<H, B>) -> Self {
         Self {
             pending: None,
             value: Arc::new(Some(value).into()),
@@ -219,7 +223,7 @@ where
     }
 
     /// Returns the decoded transaction, if decoding succeeds.
-    pub fn get(&self) -> Option<&SignedTransaction<H>> {
+    pub fn get(&self) -> Option<&SignedTransaction<H, B>> {
         self.value
             .get_or_init(|| {
                 let bytes = self
@@ -236,7 +240,7 @@ where
     ///
     /// Moves the cached value out when this handle is its only owner; clones
     /// only when the decoded value is still shared with another handle.
-    pub fn into_value(self) -> Option<SignedTransaction<H>> {
+    pub fn into_value(self) -> Option<SignedTransaction<H, B>> {
         self.get()?;
         match Arc::try_unwrap(self.value) {
             Ok(value) => value.into_inner().flatten(),
@@ -266,15 +270,16 @@ where
     }
 }
 
-impl<H> Read for LazySignedTransaction<H>
+impl<H, B> Read for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
+        if len < Transaction::<H::Digest, B>::MIN_SIZE + TransactionSignature::MIN_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {
@@ -285,9 +290,10 @@ where
     }
 }
 
-impl<H> Write for LazySignedTransaction<H>
+impl<H, B> Write for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     fn write(&self, buf: &mut impl BufMut) {
         if let Some(pending) = &self.pending {
@@ -303,9 +309,10 @@ where
     }
 }
 
-impl<H> EncodeSize for LazySignedTransaction<H>
+impl<H, B> EncodeSize for LazySignedTransaction<H, B>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     fn encode_size(&self) -> usize {
         if let Some(pending) = &self.pending {
@@ -319,22 +326,29 @@ where
     }
 }
 
-impl<H> PartialEq for LazySignedTransaction<H>
+impl<H, B> PartialEq for LazySignedTransaction<H, B>
 where
     H: Hasher,
-    SignedTransaction<H>: PartialEq,
+    B: PrivatePaymentBackend,
+    SignedTransaction<H, B>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.get() == other.get()
     }
 }
 
-impl<H> Eq for LazySignedTransaction<H> where H: Hasher {}
-
-impl<H> core::fmt::Debug for LazySignedTransaction<H>
+impl<H, B> Eq for LazySignedTransaction<H, B>
 where
     H: Hasher,
-    SignedTransaction<H>: core::fmt::Debug,
+    B: PrivatePaymentBackend,
+{
+}
+
+impl<H, B> core::fmt::Debug for LazySignedTransaction<H, B>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+    SignedTransaction<H, B>: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.get().fmt(f)
@@ -344,12 +358,13 @@ where
 /// Materializes lazily-encoded signed transactions in parallel.
 ///
 /// Returns `None` if any transaction fails to decode.
-pub fn materialize_transaction_chunks<H, St>(
+pub fn materialize_transaction_chunks<H, B, St>(
     strategy: &St,
-    transactions: Vec<LazySignedTransaction<H>>,
-) -> Option<Vec<SignedTransaction<H>>>
+    transactions: Vec<LazySignedTransaction<H, B>>,
+) -> Option<Vec<SignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     strategy
@@ -362,12 +377,13 @@ where
 /// parallel.
 ///
 /// Returns `false` if any transaction fails to decode.
-pub fn preload_transaction_slice<H, St>(
-    transactions: &[LazySignedTransaction<H>],
+pub fn preload_transaction_slice<H, B, St>(
+    transactions: &[LazySignedTransaction<H, B>],
     strategy: &St,
 ) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     strategy.fold(
@@ -382,24 +398,108 @@ where
 ///
 /// Returns the original lazy transactions after warming their cached decoded
 /// values, or `None` if any transaction fails to decode.
-pub fn preload_transaction_chunks<H, St>(
-    transactions: Vec<LazySignedTransaction<H>>,
+pub fn preload_transaction_chunks<H, B, St>(
+    transactions: Vec<LazySignedTransaction<H, B>>,
     strategy: &St,
-) -> Option<Vec<LazySignedTransaction<H>>>
+) -> Option<Vec<LazySignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     preload_transaction_slice(&transactions, strategy).then_some(transactions)
+}
+
+/// Splits a bare `Vec<SignedTransaction>` batch body into deferred
+/// [`LazySignedTransaction`]s without decoding (and therefore without
+/// decompressing any curve points) any transaction.
+///
+/// Transaction boundaries are found structurally, all cheap: the count
+/// prefix, the fixed-size sender and nonce, the payload span (fixed given its
+/// tag), and the variable-size but self-delimiting, crypto-free
+/// [`TransactionSignature`] decode. Each transaction's exact wire bytes are
+/// stored as deferred bytes, identical in shape to the block-body lazy path,
+/// so the subsequent [`preload_transaction_slice`] materializes and
+/// decompresses them across the strategy pool in parallel rather than
+/// serially on the caller.
+///
+/// This is the compressed-point ingress path: it moves the ~15-20us/point
+/// decompression off the single accepting thread and onto the pool.
+pub fn frame_signed_batch<H, B>(
+    body: &Bytes,
+    max_transactions: usize,
+) -> Result<Vec<LazySignedTransaction<H, B>>, Error>
+where
+    H: Hasher,
+    B: PrivatePaymentBackend,
+{
+    fn advance_checked(buf: &mut impl Buf, len: usize) -> Result<(), Error> {
+        if buf.remaining() < len {
+            return Err(Error::EndOfBuffer);
+        }
+        buf.advance(len);
+        Ok(())
+    }
+
+    let mut cursor = body.clone();
+    let count = usize::read_cfg(&mut cursor, &RangeCfg::new(1..=max_transactions))?;
+    let mut framed = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = body.len() - cursor.remaining();
+
+        // Sender: `Lazy<TransactionPublicKey>`, a fixed-size read.
+        advance_checked(&mut cursor, TransactionPublicKey::SIZE)?;
+
+        // Payload: peek the tag, then skip the whole (tag-determined) span.
+        if !cursor.has_remaining() {
+            return Err(Error::EndOfBuffer);
+        }
+        let tag = cursor.chunk()[0];
+        let payload_size = crate::transaction::payload_wire_size::<B>(tag)
+            .ok_or(Error::Invalid("Payload", "unknown payload tag"))?;
+        advance_checked(&mut cursor, payload_size)?;
+
+        // Nonce: fixed `u64`.
+        advance_checked(&mut cursor, u64::SIZE)?;
+
+        // Benchmark padding: length-prefixed opaque bytes appended after the
+        // nonce. Present only in `bench-tx-padding` builds; skipping it here
+        // keeps framing aligned with the padded wire format.
+        #[cfg(feature = "bench-tx-padding")]
+        {
+            let pad_len = usize::read_cfg(
+                &mut cursor,
+                &RangeCfg::new(0..=crate::transaction::PADDING_MAX_ENCODED),
+            )?;
+            advance_checked(&mut cursor, pad_len)?;
+        }
+
+        // Signature: variable, but decoded here only to measure its length
+        // (no signature verification, no point decompression).
+        TransactionSignature::read(&mut cursor)?;
+
+        let end = body.len() - cursor.remaining();
+        framed.push(LazySignedTransaction::deferred(body.slice(start..end)));
+    }
+
+    if cursor.has_remaining() {
+        return Err(Error::Invalid(
+            "SignedTransaction batch",
+            "trailing bytes after framed transactions",
+        ));
+    }
+
+    Ok(framed)
 }
 
 /// Forces the lazy transaction to decode and its sender public key to parse, in
 /// parallel with its caller. Returns `false` if decode fails or the sender is
 /// not present. Decompression is deferred to the batch build, which looks each
 /// sender up in the shared cache exactly once.
-fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
+fn signature_inputs_decode<H, B>(lazy: &LazySignedTransaction<H, B>) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
 {
     let Some(transaction) = lazy.get() else {
         return false;
@@ -415,15 +515,16 @@ where
 ///
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
-pub fn verify_transaction_batch<H, St>(
+pub fn verify_transaction_batch<H, B, St>(
     namespace: &[u8],
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
-    transactions: &[LazySignedTransaction<H>],
+    transactions: &[LazySignedTransaction<H, B>],
     signature_strategy: &St,
 ) -> bool
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     if transactions.is_empty() {
@@ -474,15 +575,16 @@ where
 /// First forces each [`Lazy`] to decode and compute its seal digest, then runs
 /// batch signature verification over the warmed transactions, both on
 /// `strategy`. Returns `None` if any transaction is invalid or undecodable.
-pub fn verify_transaction_chunks<H, St>(
+pub fn verify_transaction_chunks<H, B, St>(
     namespace: &'static [u8],
     rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
-    transactions: Vec<LazySignedTransaction<H>>,
+    transactions: Vec<LazySignedTransaction<H, B>>,
     strategy: &St,
-) -> Option<Vec<SignedTransaction<H>>>
+) -> Option<Vec<SignedTransaction<H, B>>>
 where
     H: Hasher,
+    B: PrivatePaymentBackend,
     St: Strategy,
 {
     if transactions.is_empty() {
@@ -491,7 +593,7 @@ where
 
     let transactions = preload_transaction_chunks(transactions, strategy)?;
 
-    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, strategy) {
+    if !verify_transaction_batch::<H, B, _>(namespace, rng, cache, &transactions, strategy) {
         return None;
     }
 
@@ -505,11 +607,11 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, Transaction,
+        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction,
         TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
-        DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        DecodeExt as _, Encode as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
     };
     use commonware_cryptography::{
         Hasher, Signer, Verifier, ed25519, secp256r1::standard as secp256r1, sha256,
@@ -593,7 +695,7 @@ mod test {
             let hasher = &mut sha256::Sha256::default();
             let private_key = ed25519::PrivateKey::random(test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-            let signed = Transaction::new(
+            let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
                 public_key.clone(),
                 public_key.clone(),
                 NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -626,7 +728,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -660,7 +762,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed: SignedTransaction<sha256::Sha256> = Transaction::new(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -704,5 +806,168 @@ mod test {
                     .then_some(candidate)
             })
             .expect("test should find invalid public key bytes")
+    }
+
+    /// A batch spanning every payload variant, built with the configured
+    /// chain backend (mock by default, real zkpari under --all-features),
+    /// plus its bare-`Vec` wire encoding. Signatures are ed25519 — the only
+    /// scheme the spammer emits; the variable-length secp256r1 signature
+    /// decode that framing also handles is covered by `auth`'s own tests.
+    fn mixed_batch() -> (Vec<SignedTransaction<sha256::Sha256>>, bytes::Bytes) {
+        use crate::{ChainPrivatePaymentBackend as Chain, Payload};
+        use commonware_privacy::payments::Backend as _;
+
+        let params = <Chain as crate::PrivatePaymentBackend>::params();
+        let mut rng = test_rng();
+        let ed = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(ed.public_key());
+        let to = crate::AccountKey::from_public_key(&sender);
+
+        let (current, current_opening, _fp) = Chain::fund(params, 7, &mut rng);
+        let (amount, _ao, transfer_proof) =
+            Chain::transfer(params, &current, &current_opening, 3, &mut rng);
+        let (fund_commitment, _fo, fund_proof) = Chain::fund(params, 9, &mut rng);
+        let (burn_current, burn_opening, _bfp) = Chain::fund(params, 5, &mut rng);
+        let burn_proof = Chain::burn(params, &burn_current, &burn_opening, 2, &mut rng);
+
+        let payloads = [
+            Payload::PublicTransfer {
+                to,
+                value: NonZeroU64::new(11).unwrap(),
+            },
+            Payload::PrivateFund {
+                value: NonZeroU64::new(9).unwrap(),
+                commitment: fund_commitment,
+                proof: fund_proof,
+            },
+            Payload::PrivateRollover,
+            Payload::PrivateTransfer {
+                to,
+                amount,
+                proof: transfer_proof,
+            },
+            Payload::PrivateBurn {
+                value: NonZeroU64::new(2).unwrap(),
+                proof: burn_proof,
+            },
+        ];
+
+        let mut batch = Vec::with_capacity(payloads.len());
+        for (nonce, payload) in payloads.into_iter().enumerate() {
+            batch.push(
+                Transaction::from_payload(sender.clone(), payload, nonce as u64).seal_and_sign(
+                    &ed,
+                    NAMESPACE,
+                    &mut sha256::Sha256::default(),
+                ),
+            );
+        }
+        let body = batch.encode();
+        (batch, body)
+    }
+
+    #[test]
+    fn frame_signed_batch_matches_eager_decode() {
+        let (batch, body) = mixed_batch();
+
+        let framed = super::frame_signed_batch::<sha256::Sha256, _>(&body, batch.len())
+            .expect("framing should succeed");
+        assert_eq!(framed.len(), batch.len());
+
+        for (lazy, expected) in framed.into_iter().zip(&batch) {
+            // Each deferred slice must be the exact wire bytes of one
+            // transaction and materialize back to the original.
+            assert_eq!(
+                lazy.encoded_signed_transaction().as_ref(),
+                expected.encode().as_ref()
+            );
+            let materialized = lazy.into_value().expect("framed transaction materializes");
+            assert_eq!(&materialized, expected);
+        }
+    }
+
+    /// Framing must read each transaction's own padding length prefix rather
+    /// than assume a fixed per-transaction stride: a batch whose transactions
+    /// carry *different* pad sizes must still split at the correct boundaries.
+    #[cfg(feature = "bench-tx-padding")]
+    #[test]
+    fn frame_signed_batch_handles_variable_padding() {
+        let mut rng = test_rng();
+        let ed = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(ed.public_key());
+
+        let pads = [0usize, 100, 4096];
+        let batch: Vec<SignedTransaction<sha256::Sha256>> = pads
+            .iter()
+            .enumerate()
+            .map(|(nonce, &pad)| {
+                Transaction::new(
+                    sender.clone(),
+                    sender.clone(),
+                    NonZeroU64::new(1).unwrap(),
+                    nonce as u64,
+                )
+                .with_padding(pad)
+                .seal_and_sign(&ed, NAMESPACE, &mut sha256::Sha256::default())
+            })
+            .collect();
+        let body = batch.encode();
+
+        let framed = super::frame_signed_batch::<sha256::Sha256, _>(&body, batch.len())
+            .expect("framing padded batch should succeed");
+        assert_eq!(framed.len(), batch.len());
+        for (lazy, expected) in framed.into_iter().zip(&batch) {
+            assert_eq!(
+                lazy.encoded_signed_transaction().as_ref(),
+                expected.encode().as_ref()
+            );
+            let materialized = lazy.into_value().expect("framed transaction materializes");
+            assert_eq!(&materialized, expected);
+        }
+    }
+
+    #[test]
+    fn frame_signed_batch_rejects_truncation() {
+        let (batch, body) = mixed_batch();
+        // Every strict prefix must fail rather than mis-frame.
+        for len in 1..body.len() {
+            let truncated = body.slice(0..len);
+            assert!(
+                super::frame_signed_batch::<sha256::Sha256, crate::ChainPrivatePaymentBackend>(
+                    &truncated,
+                    batch.len(),
+                )
+                .is_err(),
+                "prefix of length {len} must not frame"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_signed_batch_rejects_trailing_bytes() {
+        let (batch, body) = mixed_batch();
+        let mut extended = body.to_vec();
+        extended.push(0);
+        assert!(
+            super::frame_signed_batch::<sha256::Sha256, crate::ChainPrivatePaymentBackend>(
+                &extended.into(),
+                batch.len(),
+            )
+            .is_err(),
+            "trailing bytes after the last transaction must be rejected"
+        );
+    }
+
+    #[test]
+    fn frame_signed_batch_enforces_max_transactions() {
+        let (batch, body) = mixed_batch();
+        assert!(
+            super::frame_signed_batch::<sha256::Sha256, crate::ChainPrivatePaymentBackend>(
+                &body,
+                batch.len() - 1,
+            )
+            .is_err(),
+            "a batch exceeding the transaction cap must be rejected"
+        );
     }
 }

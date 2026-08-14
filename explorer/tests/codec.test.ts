@@ -31,5 +31,6 @@ test('transactions encode recipient account key directly', async () => {
         async () => new Uint8Array(64),
     );
 
-    assert.equal(toHex(encoded.bytes.slice(34, 66)), toHex(toAccountKey));
+    assert.equal(encoded.bytes[34], 0);
+    assert.equal(toHex(encoded.bytes.slice(35, 67)), toHex(toAccountKey));
 });

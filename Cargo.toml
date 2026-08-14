@@ -64,6 +64,7 @@ commonware-resolver = "2026.7.0"
 commonware-broadcast = "2026.7.0"
 commonware-consensus = "2026.7.0"
 commonware-cryptography = { version = "2026.7.0", default-features = false }
+commonware-privacy = { path = "../monorepo/privacy", default-features = false }
 
 # Exoware
 exoware-sdk = "2026.7.1"
@@ -75,10 +76,13 @@ exoware-sql = "2026.7.1"
 datafusion = "52"
 
 # Other
+ark-bn254 = { version = "0.6.0", default-features = false }
 axum = "0.8"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }
+hashbrown = { version = "0.17.0", default-features = false }
 rand = { version = "0.10.2", default-features = false }
+rand_core = "0.10.1"
 bytes = { version = "1.11.1", default-features = false }
 criterion = "0.7.0"
 rayon = "1.10"
@@ -98,6 +102,20 @@ mimalloc = "0.1.52"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+
+# `commonware-privacy` is consumed as a path dependency from the sibling
+# `../monorepo` checkout (branch gv-privacy-2026.7, based on the v2026.7.0
+# release). The leaf crates it pulls in as path dependencies must be patched to
+# the same checkout so the workspace sees exactly one copy of each; the
+# checkout matches the published 2026.7.0 crates, so the patched sources are
+# version-identical to the registry ones. Docker/remote builds mount that
+# checkout — see docker/justfile.
+[patch.crates-io]
+commonware-codec = { path = "../monorepo/codec" }
+commonware-codec-macros = { path = "../monorepo/codec/macros" }
+commonware-macros = { path = "../monorepo/macros" }
+commonware-macros-impl = { path = "../monorepo/macros/impl" }
+commonware-parallel = { path = "../monorepo/parallel" }
 
 [profile.samply]
 inherits = "release"

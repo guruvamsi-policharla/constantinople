@@ -2,8 +2,10 @@
 //! all-or-nothing baseline (verify path) on block-sized in-memory workloads.
 
 use commonware_cryptography::{Hasher as _, Sha256};
-use constantinople_application::executor::{PreparedTransfer, SelectiveExecutor, State, compute};
-use constantinople_primitives::{Account, AccountKey, Nonce};
+use constantinople_application::executor::{
+    PreparedOperation, PrivateVerifications, SelectiveExecutor, State, compute,
+};
+use constantinople_primitives::{AccountKey, Nonce, StateAccount};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -21,21 +23,19 @@ fn key(index: u64) -> AccountKey {
     AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
 }
 
-fn transfer(sender: AccountKey, recipient: AccountKey, value: u64, nonce: u64) -> PreparedTransfer {
-    PreparedTransfer {
-        sender,
-        recipient,
-        sender_prefix: sender.prefix(),
-        recipient_prefix: recipient.prefix(),
-        value,
-        nonce,
-    }
+fn transfer(
+    sender: AccountKey,
+    recipient: AccountKey,
+    value: u64,
+    nonce: u64,
+) -> PreparedOperation {
+    PreparedOperation::public_transfer(sender, recipient, value, nonce)
 }
 
 /// `n` transfers with unique senders/recipients; when `stale_every > 0`,
 /// every `stale_every`-th transfer carries an already-consumed nonce (only
 /// the selective path can execute those bodies).
-fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTransfer>) {
+fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedOperation>) {
     let mut state = State::with_capacity(2 * n);
     let mut transfers = Vec::with_capacity(n);
     for i in 0..n as u64 {
@@ -47,9 +47,10 @@ fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTr
         };
         state.insert(
             sender,
-            Account {
+            StateAccount {
                 balance: 1_000_000,
                 nonce: Nonce::default(),
+                private: Default::default(),
             },
         );
         if stale_every > 0 && (i as usize).is_multiple_of(stale_every) {
@@ -79,14 +80,15 @@ fn run<T>(label: &str, n: usize, mut op: impl FnMut() -> T) {
 
 fn selective(
     state: &State,
-    transfers: &[PreparedTransfer],
-) -> (usize, Vec<(usize, Option<Account>)>) {
+    transfers: &[PreparedOperation],
+) -> (usize, Vec<(usize, Option<StateAccount>)>) {
     let mut executor = SelectiveExecutor::new();
     let keys = executor.begin_round(transfers);
-    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    let values: Vec<Option<StateAccount>> =
+        keys.iter().map(|key| state.get(key).cloned()).collect();
     executor.register(&values);
     let applied = executor.apply(transfers);
-    let kept = applied.iter().filter(|applied| **applied).count();
+    let kept = applied.0.iter().filter(|applied| **applied).count();
     (kept, executor.into_updates())
 }
 
@@ -97,7 +99,7 @@ fn main() {
             println!("{n} txs / {mix} recipients");
             let (state, transfers) = fixture(n, shared, 0);
             run("baseline all-or-nothing", n, || {
-                compute(&state, &transfers).expect("clean batch")
+                compute(&state, &transfers, &mut PrivateVerifications::new()).expect("clean batch")
             });
             run("selective clean", n, || {
                 let (kept, updates) = selective(&state, &transfers);

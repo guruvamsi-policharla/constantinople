@@ -1,6 +1,7 @@
 const PUBLIC_KEY_BYTES = 34;
 const ACCOUNT_KEY_BYTES = 32;
 const ED25519_SCHEME = 0;
+const PUBLIC_TRANSFER_TAG = 0;
 const U64_BYTES = 8;
 const MAX_U64 = (1n << 64n) - 1n;
 
@@ -82,6 +83,7 @@ async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Arra
 
     return bytesConcat(
         draft.senderPublicKey,
+        new Uint8Array([PUBLIC_TRANSFER_TAG]),
         draft.toAccountKey,
         encodeU64(draft.value),
         encodeU64(draft.nonce),

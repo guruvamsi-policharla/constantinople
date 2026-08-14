@@ -24,6 +24,7 @@ constantinople-application.workspace = true
 commonware-actor.workspace = true
 commonware-p2p.workspace = true
 commonware-glue.workspace = true
+commonware-coding.workspace = true
 commonware-codec.workspace = true
 commonware-formatting.workspace = true
 commonware-utils.workspace = true

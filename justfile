@@ -27,8 +27,11 @@ lint: fmt-check docs-check
   cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
 
 # Run Rust tests
+#
+# The zkpari privacy backend grows Account to a 64-byte-commitment pair, which
+# overflows the default 2 MiB test-thread stack in deep engine tests.
 test *args='': docs-test
-  cargo nextest run --workspace --all --all-features $@
+  RUST_MIN_STACK=33554432 cargo nextest run --workspace --all --all-features $@
 
 # Test the Rust documentation
 docs-test *args='--all':
